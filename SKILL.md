@@ -1,0 +1,276 @@
+---
+name: llamastery
+description: Управление сборками и форками llama.cpp, пресетами роутера (models.ini / --models-preset), автотюнинг параметров и учёт бюджета VRAM. Используй, когда задача про llama.cpp/llama-server/llama-cli: выбор или сборка форка, настройка параметров запуска, пресеты моделей, падение с OOM, подбор n-cpu-moe/ctx/ubatch/KV-кэша, маршрутизация нескольких моделей, перенос пресетов из чужого репозитория. Триггеры: llama.cpp, llama-server, llama-faks, ik_llama, models.ini, --models-preset, пресет, n-cpu-moe, n-gpu-layers, cache-type-k, ubatch, mmproj, spec-type, router mode, VRAM не хватает.
+---
+
+# llamastery
+
+Управление сборками/форками llama.cpp и пресетами роутера через `llamastery`.
+Только стандартная библиотека Python 3. Ничего не ставит глобально.
+
+Подробная документация — в `docs/`: `ru/`, `en/`, `zh/`.
+Этот файл — краткая памятка, для деталей (формат пресетов, методика
+тюнинга, правила оформления комментариев) иди в `docs/ru/`.
+
+## С чего начать
+
+```bash
+SKILL=~/.config/opencode/skills/llamastery   # или где лежит этот скилл
+$SKILL/bin/llamastery doctor          # что видно: сборки, пресет, замеры, калибровка
+```
+
+Если `doctor` ругается на пустой реестр:
+
+```bash
+$SKILL/bin/llamastery builds detect --apply
+```
+
+## Реестр сборок и форков
+
+Каталог сборки, remote, наличие роутера (`--models-preset`) и команда-менеджер.
+Роутер есть не у всех: `ik_llama` — single-режим, пресеты в нём транслируются
+в argv вручную.
+
+```bash
+llamastery builds list                       # что зарегистрировано, собрано ли, версия
+llamastery builds detect                     # найти форки в типичных каталогах (только просмотр)
+llamastery builds detect --apply             # записать в реестр
+llamastery builds show faks
+llamastery builds add mine --path ~/git/mine-fork --remote https://github.com/u/mine --no-router
+```
+
+## Схема флагов
+
+Схема парсится из `--help` конкретной сборки, поэтому форковые флаги
+(`load-mode`, `image-min-tokens`, `ctx-checkpoints`, `spec-type`) видны
+автоматически. Кэш по mtime бинаря.
+
+```bash
+llamastery schema --build faks               # сколько флагов у сборки
+llamastery schema --build faks --grep moe    # что есть по слову
+llamastery schema --build faks --json | jq '."--spec-type"'
+```
+
+Если нужно «что вообще умеет этот форк» — начинай с `schema --grep`.
+
+## Пресеты
+
+Формат — официальный INI роутера (`llama-server --models-preset`). Подробности
+формата и каскада: `docs/ru/presets.md`.
+
+```bash
+llamastery presets list                      # все секции
+llamastery presets show <секция>             # ключи секции
+llamastery presets globals                   # секция [*]
+llamastery presets export -o - <секция>...   # выгрузка подмножества
+```
+
+### Импорт чужих пресетов
+
+Источники: локальный файл, URL, `git-репо#ветка:путь/внутри`.
+
+```bash
+llamastery presets import --source ./foreign-presets.ini --dry-run
+llamastery presets import --source 'https://github.com/u/repo#main:presets.ini' --dry-run
+llamastery presets import --source git@github.com:u/repo.git --only my-model-128k
+llamastery presets import --source ./p.ini --on-conflict new      # не перетирать
+llamastery presets import --source ./p.ini --on-conflict overwrite --conflicts
+```
+
+Поведение: по умолчанию `--dry-run`; при конфликтах `skip`; перед записью
+делается `.bak-<время>`. `--rename старая=новая` переименовывает секции.
+
+### Проверка
+
+```bash
+llamastery validate                          # все секции текущего models.ini
+llamastery validate <секция> --json
+llamastery validate --no-paths                # не ходить на диск (быстрее)
+```
+
+Ловит: неизвестные ключи, control-аргументы роутера (`api-key`, `models-max`
+вырезаются; `port`/`host`/`alias` перезаписываются), несуществующие GGUF,
+`c` больше обученного контекста, `n-cpu-moe` больше числа слоёв, известные
+грабли форков.
+
+## Загрузка сборки и пресета
+
+`llamastery` сам управляет сервером — отдельных менеджеров (`llama`,
+`llama-faks`, `llama-ik`) **не требуется и не используется**. Это осознанно:
+скрипты под каждую сборку есть далеко не у всех, а скилл должен работать
+у того, кто их не ставил.
+
+```bash
+llamastery runtime start --build faks      # поднять роутер
+llamastery runtime status                  # порт, pid, сборка, что в VRAM
+llamastery load <пресет>                   # загрузить пресет в VRAM
+llamastery runtime unload [модель]         # выгрузить, сервер остаётся жив
+llamastery runtime restart --build faks
+llamastery runtime stop
+llamastery runtime logs -n 100
+```
+
+Роутер поднимается как `llama-server --models-preset <ini> --host --port`;
+пид и лог лежат в `~/.local/state/llamastery/`. Переменные окружения
+сборки берутся из реестра (`builds add --env GGML_...=1`), а не из кода.
+
+Перед загрузкой — проверка по схеме **этой** сборки и прогноз VRAM:
+
+```
+пресет: qwen3.8-35B-A3B-miniplus-21-128ctx-ngram-mmproj
+сборка: faks   бинарь: /home/axel/git/llama-faks/build/bin/llama-server
+  VRAM: 8.67 GiB из 12.00 GiB, запас +2.96 GiB
+```
+
+При ошибках загрузка не выполняется (`--force` обходит). Схема флагов у
+каждой сборки своя, поэтому пресет, написанный под форк, на ik_llama даст
+предупреждения: часть флагов там просто не существует.
+
+Сборки **без роутера** (ik_llama, где нет `--models-preset`) тоже
+поддержаны: `llamastery load --build ik` транслирует секцию пресета в argv и
+перезапускает single-сервер. Посмотреть argv, не запуская:
+
+```bash
+llamastery load <пресет> --build ik --dry-run
+```
+
+### Замер скорости на реальной глубине
+
+Тюнер экономит на глубине, а работать нужно на длинном контексте.
+Поэтому глубину измеряют отдельно, на живом сервере:
+
+```bash
+llamastery probe --tokens 110000 --max-tokens 96 --repeats 2
+llamastery probe --tokens 4096 --repeats 1        # короткий, для кривой
+llamastery probe --image ~/фото.jpg               # проверка зрения (mmproj)
+llamastery probe --from-file server.cpp --tokens 110000   # промпт из настоящего файла
+llamastery probe ... --record --preset <секция>  # записать в measurements.json
+```
+
+Замер идёт обычным запросом: сервер сам считает timings, отсюда
+`prompt_n / predicted_n / *_ms`. Работает и с роутером, и с одиночным
+сервером.
+
+**Prompt cache выключен явно:** в запрос уходит `cache_prompt: false`. Без
+этого повтор того же текста приходит из прогретого KV с `prompt_n = 4` вместо
+110000, и prefill такой пробы в разы ниже — на графике это выглядит как
+«внезапно ускорилось». Такие пробы помечаются 🔥 и в статистику
+prefill не попадают. Если все пробы серии прогретые, инструмент честно скажет, что
+холодного prefill в ней нет.
+
+**Что именно мерить — важнее повторов.** Проба «без повторов» из выдуманного
+словаря частично зацикливает модель, и результат зависит от того, как сборка
+переживает зацикливание, а не от реальной скорости. Для честной оценки —
+`--from-file` с настоящим кодом или прозой; при обрыве файла добавляется хвост,
+иначе модель считает файл завершённым и выдаёт EOS на первом токене.
+
+Измеренная разница на 114688 (Qwen3.8 и Tiel-Coder NanoPlus, faks):
+
+| промпт | ngram-mod | без ngram |
+|---|---|---|
+| текст с повторами | 96–107 t/s | 26–28 t/s |
+| реальный код на 110k | 25.6 t/s | 28.8 t/s |
+
+Ускоритель даёт ×3–4 на повторяющемся тексте и **вредит** на уникальном: он
+платит за промахи. Включать его нужно под задачи с повторами, а не постоянно.
+
+### Замер фактической памяти
+
+Пока пресет загружен — сними факт с карты, он станет надёжнее любой оценки:
+
+```bash
+llamastery measure                    # записать в measurements.json
+llamastery measure --recalibrate      # заодно пересчитать compute buffer
+```
+
+Замер имеет приоритет над оценкой в `budget` и `validate`.
+
+## Бюджет VRAM и прогноз по слотам
+
+```bash
+llamastery budget                              # все пресеты + прогноз по --models-max
+llamastery budget <секция> <секция> --models-max 2 --reserve 1024 --explain
+llamastery calibrate <секция> --free-mib 1147
+llamastery calibrate a=1147,b=992 --free-mib     # точечно, по каждой секции
+llamastery calibrate --from-log                  # по отчётам сервера о compute buffer
+```
+
+`budget` раскладывает веса / KV / mmproj и добавляет **подогнанный** compute
+buffer. Пока `calibrate` не запускался, оценка занижена — об этом печатается
+предупреждение, и это не баг. `calibrate` также показывает разброс остатков:
+если он больше гигабайта, структурной модели нельзя доверять и нужно опираться
+на замеры.
+
+**Живой замер важнее прогноза.** Если по пресету есть фактический `used_mib`,
+решение «влезает ли» принимается по нему, а оценка показывается рядом для
+сверки. Иначе рабочий пресет с неточной моделью выглядит невмещающимся —
+так случилось с `tiel-coder-nanoplus-128ctx-mmproj-moe16` (оценка 11.54 GiB
+против 10.42 GiB по факту).
+
+`calibrate --from-log` точнее `--from-tune`: он читает прямо из лога сервера
+строки `CUDA0 compute buffer size` рядом с `n_ubatch`, то есть буфер назван
+сам собой. Минус — сервер печатает такую разбивку не при каждой загрузке
+(в режиме роутера отчёт инстанса иногда не попадает в общий лог), поэтому
+точек бывает мало. Остаток от общего (старый способ) включает постоянные
+накладные расходы и потому завышает буфер примерно на 0.3 GiB.
+
+## Журнал падений
+
+```bash
+llamastery crashes                       # какие пресеты роняют сервер и почему
+llamastery crashes --forget <пресет>     # снять запись: пресет проверен и работает
+```
+
+Пресет может загрузиться, пройти валидацию по схеме и упасть только на глубоком
+контексте — так роняет CUDA связка `ubatch 2048 + ngram-mod` на 114688. Такие
+падения запоминаются автоматически (при неудачной загрузке и при падении
+инстанса во время `probe`), после чего:
+
+- `validate` предупреждает о пресете, который ронял сервер;
+- `presets annotate` вписывает в блок пресета строку «⚠️ Нюанс: ПАДАЕТ ...»;
+- успешный замер снимает запись сам — проверенный пресет не должен числиться
+  падающим.
+
+Хранится в `~/.local/state/llamastery/crashes.json`.
+
+## Замеры
+
+```bash
+llamastery ingest             # что найдено в tune-results и комментариях models.ini
+llamastery ingest --apply     # сохранить в ~/.local/state/llamastery/measurements.json
+```
+
+Замеры из `tune-results/*/results.json` (генерируются тюнером) и из
+комментариев над секциями `models.ini` сводятся в единое хранилище и
+подставляются в `budget` и `validate` (замер важнее эвристики).
+
+## Автотюнинг
+
+Движок — `tools/tune_models.py` (двухэтапный: `llama-bench` на скрининг,
+`llama-server` на валидацию контекста, KV, RAM/VRAM и retrieval-тест).
+Обёртка подставляет путь к сборке:
+
+```bash
+llamastery tune ~/.config/llama/models.ini <секция> --build faks --extra deep apply
+llamastery tune models.ini tiel-coder-nanoplus-128ctx --build faks \
+        --extra c=114688 n-cpu-moe=20 ubatch=1024 reserve=1024 min-tps=25
+```
+
+Методика, ловушки и уже выведенные законы — `docs/ru/tuning.md`
+(есть также `docs/en/tuning.md` и `docs/zh/tuning.md`).
+**Прогон тюнера занимает минуты-десятки минут и грузит GPU.** Перед запуском
+скажи пользователю, что будет, и запускай только по явному согласию.
+
+## Правила работы
+
+1. Ничего не пиши в `models.ini` без `--dry-run` сначала и без согласия
+   пользователя. Резервная копия делается автоматически, но это не отменяет
+   необходимость спросить.
+2. Оценка VRAM — оценка. Есть замер — показывай замер, а не вычисление.
+3. Форки не коммить и не пушь без явной просьбы. В частности в
+   `AGENTS.md` форка Faks прямо запрещён автоматический коммит и PR от
+   имени агента — придерживайся этого, если задача коснётся самого форка.
+4. Пути к моделям в пресетах указывают в кэш HF (`~/.cache/huggingface/hub`).
+   Не предлагай дублировать модели в отдельный каталог без причины.
+5. `ik_llama` не умеет роутер: для него пресеты надо раскладывать в argv
+   самому, проверяй `builds show ik`.

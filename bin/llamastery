@@ -1,0 +1,1398 @@
+#!/usr/bin/env python3
+"""llamastery — управление сборками/форками llama.cpp и пресетами.
+
+Только стандартная библиотека. Каждая подкоманда самодостаточна и
+безвредна: по умолчанию ничего не пишет (--dry-run), а перед реальной
+записью делает резервную копию.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib import (budget, builds, crashes, gguf, measure, paths, presets,  # noqa: E402
+                 runtime, schema, server, validate)
+from lib.inifile import IniFile  # noqa: E402
+
+MIB = 2 ** 20
+
+
+def out(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=1, default=str))
+
+
+def human_gb(x: float) -> str:
+    return f"{x:6.2f} GiB"
+
+
+# ─────────────────────────── builds ───────────────────────────
+def cmd_builds_stale(args) -> int:
+    """Актуальность сборок: отстают ли от апстрима и от своего же дерева.
+
+    Проверять это стоит перед замерами: за сутки форк может получить новые
+    коммиты, а с ними — новые флаги, и пресет, который сегодня проходит
+    валидацию, завтра может вести себя иначе. Проверка ничего не меняет —
+    она только сообщает, решение остаётся за человеком.
+    """
+    names = list(builds.all_builds()) or []
+    if args.name:
+        names = [args.name]
+    if not names:
+        print("реестр пуст. Заполнить: llamastery builds detect --apply")
+        return 1
+    stale, code = [], 0
+    for n in names:
+        r = builds.freshness(n, fetch=not args.no_fetch)
+        if r.get("error"):
+            print(f"[—  ] {n}: {r['error']}")
+            code = code or 1
+            continue
+        behind, ahead = r.get("behind"), r.get("ahead")
+        bits = [f"ветка {r.get('branch')} @ {r.get('head')}"]
+        if behind:
+            bits.append(f"отстал на {behind} комм.")
+        if ahead:
+            bits.append(f"своих коммитов: {ahead}")
+        if r.get("dirty"):
+            bits.append("дерево грязное")
+        if r.get("bin_behind_tree"):
+            bits.append("бинарь старее дерева")
+        ok = not (behind or r.get("bin_behind_tree"))
+        print(f"[{'ok ' if ok else 'stl'}] {n:<9} " + ", ".join(bits))
+        if r.get("note"):
+            print(f"         ! {r['note']}")
+        if behind:
+            stale.append((n, r))
+            for c in r.get("new_commits", [])[:6]:
+                print(f"         + {c}")
+            if len(r.get("new_commits", [])) > 6:
+                print(f"         + …ещё {behind - 6}")
+            if r.get("flags_may_change"):
+                files = ", ".join(Path(f).name for f in r.get("flag_files", []))
+                print(f"         ! менялись файлы с флагами: {files}")
+                for ln in r.get("flag_diffstat", []):
+                    print(f"           {ln.strip()}")
+                print(f"         после обновления схема флагов пересоберётся сама;")
+                print(f"         проверь её: llamastery schema {n} --refresh")
+    if not stale:
+        print("\nвсе сборки актуальны")
+        return 0
+    print(f"\nтребуют внимания: {', '.join(n for n, _ in stale)}")
+    print("обновление и пересборка — решение человека:")
+    print("  git -C <путь> pull && cmake --build build -j$(nproc)")
+    print("затем: llamastery schema <сборка> --refresh")
+    return 3
+
+
+def cmd_builds(args) -> int:
+    if args.action == "stale":
+        return cmd_builds_stale(args)
+    if args.action == "list":
+        reg = builds.all_builds()
+        if not reg:
+            print("реестр пуст. Заполнить: llamastery builds detect --apply")
+            return 0
+        for name, b in reg.items():
+            st = b.status()
+            mark = "ok " if st["bin_exists"] else "—  "
+            print(f"[{mark}] {name:<10} {st['server_bin']}")
+            if st.get("version"):
+                print(f"         версия: {st['version']}")
+            if st.get("git", {}).get("branch"):
+                dirty = " (грязное дерево)" if st["git"].get("dirty") else ""
+                print(f"         git: {st['git']['branch']} {st['git'].get('commit','')}{dirty}")
+            print(f"         router: {'да' if st['router'] else 'нет (single)'}"
+                  f" | менеджер: {st['manager'] or '—'}")
+            if st["note"]:
+                print(f"         {st['note']}")
+        return 0
+
+    if args.action == "detect":
+        found = builds.detect()
+        if not found:
+            print("типичных форков не найдено")
+            return 1
+        for b in found:
+            st = b.status()
+            print(f"{b.name:<10} {b.path}")
+            print(f"           бинарь: {'есть' if st['bin_exists'] else 'НЕТ сборки'}"
+                  f"  remote: {b.remote}")
+        if args.apply:
+            for b in found:
+                builds.upsert(b)
+            print(f"\nзаписано в {paths.builds_file()}")
+        else:
+            print("\n(только просмотр; добавь --apply чтобы записать в реестр)")
+        return 0
+
+    if args.action == "add":
+        b = builds.Build(name=args.name, path=args.path, remote=args.remote or "",
+                         router=not args.no_router, manager=args.manager or "",
+                         note=args.note or "", port=args.port)
+        builds.upsert(b)
+        print(f"добавлен: {b.name} -> {b.server_bin}")
+        if b.port:
+            print(f"  порт: {b.port}")
+        if not b.server_bin.exists():
+            print("  ВНИМАНИЕ: бинарь не собран (build/bin/llama-server отсутствует)")
+        return 0
+
+    if args.action == "rm":
+        print("удалён" if builds.remove(args.name) else "не найден")
+        return 0
+
+    if args.action == "show":
+        b = builds.get(args.name)
+        if not b:
+            print(f"нет сборки {args.name!r}", file=sys.stderr)
+            return 1
+        out(b.status())
+        return 0
+    return 2
+
+
+# ─────────────────────────── schema ───────────────────────────
+def cmd_schema(args) -> int:
+    binary, src = builds.resolve_binary(args.build)
+    flags, meta = schema.load(binary, refresh=args.refresh)
+    if meta.get("error"):
+        print(f"ошибка схемы: {meta['error']}", file=sys.stderr)
+        return 1
+    if args.json:
+        uniq = {f.canonical: f for f in {id(v): v for v in flags.values()}.values()}
+        out({"meta": meta,
+             "flags": {k: {"kind": f.kind, "enum": f.enum, "default": f.default,
+                           "ini_keys": f.ini_keys(), "env": f.env}
+                       for k, f in uniq.items()}})
+        return 0
+    if args.grep:
+        pat = args.grep.lower()
+        uniq = {f.canonical: f for f in {id(v): v for v in flags.values()}.values()}
+        for k, f in sorted(uniq.items()):
+            if pat in k.lower() or pat in f.description.lower():
+                print(f"{f.canonical:<26} kind={f.kind:<7} "
+                      f"enum={','.join(f.enum[:5]) or '—':<40} "
+                      f"default={f.default or '—'}")
+                if f.description:
+                    print(f"    {f.description[:110]}")
+        return 0
+    uniq = {id(v): v for v in flags.values()}
+    print(f"источник: {meta.get('binary')} ({src})")
+    print(f"флагов:   {len(uniq)}   mtime: {meta.get('mtime')}")
+    return 0
+
+
+# ─────────────────────────── presets ───────────────────────────
+def _load_ini(path: str | None) -> IniFile:
+    return IniFile.load(path or paths.default_ini())
+
+
+def cmd_presets(args) -> int:
+    if args.action == "list":
+        ini = _load_ini(args.ini)
+        g = ini.globals()
+        for name, sec in ini.sections.items():
+            if name == "*":
+                continue
+            p = sec.pairs()
+            model = p.get("model") or p.get("m") or p.get("hf-repo") or "—"
+            ctx = p.get("c") or p.get("ctx-size") or "?"
+            mark = g and name == "*"
+            print(f"{name}")
+            print(f"    модель: {Path(model).name if model != '—' else model}")
+            print(f"    ctx: {ctx}  ключей: {len(p)}")
+        return 0
+
+    if args.action == "show":
+        ini = _load_ini(args.ini)
+        for name in args.names:
+            sec = ini.section(name)
+            if not sec:
+                print(f"нет секции {name!r}", file=sys.stderr)
+                continue
+            print(f"[{name}]")
+            for k, v in sec.pairs().items():
+                print(f"  {k} = {v}")
+        return 0
+
+    if args.action == "globals":
+        ini = _load_ini(args.ini)
+        g = ini.globals()
+        if not g:
+            print("глобальной секции [*] нет")
+            return 0
+        for k, v in g.items():
+            print(f"{k} = {v}")
+        return 0
+
+    if args.action == "annotate":
+        from lib import annotate as _a
+        ini = _load_ini(args.ini)
+        rep = _a.annotate(ini, apply_changes=args.apply)
+        if args.dry_run or not args.apply:
+            import difflib
+            d = difflib.unified_diff(ini.text.splitlines(),
+                                     rep["text"].splitlines(),
+                                     fromfile=str(ini.path) + " (сейчас)",
+                                     tofile=str(ini.path) + " (стандарт)",
+                                     lineterm="", n=1)
+            print("\n".join(d))
+        else:
+            print(f"переписано блоков: {len(rep['changed'])}")
+        print(f"\nизменено секций: {len(rep['changed'])} из "
+              f"{len(rep['metrics'])}")
+        if rep["unparsed"]:
+            print("\nНЕ РАСПОЗНАНО (перенесено в Нюанс как есть):")
+            for name, lines in rep["unparsed"].items():
+                print(f"  [{name}]")
+                for l in lines:
+                    print(f"      {l[:100]}")
+        if args.dry_run or not args.apply:
+            print("\n(dry-run: файл не тронут; --apply чтобы записать)")
+        return 0
+
+    if args.action == "export":
+        ini = _load_ini(args.ini)
+        text = presets.export_sections(ini, args.names)
+        if args.output in (None, "-"):
+            sys.stdout.write(text)
+        else:
+            Path(args.output).expanduser().write_text(text, encoding="utf-8")
+            print(f"записано: {args.output} ({len(text)} байт)")
+        return 0
+
+    if args.action == "import":
+        text, origin = presets.fetch_source(args.source)
+        tmp = Path(paths.cache_dir()) / "import-source.ini"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(text, encoding="utf-8")
+        src_ini = IniFile(tmp, text)
+
+        target_path = Path(args.target or paths.default_ini()).expanduser()
+        if target_path.exists():
+            tgt = IniFile.load(target_path)
+        else:
+            # импорт в новый файл — это нормальный сценарий, а не ошибка
+            tgt = IniFile(str(target_path), "")
+            print(f"цель не существует, будет создана: {target_path}")
+
+        res = presets.merge_into(tgt, src_ini, only=args.only,
+                                 rename=dict(p.split("=", 1) for p in (args.rename or [])
+                                             if "=" in p),
+                                 on_conflict=args.on_conflict)
+        print(f"источник: {origin}")
+        print(f"цель:     {target_path}")
+        print(f"добавлено: {len(res.added)}  обновлено: {len(res.updated)}  "
+              f"пропущено: {len(res.skipped)}")
+        for s in res.added:
+            print(f"  + {s}")
+        for s in res.updated:
+            print(f"  ~ {s}")
+        if res.conflicts:
+            print("\nконфликты (было -> стало):")
+            for sec, key, ch in res.conflicts[:30]:
+                print(f"  [{sec}] {key}: {ch}")
+            if len(res.conflicts) > 30:
+                print(f"  ... ещё {len(res.conflicts) - 30}")
+        if not res.changed:
+            print("\nизменений нет")
+            return 0
+        if args.dry_run:
+            print("\n(dry-run: файл не тронут)")
+            return 0
+        if args.conflicts and args.on_conflict == "skip":
+            print("\nесть конфликты — нужен --on-conflict overwrite или --allow-conflicts")
+            return 3
+        bk = (presets.backup(target_path) if target_path.exists()
+              else None)
+        tgt.save()
+        print(f"\nзаписано: {target_path}"
+              + (f". резервная копия: {bk}" if bk else ""))
+        return 0
+    return 2
+
+
+# ─────────────────────────── load ───────────────────────────
+def _adopt_running_build() -> str | None:
+    """Восстановить знание о работающей сборке в свежем процессе.
+
+    Каждый вызов CLI — отдельный процесс, а адрес сервера зависит от сборки
+    (у неё может быть свой порт). Без этого шага `probe` и `measure` после
+    `load` пошли бы на дефолтный 8099 и увидели пустую VRAM.
+    """
+    pf = server.read_pid()
+    if pf and server.alive(pf):
+        name = server.identify(pf)
+        if name:
+            server.use_build(name)
+            return name
+    return None
+
+
+def cmd_load(args) -> int:
+    """Загрузить пресет: роутер — через API, сборка без роутера — рестартом.
+
+    Перед загрузкой пресет проверяется по схеме выбранной сборки и
+    прогнозируется VRAM; при ошибках загрузка не выполняется.
+    """
+    import time
+
+    ini = _load_ini(args.ini)
+    name, cands = runtime.pick_preset_name(args.preset, ini)
+    if not name:
+        print(f"пресет {args.preset!r} не найден", file=sys.stderr)
+        for c in cands:
+            print(f"  похоже: {c}", file=sys.stderr)
+        if not cands:
+            print("  подсказка: llamastery presets list", file=sys.stderr)
+        return 2
+    if len(cands) > 1:
+        print(f"подходит {len(cands)} секций, укажи точное имя:", file=sys.stderr)
+        for c in cands:
+            print(f"  {c}", file=sys.stderr)
+        return 2
+
+    build_name = args.build or runtime.active_build()
+    binary, bsrc = builds.resolve_binary(build_name)
+    b = builds.get(build_name) if build_name else None
+    pairs = ini.section(name).pairs()
+    ok, report = runtime.preflight(name, pairs, build_name)
+    print(f"пресет: {name}")
+    print(f"сборка: {build_name or '?'}   бинарь: {binary}")
+    if report:
+        print(report)
+    if not ok and not args.force:
+        print("\nотказ: пресет не проходит проверку. Исправить или --force.")
+        return 1
+
+    # ---- сборка без роутера: единственный способ — старт с трансляцией пресета
+    if b is not None and not b.router:
+        print(f"внимание: {build_name} без роутера (--models-preset не "
+              f"работает), пресет транслируется в argv и сервер "
+              f"перезапускается")
+        if args.dry_run:
+            from lib import schema as _sch
+            flags, meta = _sch.load(b.server_bin)
+            extra, warns = server.preset_to_argv(pairs, flags)
+            for w in warns:
+                print(f"  ! {w}")
+            print("\n(dry-run) argv:")
+            print("   ", " ".join([str(b.server_bin)] + extra
+                                  + ["--host", "127.0.0.1", "--port",
+                                     str(server.port_number())]))
+            return 0
+        server.stop()
+        res = server.start(build_name, ini=str(ini.path), preset=name)
+        print(res.message)
+        return 0 if res.ok else 1
+
+    # ---- роутер
+    _adopt_running_build()
+    if not server.healthy():
+        if args.dry_run:
+            print("\n(dry-run) сервер не запущен; выполнится: "
+                  f"llamastery runtime start --build {build_name or '?'}")
+            return 0
+        if build_name:
+            res = server.start(build_name, ini=str(ini.path))
+            print(res.message)
+            if not res.ok:
+                return 1
+        else:
+            print("сервер не запущен и сборка не указана: "
+                  "llamastery runtime start", file=sys.stderr)
+            return 1
+
+    listed = server.models(reload=True)
+    if not listed:
+        print(f"в пресете нет моделей ({ini.path})", file=sys.stderr)
+        return 1
+    idx = None
+    for i, m in enumerate(listed):
+        if m["id"].lower() == name.lower():
+            idx = i
+            break
+    if idx is None:
+        for i, m in enumerate(listed):
+            if name.lower() in m["id"].lower():
+                idx = i
+                break
+    if idx is None:
+        print(f"секции {name!r} нет среди моделей роутера", file=sys.stderr)
+        for i, m in enumerate(listed, 1):
+            print(f"  {i}. {m['id']} [{m['status']}]", file=sys.stderr)
+        return 2
+
+    m = listed[idx]
+    if m["status"] == "loaded":
+        print(f"уже загружена: {m['id']}")
+        return 0
+    if args.dry_run:
+        print(f"\n(dry-run) загрузится: {m['id']}")
+        return 0
+
+    if m["status"] == "loading":
+        print(f"уже грузится: {m['id']}, жду")
+    else:
+        # VRAM на карте одна: выгружаем всё остальное
+        for o in listed:
+            if o["id"] == m["id"]:
+                continue
+            if o["status"] in ("loaded", "sleeping", "loading"):
+                print(f"выгружаю {o['id']} (место в VRAM нужно)")
+                server.api_unload(o["id"])
+                server.wait_status(o["id"], ("unloaded", "sleeping"), timeout=300)
+        resp = server.api_load(m["id"])
+        if isinstance(resp, dict) and resp.get("success") is not True:
+            print(f"запрос на загрузку не подтверждён: {resp}", file=sys.stderr)
+            return 1
+
+    print(f"жду загрузки {m['id']}...")
+    st = server.wait_status(m["id"], ("loaded", "sleeping"),
+                            timeout=args.timeout)
+    if st in ("loaded", "sleeping"):
+        print(f"готово: {m['id']} — {server.STATUS_LABEL.get(st, st)}")
+        return 0
+    if st == "failed":
+        print(f"не загрузилась (OOM или ошибка). Проверь n-gpu-layers / "
+              f"n-cpu-moe в {ini.path}", file=sys.stderr)
+        crashes.note(name, build_name or "?",
+                     crashes.tail_log(server.log_file()),
+                     depth=budget._flag_int(pairs, "c"),
+                     log=str(server.log_file()))
+        _say_crash(name)
+        return 1
+    print(f"таймаут загрузки, статус {st}. Лог: {server.log_file()}",
+          file=sys.stderr)
+    return 1
+
+
+def _say_crash(name: str) -> None:
+    """Сказать, что падение записано, и чем это грозит дальше."""
+    e = crashes.known(name)
+    if not e:
+        return
+    print(f"\nпадение записано в журнал ({e['kind']}): {e['why']}", file=sys.stderr)
+    print(f"  теперь validate и presets annotate будут предупреждать о {name}",
+          file=sys.stderr)
+    print(f"  прошёл замер — сбросить: llamastery crashes forget {name}", file=sys.stderr)
+
+
+def calibrate_from_log() -> int:
+    """Калибровка compute buffer по собственному отчёту сервера."""
+    import re
+    import statistics
+    import json as _json
+
+    pts: dict[int, list[float]] = {}
+    try:
+        text = server.log_file().read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"не прочитать лог {server.log_file()}: {exc}", file=sys.stderr)
+        return 1
+    ub = None
+    for ln in text.splitlines():
+        m = re.search(r"n_ubatch\s*=\s*(\d+)", ln)
+        if m:
+            ub = int(m.group(1))
+        m = re.search(r"CUDA0 compute buffer size =\s*([\d.]+) MiB", ln)
+        if m and ub:
+            pts.setdefault(ub, []).append(float(m.group(1)))
+    if not pts:
+        print("в логе нет ни одной строки «CUDA0 compute buffer size»")
+        print(f"  лог: {server.log_file()}")
+        print("  такие строки сервер печатает при загрузке модели; в режиме")
+        print("  роутера отчёт инстанса иногда не попадает в общий лог — тогда")
+        print("  запусти одиночный сервер (llamastery runtime start --preset ...) и повтори")
+        return 1
+
+    print("найдено в логе:")
+    for u in sorted(pts):
+        vals = pts[u]
+        print(f"  ubatch {u:>5}: {statistics.median(vals):8.0f} MiB "
+              f"({len(vals)} сообщ.)")
+    ub_ref, vals_ref = sorted(pts.items())[0]
+    mib = statistics.median(vals_ref)
+    cal = budget.load_calibration()
+    old = cal.get("compute_gb", 0.0)
+    cal["compute_gb"] = round(mib / 1024.0, 3)
+    cal["compute_ref_ubatch"] = ub_ref
+    cal["compute_source"] = (f"ж��ой отчёт сервера: {mib:.0f} MiB при "
+                             f"n_ubatch={ub_ref} (точек в логе: "
+                             f"{sum(len(v) for v in pts.values())})")
+    budget.save_calibration(cal)
+    print(f"\nбыло: {old:.3f} GiB при ub={cal.get('compute_ref_ubatch')}")
+    print(f"стало: {cal['compute_gb']:.3f} GiB при ub={ub_ref}  [запись сохранена]")
+    print("проверь: llamastery budget --ini <файл> <секция>")
+    return 0
+
+
+def cmd_crashes(args) -> int:
+    """Журнал падений: какие пресеты роняют сервер и почему."""
+    entries = crashes.all_entries()
+    if args.forget:
+        ok = crashes.forget(args.forget)
+        print(f"удалено: {args.forget}" if ok else "такой записи нет")
+        if ok:
+            print(f"не забудь перезаписать пресет: llamastery presets annotate "
+                  f"--ini <файл> --apply")
+        return 0 if ok else 1
+    if not entries:
+        print("падений не записано")
+        print(f"  журнал: {paths.crashes_file()}")
+        return 0
+    print(f"падений записано: {len(entries)}\n")
+    for name, e in sorted(entries.items(),
+                          key=lambda kv: kv[1].get("last", ""), reverse=True):
+        depth = f", глубина {e['depth']} ток." if e.get("depth") else ""
+        print(f"  {name}")
+        print(f"    {e.get('why', '')} [{e.get('kind', '?')}]")
+        print(f"    {e.get('count', 1)} раз, последний {e.get('last', '?')}"
+              f", сборка {e.get('build', '?')}{depth}")
+    print(f"\nжурнал: {paths.crashes_file()}")
+    print(f"сбросить после успешного замера: llamastery crashes forget <пресет>")
+    return 0
+
+
+def cmd_runtime(args) -> int:
+    """Собственный жизненный цикл сервера. Внешние менеджеры не нужны."""
+    if args.verb == "status":
+        st = server.status()
+        print(f"роутер:    {st['url']}   "
+              f"{'отвечает' if st['up'] else 'НЕ отвечает'}")
+        print(f"порт:      {st['port']}")
+        print(f"pid:       {st['pid'] or '-'}")
+        print(f"сборка:    {st['build'] or 'не определена'}")
+        print(f"пресет:    {st['ini']}")
+        if st.get("single"):
+            print(f"single:    {st['single'].get('preset')}")
+        print(f"лог:       {st['log']}")
+        if st["models"]:
+            print("модели:")
+            for m in st["models"]:
+                label = server.STATUS_LABEL.get(m["status"], m["status"])
+                print(f"  [{m['status']:<10}] {m['id']}"
+                      + (f"   {label}" if m["status"] != "loaded" else ""))
+        else:
+            print("модели:    нет (VRAM свободна)")
+        return 0 if st["up"] else 1
+
+    if args.verb == "start":
+        if server.healthy():
+            print(f"уже работает на {server.server_url()}")
+            if args.reload:
+                n = len(server.models(reload=True))
+                print(f"пресет перечитан: {n} моделей")
+            return 0
+        res = server.start(args.build, ini=args.ini, preset=args.preset)
+        for w in res.warnings:
+            print(f"  ! {w}")
+        print(res.message)
+        if res.ok and res.argv:
+            print("argv: " + " ".join(res.argv))
+        return 0 if res.ok else 1
+
+    if args.verb == "stop":
+        ok, msg = server.stop()
+        print(msg)
+        return 0 if ok else 1
+
+    if args.verb == "restart":
+        ok, msg = server.stop()
+        print(msg)
+        res = server.start(args.build, ini=args.ini, preset=args.preset)
+        print(res.message)
+        return 0 if res.ok else 1
+
+    if args.verb == "unload":
+        if not server.healthy():
+            print("сервер не запущен — выгружать нечего, VRAM свободна")
+            return 0
+        listed = server.models()
+        want = [args.model] if args.model else [m["id"] for m in listed
+                                                if m["status"] in
+                                                ("loaded", "sleeping", "loading")]
+        if not want:
+            print("загруженных моделей нет")
+            return 0
+        for mid in want:
+            print(f"выгружаю {mid}...")
+            server.api_unload(mid)
+        for mid in want:
+            st = server.wait_status(mid, ("unloaded", "sleeping"), timeout=300)
+            print(f"  {mid}: {server.STATUS_LABEL.get(st, st)}")
+        print(f"сервер жив на {server.server_url()}")
+        return 0
+
+    if args.verb == "logs":
+        n = args.lines or 50
+        try:
+            data = server.log_file().read_text(encoding="utf-8",
+                                               errors="replace").splitlines()
+        except OSError as exc:
+            print(f"лог недоступен: {exc}", file=sys.stderr)
+            return 1
+        for line in data[-n:]:
+            print(line)
+        return 0
+
+    if args.verb == "doctor":
+        return cmd_doctor(argparse.Namespace(build=args.build))
+
+    print(f"неизвестный verb: {args.verb}", file=sys.stderr)
+    return 2
+
+
+# ─────────────────────────── validate ───────────────────────────
+def cmd_validate(args) -> int:
+    ini = _load_ini(args.ini)
+    binary, src = builds.resolve_binary(args.build)
+    if not args.build:
+        print("внимание: --build не указан, схема взята у сборки по умолчанию "
+              f"({src}). Проверка флагов другой сборки будет ложной.",
+              file=sys.stderr)
+    flags, meta = schema.load(binary)
+    if meta.get("error"):
+        print(f"ошибка схемы: {meta['error']}", file=sys.stderr)
+        return 1
+    names = args.names or [n for n in ini.names() if n != "*"]
+    rep = validate.Report()
+    cache: dict = {}
+    store = measure.load_store()
+    checked_models = 0
+    for name in names:
+        sec = ini.section(name)
+        if not sec:
+            continue
+        pairs = sec.pairs()
+        validate.validate_section(name, pairs, flags, rep,
+                                  check_paths=not args.no_paths, model_cache=cache)
+        meas = measure.lookup(pairs, store)
+        validate.check_traps(name, pairs, rep, meas)
+        validate.check_crash_history(name, rep)
+        checked_models += 1
+
+    if args.json:
+        out({"ini": str(paths.default_ini() if not args.ini else args.ini),
+             "schema_from": meta.get("binary"),
+             "errors": rep.count("error"), "warnings": rep.count("warn"),
+             "findings": [f.__dict__ for f in rep.findings]})
+    else:
+        print(f"проверено секций: {checked_models}   схема: {meta.get('binary')}")
+        if not rep.findings:
+            print("проблем не найдено")
+        for f in rep.findings:
+            print(f.line())
+        print(f"\nошибок: {rep.count('error')}  предупреждений: {rep.count('warn')}")
+    return 0 if rep.ok else 1
+
+
+# ─────────────────────────── budget ───────────────────────────
+def cmd_budget(args) -> int:
+    ini = _load_ini(args.ini)
+    names = args.names or [n for n in ini.names() if n != "*"]
+    cal = budget.load_calibration()
+    vram = budget.gpu_total_mib()
+    store = measure.load_store()
+
+    rows = []
+    for name in names:
+        sec = ini.section(name)
+        if not sec:
+            continue
+        pairs = sec.pairs()
+        model = pairs.get("model") or pairs.get("m") or ""
+        meta = None
+        mp = pairs.get("mmproj")
+        mm = None
+        if model and gguf.is_gguf(model):
+            try:
+                meta = gguf.probe(model)
+            except gguf.GGUFError:
+                meta = None
+        if mp and gguf.is_gguf(mp):
+            try:
+                mm = gguf.probe(mp)
+            except gguf.GGUFError:
+                mm = None
+        est = budget.estimate(pairs, meta, mmproj_meta=mm)
+        meas = measure.lookup(pairs, store)
+        if meas and meas.get("min_free_mib") is not None:
+            est.measured_min_free_mib = meas["min_free_mib"]
+        rows.append((name, est, meas))
+
+    if not rows:
+        print("нет секций для расчёта")
+        return 1
+
+    print(f"VRAM на карте: {vram} MiB" if vram else "VRAM: неизвестно (нет nvidia-smi)")
+    print(f"compute buffer (калибровка): {cal.get('compute_gb', 0.0):.2f} GiB"
+          + ("" if cal.get("compute_gb") else "   ← НЕ КАЛИБРОВАНО, оценка занижена"))
+    print()
+    hdr = f"{'пресет':<44} {'веса':>9} {'KV':>8} {'mmproj':>7} {'прочее':>8} {'всего':>9} {'tg':>7}"
+    print(hdr)
+    print("-" * len(hdr))
+    for name, est, meas in rows:
+        tg = ""
+        if meas:
+            tg = meas.get("deep_tps") or meas.get("short_tps") or ""
+            tg = f"{tg:.0f} t/s" if isinstance(tg, (int, float)) else ""
+        print(f"{name[:43]:<44} {est.weights_gb:8.2f}G {est.kv_gb:7.2f}G "
+              f"{est.mmproj_gb:6.2f}G {est.compute_gb:7.2f}G {est.total_gb:8.2f}G {tg:>9}")
+
+    # прогноз против --models-max
+    budget_mib = vram or int(cal.get("vram_total_mib", 0) or 0)
+    reserve = args.reserve
+    if budget_mib:
+        usable = budget_mib - reserve
+        print(f"\nслот одновременно (models-max = {args.models_max}), "
+              f"резерв {reserve} MiB → доступно {usable} MiB")
+# Живой замер важнее прогноза: пресет, который уже мерился и влезает,
+        # нельзя объявлять невмещающимся из-за неточной модели.
+        def need_mib(est, meas):
+            if meas and meas.get("used_mib"):
+                return float(meas["used_mib"])
+            return est.total_gb * 1024.0
+
+        ranked = sorted(rows, key=lambda r: need_mib(r[1], r[2]))
+        loaded, used = [], 0.0
+        for name, est, meas in ranked:
+            if used + need_mib(est, meas) <= usable:   # MiB
+                loaded.append((name, need_mib(est, meas), bool(meas and meas.get("used_mib"))))
+                used += need_mib(est, meas)
+            if len(loaded) >= args.models_max:
+                break
+        for name, mib, is_meas in loaded:
+            src = "замер" if is_meas else "оценка"
+            print(f"  влезает: {name}  ({mib / 1024.0:.2f} GiB, {src})")
+        if len(loaded) < min(args.models_max, len(ranked)):
+            print("  не влезает:")
+            for name, est, meas in ranked[len(loaded):min(args.models_max, len(ranked))]:
+                mib = need_mib(est, meas)
+                src = "замер" if (meas and meas.get("used_mib")) else "оценка"
+                print(f"    {name}  нужно {mib / 1024.0:.2f} GiB ({src}), "
+                      f"осталось {(usable - used) / 1024.0:.2f} GiB")
+    else:
+        print("\n(прогноз по слотам не построен: неизвестен объём VRAM)")
+
+    if args.explain and rows:
+        name, est, _ = rows[0]
+        print(f"\nразбор «{name}»:")
+        for n in est.notes:
+            print(f"  - {n}")
+    return 0
+
+
+def cmd_calibrate(args) -> int:
+    """Подгоняет compute buffer по фактическим замерам.
+
+    --from-tune берёт все успешные прогоны tune_models.py, считает для
+    каждого структурную часть (веса с учётом n-cpu-moe + KV + mmproj) и
+    берёт медиану остатка. Так калибровка не зависит от того, какие секции
+    пользователь перечислил руками.
+
+    --from-log читает прямо из лога сервера строки «CUDA0 compute buffer
+    size» рядом с n_ubatch. Это единственный источник, где compute buffer
+    назван сам собой, а не вычислен вычитанием; остаток от общего включает
+    постоянные накладные расходы и потому завышает буфер. Минус — сервер
+    пишет такую разбивку не при каждой загрузке (в режиме роутера лог
+    инстанса может не попасть в общий), поэтому точек бывает мало.
+    """
+    if args.from_log:
+        return calibrate_from_log()
+    if args.from_tune:
+        return calibrate_from_tune()
+
+    import glob
+    import json as _json
+    import statistics
+    ini = _load_ini(args.ini)
+    names = args.names
+    if not names:
+        store = measure.load_store()
+        names = list(store.get("records", {}).keys())
+        print("укажи секции явно (измерения по подписям не разворачиваются в секции)")
+    structural, measured, residuals = [], [], []
+    for name in names:
+        sec = ini.section(name)
+        if not sec:
+            print(f"нет секции {name!r}", file=sys.stderr)
+            continue
+        pairs = sec.pairs()
+        model = pairs.get("model") or ""
+        if not model or not gguf.is_gguf(model):
+            print(f"{name}: нет модели — пропуск")
+            continue
+        meta = gguf.probe(model)
+        mm = None
+        if pairs.get("mmproj") and gguf.is_gguf(pairs["mmproj"]):
+            mm = gguf.probe(pairs["mmproj"])
+        est = budget.estimate(pairs, meta, compute_gb=0.0, mmproj_meta=mm)
+        def pick(arg):
+            """Значение можно задать общим флагом или точечно: секция=значение."""
+            if not arg:
+                return None
+            for item in str(arg).split(","):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    if k.strip() == name:
+                        return float(v)
+                elif len(str(arg).split(",")) == 1:
+                    return float(item)
+            return None
+        used = pick(args.used_gib)
+        if used is None:
+            free = pick(args.free_mib)
+            total = budget.gpu_total_mib()
+            if free is None or not total:
+                print(f"{name}: не хватает данных (нужно --used-gib или "
+                      f"--free-mib, можно точечно: --free-mib {name}=1147)")
+                continue
+            used = (total - free) / 1024.0    # MiB -> GiB
+        structural.append(est.weights_gb + est.kv_gb + est.mmproj_gb)
+        measured.append(used)
+        residuals.append(used - structural[-1])
+        print(f"{name}: структура {structural[-1]:.2f} GiB, факт {used:.2f} GiB, "
+              f"остаток {used - structural[-1]:+.2f} GiB")
+    if not structural:
+        print("нечего калибровать")
+        return 1
+    if len(residuals) > 1:
+        spread = max(residuals) - min(residuals)
+        print(f"\nразброс остатков: {spread:.2f} GiB — "
+              + ("модель приемлема" if spread < 1.0
+                 else "модель неточна: замеры расходятся сильнее, чем предсказывает "
+                      "структурный расчёт. Доверяй замерам, не оценке."))
+    value = budget.fit([], measured, structural)
+    cal = budget.load_calibration()
+    vram = budget.gpu_total_mib()
+    if vram:
+        cal["vram_total_mib"] = vram
+    cal["compute_gb"] = round(value, 3)
+    p = budget.save_calibration(cal)
+    print(f"\ncompute_gb = {value:.3f} → {p}")
+    return 0
+
+
+def calibrate_from_tune() -> int:
+    """Калибровка по всем успешным прогонам тюнера."""
+    import glob
+    import json as _json
+    import statistics
+    import math
+    cal = budget.load_calibration()
+    real = cal.get("offload_realization", 0.89)
+    residuals, ubs = [], []
+    for f in sorted(glob.glob(str(paths.home() / ".config" / "llama" /
+                                  "tune-results" / "*" / "*" / "results.json"))):
+        try:
+            runs = _json.load(open(f, encoding="utf-8"))
+        except (OSError, _json.JSONDecodeError):
+            continue
+        for r in runs if isinstance(runs, list) else []:
+            if not isinstance(r, dict) or not r.get("ok"):
+                continue
+            free = r.get("min_observed_free_mib")
+            if free is None:
+                continue
+            cfg = {**(r.get("config") or {}), **(r.get("config_extra") or {})}
+            cmd = (r.get("command_preview") or "").split()
+            def _val(flag):
+                for i, t in enumerate(cmd):
+                    if t == flag and i + 1 < len(cmd):
+                        return cmd[i + 1]
+                    if t.startswith(flag + "="):
+                        return t.split("=", 1)[1]
+                return ""
+            model = _val("--model")
+            if not model or not gguf.is_gguf(model):
+                continue
+            try:
+                meta = gguf.probe(model)
+            except gguf.GGUFError:
+                continue
+            total_mib = budget.gpu_total_mib()
+            if not total_mib:
+                print("нужен nvidia-smi")
+                return 1
+            used = (total_mib - int(free)) / 1024.0
+            mm = None
+            mp = _val("--mmproj")
+            if mp and gguf.is_gguf(mp):
+                try:
+                    mm = gguf.probe(mp)
+                except gguf.GGUFError:
+                    mm = None
+            tmp = budget.load_calibration()
+            budget.save_calibration({**tmp, "offload_realization": real,
+                                     "compute_gb": 0.0, "compute_ref_ubatch": 0})
+            struct = budget.estimate(cfg, meta, compute_gb=0.0, mmproj_meta=mm)
+            budget.save_calibration(tmp)
+            s = struct.weights_gb + struct.kv_gb + struct.mmproj_gb
+            if used > s:
+                residuals.append(used - s)
+                ubs.append(int(cfg.get("ubatch-size") or cfg.get("ub") or 0))
+    if not residuals:
+        print("подходящих прогонов не найдено (нужны ok=True и min_observed_free_mib)")
+        return 1
+    value = statistics.median(residuals)
+    ub = int(statistics.median([u for u in ubs if u])) if any(ubs) else 0
+    total = budget.gpu_total_mib()
+    cal["compute_gb"] = round(value, 3)
+    cal["compute_ref_ubatch"] = ub
+    if total:
+        cal["vram_total_mib"] = total
+    cal["compute_source"] = (f"медиана остатка по {len(residuals)} успешным "
+                             f"прогонам при ub={ub}")
+    p = budget.save_calibration(cal)
+    print(f"учтено прогонов: {len(residuals)}")
+    print(f"compute_gb = {value:.3f} при ubatch={ub}  (разброс "
+          f"{min(residuals):.2f}..{max(residuals):.2f} GiB)")
+    print(f"записано: {p}")
+    return 0
+
+
+# ─────────────────────────── probe ───────────────────────────
+def cmd_probe(args) -> int:
+    """Замер скорости на живом сервере, на реальной глубине контекста.
+
+    Тюнер проверяет короткий контекст, потому что глубокая фаза стоит часов.
+    Здесь измеряется именно то, что нужно в работе: tg на глубине D.
+    """
+    from lib import probe as _probe
+    if not _adopt_running_build() and not server.healthy():
+        print("сервер не запущен: llamastery runtime start", file=sys.stderr)
+        return 1
+    loaded = [m for m in server.loaded_models()
+              if m["status"] in ("loaded", "sleeping")]
+    if not loaded:
+        print("в VRAM ничего не загружено: llamastery load <пресет>", file=sys.stderr)
+        return 1
+    single = bool(loaded[0].get("single"))
+    model = None if single else (args.model or loaded[0]["id"])
+    print(f"модель: {loaded[0]['id']}"
+          + ("   (одиночный сервер, --model не передаём)" if single else ""))
+    print(f"замеров: {args.repeats}   глубина промпта: {args.tokens} токенов"
+          + ("   + картинка" if args.image else "")
+          + (f"   текст из файла: {args.from_file}" if args.from_file
+             else "   текст БЕЗ повторов (честная оценка ускорителя)"
+             if args.varied else "   текст С повторами (выгодно ngram)"))
+    res = _probe.probe_repeat(args.tokens, args.max_tokens, args.repeats,
+                              image=args.image, model=model,
+                              timeout=args.timeout, varied=args.varied,
+                              from_file=args.from_file)
+    for i, r in enumerate(res["runs"], 1):
+        if not r.get("ok"):
+            print(f"  проба {i}: ОШИБКА — {r.get('error')}")
+            # сервер мог упасть целиком: модель выгружена, а пресет остаётся
+            # в ini как ни в чём не бывало. Запоминаем причину по логу.
+            e = crashes.note(model or loaded[0]["id"],
+                             server.status().get("build") or "?",
+                             crashes.tail_log(server.log_file()),
+                             depth=args.tokens, log=str(server.log_file()))
+            if e:
+                print(f"  проба уронила сервер: {e['why']}", file=sys.stderr)
+                print(f"  записано в журнал падений: {model}", file=sys.stderr)
+            continue
+        print(f"  проба {i}: prompt {r.get('prompt_n')} ток., "
+              f"сгенерировано {r.get('predicted_n')}, "
+              f"tg {r.get('gen_tps')} t/s, "
+              f"prefill {r.get('prefill_tps')} t/s, "
+              f"время {r['wall_s']} с"
+              + ("   ПРОГРЕТО, в prefill не учтена" if r.get("cached") else ""))
+        if r.get("content"):
+            print(f"           ответ: {r['content'][:110]!r}")
+    if not res.get("ok_count"):
+        return 1
+    print(f"\nитого: tg худший {res['gen_tps_min']} t/s, "
+          f"средний {res['gen_tps_mean']} t/s"
+          + (f", prefill {res['prefill_tps']} t/s" if res.get("prefill_tps") else ""))
+    if res.get("note"):
+        print(f"  {res['note']}", file=sys.stderr)
+    if res.get("cached_runs"):
+        print(f"  проб из прогретого KV: {res['cached_runs']} "
+              f"(в prefill не попали)", file=sys.stderr)
+
+    # успешный замер снимает претензию «этот пресет падает»
+    if model and not res.get("cached_runs"):
+        if crashes.forget(model):
+            print(f"  журнал падений очищен: {model} прошёл замер", file=sys.stderr)
+
+    if args.record and args.preset:
+        ini = _load_ini(args.ini)
+        pairs = (ini.section(args.preset).pairs() if ini.section(args.preset)
+                 else {})
+        if pairs:
+            cap = {"used_mib": None, "free_mib": None, "total_mib": None,
+                   "loaded": [model], "at": int(time.time())}
+            rec = measure.signature(pairs)
+            store = measure.load_store()
+            store.setdefault("records", {})
+            entry = store["records"].setdefault(
+                rec, {"signature": rec, "config": pairs, "runs": 0,
+                      "sources": []})
+            entry["short_tps"] = res["gen_tps_mean"]
+            if args.tokens >= 100000:
+                entry["deep_tps"] = res["gen_tps_min"]
+            if res.get("prefill_tps"):
+                entry["prefill_tps"] = res["prefill_tps"]
+            entry["probe_tokens"] = args.tokens
+            entry["runs"] = entry.get("runs", 0) + 1
+            entry.setdefault("sources", []).append(
+                f"llamastery probe {args.tokens}t")
+            measure.save_store(store)
+            print(f"записано в measurements.json: {args.preset}")
+        else:
+            print(f"секции {args.preset!r} нет в {ini.path} — не записано",
+                  file=sys.stderr)
+    return 0
+
+
+# ─────────────────────────── measure ───────────────────────────
+def cmd_measure(args) -> int:
+    """Снимает фактическое потребление VRAM и записывает его в хранилище.
+
+    Запускать, пока пресет ЗАГРУЖЕН. Дальше замер имеет приоритет над
+    оценкой в budget и в validate.
+    """
+    from lib import vram
+    cap = vram.capture_preset(allow_single=True)
+    if not cap.get("ok"):
+        print(cap.get("error"), file=sys.stderr)
+        return 1
+    print(f"VRAM: занято {cap['used_mib']} MiB"
+          + (f" из {cap['total_mib']} MiB, свободно {cap['free_mib']} MiB"
+             if cap.get("total_mib") else ""))
+    if not cap["loaded"]:
+        print("в VRAM ничего не загружено — снимать нечего")
+        return 1
+    print("загружено: " + ", ".join(cap["loaded"]))
+
+    ini = _load_ini(args.ini)
+    targets = args.names or cap["loaded"]
+    from lib import budget, gguf
+    rc = 0
+    for want in targets:
+        name, cands = runtime.pick_preset_name(want, ini)
+        if not name and (want.endswith(".gguf") or "/" in want):
+            # одиночный сервер отдаёт в /models путь к файлу, а не имя секции
+            for sec in ini.names():
+                if sec == "*":
+                    continue
+                p_ = ini.section(sec).pairs()
+                if p_.get("model") == want or p_.get("m") == want:
+                    name = sec
+                    break
+        if not name:
+            print(f"секция {want!r} не найдена в {ini.path}", file=sys.stderr)
+            rc = 2
+            continue
+        pairs = ini.section(name).pairs()
+        rec = vram.record(name, pairs, cap)
+        used_gb = rec.get("vram_mib", 0) / 1024.0
+        print(f"\n{name}")
+        print(f"  записано: vram {used_gb:.2f} GiB [замер], "
+              f"свободно {rec.get('min_free_mib')} MiB")
+        if args.recalibrate:
+            model = pairs.get("model") or ""
+            if not (model and gguf.is_gguf(model)):
+                print("  перекалибровка пропущена: нет файла модели")
+                continue
+            meta = gguf.probe(model)
+            mm = None
+            if pairs.get("mmproj") and gguf.is_gguf(pairs["mmproj"]):
+                try:
+                    mm = gguf.probe(pairs["mmproj"])
+                except gguf.GGUFError:
+                    mm = None
+            struct = budget.estimate(pairs, meta, compute_gb=0.0, mmproj_meta=mm)
+            structural = struct.weights_gb + struct.kv_gb + struct.mmproj_gb
+            res = vram.calibrate_from_measurement(pairs, cap["used_mib"],
+                                                 structural)
+            if res:
+                print(f"  compute buffer: {res['compute_gb']} GiB "
+                      f"(остаток {res['residual']} GiB) → {res['store']}")
+    print(f"\nхранилище замеров: {measure.store_path()}")
+    return rc
+
+
+# ─────────────────────────── ingest ───────────────────────────
+def cmd_ingest(args) -> int:
+    store = measure.build_store(args.ini)
+    recs = store["records"]
+    tune = measure.ingest_tune_results()
+    print(f"замеров из tune-results: {len(tune)}")
+    print(f"всего записей: {len(recs)}")
+    with_tps = sum(1 for r in recs.values()
+                   if r.get("short_tps") or r.get("deep_tps"))
+    print(f"из них со скоростью: {with_tps}")
+    if args.apply:
+        p = measure.save_store(store)
+        print(f"записано: {p}")
+    else:
+        print("(только просмотр; --apply чтобы сохранить)")
+    return 0
+
+
+# ─────────────────────────── tune ───────────────────────────
+def cmd_tune(args) -> int:
+    root = Path(__file__).resolve().parent.parent
+    tuner = root / "tools" / "tune_models.py"
+    if not tuner.exists():
+        print(f"нет тюнера: {tuner}", file=sys.stderr)
+        return 1
+    binary, src = builds.resolve_binary(args.build)
+    if not binary:
+        print("не найден llama-server; укажи --build", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, str(tuner), args.ini, args.section,
+           "--server", str(binary)]
+    for item in args.extra:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            cmd += [f"--{k.lstrip('-')}", v]
+        else:
+            cmd.append(f"--{item.lstrip('-')}")
+    # артефакты прогона (tune-results/) должны ложиться рядом с пресетом,
+    # а не в каталог, откуда запущен скилл
+    run_dir = Path(args.ini).expanduser().parent
+    print("запуск:", " ".join(cmd), file=sys.stderr)
+    print(f"рабочий каталог: {run_dir}", file=sys.stderr)
+    try:
+        return subprocess.call(cmd, cwd=str(run_dir))
+    except OSError as exc:
+        print(f"не удалось запустить тюнер: {exc}", file=sys.stderr)
+        return 1
+
+
+# ─────────────────────────── doctor ───────────────────────────
+def cmd_doctor(args) -> int:
+    ok = True
+    print("пути")
+    for label, p in (("конфиг", paths.config_dir()), ("состояние", paths.state_dir()),
+                     ("кэш", paths.cache_dir())):
+        print(f"  {label:<10} {p}  {'ok' if p.exists() else 'нет (создастся)'}")
+    print(f"  {'пресет':<10} {paths.default_ini()}  "
+          f"{'ok' if paths.default_ini().exists() else 'НЕТ ФАЙЛА'}")
+
+    print("\nсборки")
+    reg = builds.all_builds()
+    if not reg:
+        print("  реестр пуст — llamastery builds detect --apply")
+        ok = False
+    for name, b in reg.items():
+        st = b.status()
+        flag = "ok " if st["bin_exists"] else "НЕТ"
+        print(f"  {flag} {name:<10} {st['server_bin']}")
+        if st.get("version"):
+            print(f"       {st['version']}")
+    binary, src = builds.resolve_binary(args.build)
+    print(f"\nсхема флагов: {binary or 'НЕ НАЙДЕН llama-server'} (через {src})")
+    if not binary:
+        ok = False
+
+    print("\nменеджеры на PATH")
+    for cmd in ("llama", "llama-faks", "llama-ik", "catapult", "catapult-cn",
+                "llm-preset-manager"):
+        import shutil
+        found = shutil.which(cmd)
+        print(f"  {'ok ' if found else '—  '} {cmd:<22} {found or '—'}")
+
+    print("\nзамеры")
+    st = measure.load_store()
+    print(f"  записей в measurements.json: {len(st.get('records', {}))}")
+    tune_dirs = measure._tune_dirs()
+    print(f"  каталогов tune-results: {len(tune_dirs)}")
+
+    cal = budget.load_calibration()
+    print(f"  калибровка compute_gb: {cal.get('compute_gb', 'нет')}")
+    vram = budget.gpu_total_mib()
+    print(f"  VRAM: {vram} MiB" if vram else "  VRAM: неизвестно")
+
+    # Актуальность сборок: замеры на устаревшей сборке сравнимы только между
+    # собой, а вывод «какая сборка быстрее» через день меняется. Проверка
+    # ничего не меняет — решение об обновлении остаётся за человеком.
+    stale = []
+    for n in builds.all_builds():
+        r = builds.freshness(n, fetch=True)
+        if r.get("behind") or r.get("bin_behind_tree"):
+            stale.append(f"{n}(-{r.get('behind') or '?'}"
+                         + (", флаги" if r.get("flags_may_change") else "") + ")")
+    print(f"  актуальность сборок: {'устарели: ' + ', '.join(stale) if stale else 'все актуальны'}")
+    if stale:
+        print("    → подробности: llamastery builds stale   "
+              "(обновление и пересборка — решение человека)")
+    return 0 if ok else 1
+
+
+# ─────────────────────────── main ───────────────────────────
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        prog="llamastery",
+        description="сборки/форки llama.cpp, пресеты, бюджет VRAM")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("builds", help="реестр сборок и форков")
+    b.add_argument("action",
+                   choices=["list", "detect", "add", "rm", "show", "stale"])
+    b.add_argument("name", nargs="?")
+    b.add_argument("--path")
+    b.add_argument("--remote")
+    b.add_argument("--manager")
+    b.add_argument("--note")
+    b.add_argument("--no-router", action="store_true")
+    b.add_argument("--port", type=int,
+                   help="свой порт (нужно сборке без роутера, если 8099 занят)")
+    b.add_argument("--apply", action="store_true")
+    b.add_argument("--no-fetch", action="store_true",
+                   help="актуальность без обращения к сети")
+    b.set_defaults(func=cmd_builds)
+
+    s = sub.add_parser("schema", help="схема флагов из llama-server --help")
+    s.add_argument("--build", help="имя сборки из реестра или путь к бинарю")
+    s.add_argument("--refresh", action="store_true", help="не брать кэш")
+    s.add_argument("--grep", help="фильтр по имени или описанию")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_schema)
+
+    pr = sub.add_parser("presets", help="операции над пресетами")
+    pr.add_argument("action", choices=["list", "show", "globals", "import",
+                                       "export", "annotate"])
+    pr.add_argument("names", nargs="*")
+    pr.add_argument("--ini")
+    pr.add_argument("--source", help="файл | URL | git-репо#ref:путь")
+    pr.add_argument("--target", help="куда импортировать (по умолчанию models.ini)")
+    pr.add_argument("--only", nargs="*", help="только эти секции")
+    pr.add_argument("--rename", nargs="*", help="старое=новое")
+    pr.add_argument("--on-conflict", choices=["skip", "overwrite", "new"],
+                    default="skip")
+    pr.add_argument("--conflicts", action="store_true",
+                    help="разрешить перезапись при конфликтах")
+    pr.add_argument("--dry-run", action="store_true")
+    pr.add_argument("--apply", action="store_true")
+    pr.add_argument("--output", "-o")
+    pr.set_defaults(func=cmd_presets)
+
+    ld = sub.add_parser("load", help="загрузить пресет нужной сборкой")
+    ld.add_argument("preset")
+    ld.add_argument("--ini")
+    ld.add_argument("--build", help="сборка из реестра (по умолчанию активная)")
+    ld.add_argument("--dry-run", action="store_true")
+    ld.add_argument("--force", action="store_true",
+                    help="загрузить даже при ошибках проверки")
+    ld.add_argument("--timeout", type=int, default=900,
+                    help="сколько ждать загрузки, секунд")
+    ld.set_defaults(func=cmd_load)
+
+    rt = sub.add_parser("runtime",
+                        help="жизненный цикл сервера: start/stop/status/...")
+    rt.add_argument("verb",
+                    choices=["status", "start", "stop", "restart", "unload",
+                             "logs", "doctor"])
+    rt.add_argument("args", nargs="*")
+    rt.add_argument("--build", help="сборка из реестра")
+    rt.add_argument("--ini", help="путь к пресету (по умолчанию models.ini)")
+    rt.add_argument("--preset", help="секция пресета для сборок без роутера")
+    rt.add_argument("--model", help="выгрузить конкретную модель")
+    rt.add_argument("--lines", "-n", type=int, help="сколько строк лога")
+    rt.add_argument("--reload", action="store_true",
+                    help="перечитать пресет на живом сервере")
+    rt.add_argument("--dry-run", action="store_true")
+    rt.set_defaults(func=cmd_runtime)
+
+    v = sub.add_parser("validate", help="проверка пресетов против схемы и путей")
+    v.add_argument("names", nargs="*")
+    v.add_argument("--ini")
+    v.add_argument("--build")
+    v.add_argument("--no-paths", action="store_true",
+                   help="не проверять существование файлов")
+    v.add_argument("--json", action="store_true")
+    v.set_defaults(func=cmd_validate)
+
+    bu = sub.add_parser("budget", help="оценка VRAM и прогноз по слотам")
+    bu.add_argument("names", nargs="*")
+    bu.add_argument("--ini")
+    bu.add_argument("--models-max", type=int, default=4)
+    bu.add_argument("--reserve", type=int, default=1024, help="MiB запаса")
+    bu.add_argument("--explain", action="store_true")
+    bu.set_defaults(func=cmd_budget)
+
+    c = sub.add_parser("calibrate", help="подогнать compute buffer по замерам")
+    c.add_argument("names", nargs="*")
+    c.add_argument("--ini")
+    c.add_argument("--used-gib",
+                   help="фактически занято, GiB (или секция=GiB для точечной)")
+    c.add_argument("--from-tune", action="store_true",
+                   help="калибровать по всем успешным прогонам tune_models.py")
+    c.add_argument("--from-log", action="store_true",
+                   help="калибровать по отчётам сервера о compute buffer "
+                        "из его же лога (точнее, чем остаток от общего)")
+    c.add_argument("--free-mib",
+                   help="свободно по nvidia-smi, MiB (или секция=MiB)")
+    c.set_defaults(func=cmd_calibrate)
+
+    cr = sub.add_parser("crashes", help="журнал падений: какие пресеты роняют сервер")
+    cr.add_argument("--forget", help="снять запись: пресет проверен и работает")
+    cr.set_defaults(func=cmd_crashes)
+
+    pr = sub.add_parser("probe", help="замерить tg/prefill на живом сервере")
+    pr.add_argument("--tokens", type=int, default=8192,
+                    help="сколько токенов в промпте (это и есть глубина)")
+    pr.add_argument("--max-tokens", type=int, default=64,
+                    help="сколько токенов генерировать")
+    pr.add_argument("--repeats", type=int, default=3)
+    pr.add_argument("--model", help="явная модель (по умолчанию загруженная)")
+    pr.add_argument("--image", help="файл картинки — проверка зрения")
+    pr.add_argument("--from-file", help="промпт из реального файла (код/проза)")
+    pr.add_argument("--varied", action="store_true",
+                    help="текст без повторов: честная оценка ngram и подобных")
+    pr.add_argument("--preset", help="секция пресета для записи замера")
+    pr.add_argument("--ini")
+    pr.add_argument("--record", action="store_true",
+                    help="записать замер в measurements.json")
+    pr.add_argument("--timeout", type=float, default=3600.0)
+    pr.set_defaults(func=cmd_probe)
+
+    ms = sub.add_parser("measure", help="снять факт VRAM по загруженному пресету")
+    ms.add_argument("names", nargs="*",
+                    help="секции пресетов; по умолчанию — загруженные")
+    ms.add_argument("--ini")
+    ms.add_argument("--recalibrate", action="store_true",
+                    help="пересчитать compute buffer по этому замеру")
+    ms.set_defaults(func=cmd_measure)
+
+    i = sub.add_parser("ingest", help="собрать замеры из tune-results и models.ini")
+    i.add_argument("--ini")
+    i.add_argument("--apply", action="store_true")
+    i.set_defaults(func=cmd_ingest)
+
+    t = sub.add_parser("tune", help="автотюнинг (обёртка над tools/tune_models.py)")
+    t.add_argument("ini")
+    t.add_argument("section")
+    t.add_argument("--build")
+    t.add_argument("--extra", nargs="*", default=[],
+                   help="флаги тюнера, можно в виде ключ=значение")
+    t.set_defaults(func=cmd_tune)
+
+    d = sub.add_parser("doctor", help="проверка окружения")
+    d.add_argument("--build")
+    d.set_defaults(func=cmd_doctor)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except FileNotFoundError as exc:
+        print(f"файл не найден: {exc}", file=sys.stderr)
+        raise SystemExit(1)
