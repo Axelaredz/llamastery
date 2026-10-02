@@ -2,6 +2,7 @@
 """Тесты без внешних зависимостей: python3 tests/run_tests.py"""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -10,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from lib import budget, gguf, inifile, measure, presets, schema, validate  # noqa: E402
+from lib import budget, gguf, inifile, measure, presets, schema, swap, validate  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -715,6 +716,39 @@ def test_stop_covers_all_build_ports() -> None:
     body = src.read_text()
     check("ports.update(int(b.port) for b in builds.all_builds().values() if b.port)"
           in body, "stop перебирает порты всех сборок")
+
+
+def test_swap_port_check() -> None:
+    """Проверка занятости порта: парсинг, свободен/занят, владелец без падений."""
+    import socket as _sock
+
+    print("swap: занятость порта")
+    check(swap.parse_listen("0.0.0.0:8080") == ("0.0.0.0", 8080), "host:port")
+    check(swap.parse_listen("http://127.0.0.1:8090/") == ("127.0.0.1", 8090), "URL")
+    check(swap.parse_listen("8090") == ("0.0.0.0", 8090), "голый порт")
+
+    srv = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    free_port = srv.getsockname()[1]
+    srv.close()
+    check(not swap.is_port_busy("127.0.0.1", free_port), "свободный порт — свободен")
+
+    srv = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    busy_port = srv.getsockname()[1]
+    try:
+        check(swap.is_port_busy("0.0.0.0", busy_port), "занятый порт — занят")
+        owner = swap.port_owner(busy_port)
+        check(owner is None or isinstance(owner, dict), "владелец без падений")
+        if isinstance(owner, dict):
+            check(owner.get("pid") == os.getpid() or owner.get("pid") is None,
+                  "владелец — мы или не виден")
+            check(isinstance(swap.describe_owner(owner), str), "описание — строка")
+    finally:
+        srv.close()
 
 
 def test_probe_retries_on_immediate_stop() -> None:

@@ -11,8 +11,11 @@
 """
 
 import json
+import os
 import shlex
 import shutil
+import socket
+import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -153,3 +156,119 @@ def status(swap_url: str = "http://127.0.0.1:8080", timeout: float = 5.0) -> dic
     except Exception as exc:  # noqa: BLE001
         out["error"] = str(exc)
     return out
+
+
+# ── занятость порта ──
+def parse_listen(text: str) -> tuple[str, int]:
+    """Разбирает --listen/URL в (host, port).
+
+    Принимает '0.0.0.0:8080', '127.0.0.1:8090', ':8080', '8080',
+    'http://127.0.0.1:8080/'.
+    """
+    s = (text or "").strip()
+    s = s.split("://", 1)[-1].rstrip("/")
+    if ":" in s:
+        host, _, port = s.rpartition(":")
+    else:
+        host, port = "", s
+    return host or "0.0.0.0", int(port)
+
+
+def is_port_busy(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Слушает ли кто-то порт. Только stdlib, без ss/lsof."""
+    probe = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+    try:
+        with socket.create_connection((probe, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _tcp_listen_inodes(port: int) -> set[str]:
+    """Inode сокетов в LISTEN на порту (IPv4+IPv6). Пусто — не Linux."""
+    want = f"{port:04X}"
+    inodes: set[str] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(path).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            f = ln.split()
+            if len(f) < 10:
+                continue
+            try:
+                local_port, state, inode = f[1].rsplit(":", 1)[1], f[3], f[9]
+            except IndexError:
+                continue
+            if local_port.upper() == want and state == "0A":
+                inodes.add(inode)
+    return inodes
+
+
+def port_owner(port: int) -> dict | None:
+    """Кто держит порт: pid/exe/cmd, плюс docker-контейнер если он пробросил порт.
+
+    Best-effort: нет прав или не Linux — вернёт None или часть полей.
+    """
+    owner: dict = {"port": port, "pid": None, "exe": None,
+                   "cmd": None, "container": None}
+    inodes = _tcp_listen_inodes(port)
+    if inodes:
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except (OSError, PermissionError):
+                continue
+            hit = False
+            for fd in fds:
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in inodes:
+                    hit = True
+                    break
+            if not hit:
+                continue
+            try:
+                owner["exe"] = os.readlink(f"/proc/{pid}/exe")
+            except (OSError, PermissionError):
+                pass
+            try:
+                raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+                owner["cmd"] = raw.replace(b"\0", b" ").decode(
+                    "utf-8", "replace").strip()[:200]
+            except OSError:
+                pass
+            owner["pid"] = int(pid)
+            break
+    if shutil.which("docker"):
+        try:
+            r = subprocess.run(["docker", "ps", "--format", "{{.Names}} {{.Ports}}"],
+                               capture_output=True, text=True, timeout=10)
+            for ln in r.stdout.splitlines():
+                if f":{port}->" in ln or f":{port}/" in ln or f"->{port}/" in ln:
+                    owner["container"] = ln.strip()[:160]
+                    break
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if owner["pid"] is None and owner["container"] is None:
+        return None
+    return owner
+
+
+def describe_owner(owner: dict | None) -> str:
+    """Одна строка для печати: кто занял порт."""
+    if not owner:
+        return "владелец не виден (чужой пользователь или не Linux)"
+    bits = []
+    if owner.get("container"):
+        bits.append(f"docker: {owner['container']}")
+    if owner.get("pid"):
+        bits.append(f"pid {owner['pid']}")
+    if owner.get("exe"):
+        bits.append(owner["exe"])
+    if owner.get("cmd"):
+        bits.append(f"[{owner['cmd']}]")
+    return "; ".join(bits) if bits else "владелец не виден"

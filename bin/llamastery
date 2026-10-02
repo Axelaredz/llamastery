@@ -1252,6 +1252,19 @@ def cmd_swap(args) -> int:
         print(f"бинарь: {binp or 'НЕ НАЙДЕН (swap install)'}")
         st = swap.status(args.url)
         print(f"прокси {st['url']}: {'up' if st['up'] else 'down'}")
+        try:
+            host, port = swap.parse_listen(st["url"])
+        except ValueError:
+            host, port = "0.0.0.0", 8080
+        if st["up"]:
+            print(f"порт {port}: слушает swap")
+        elif swap.is_port_busy(host, port):
+            owner = swap.describe_owner(swap.port_owner(port))
+            print(f"! порт {port} занят НЕ свапом: {owner}")
+            print(f"  swap на этот порт не встанет — смени --listen "
+                  f"или освободи порт")
+        else:
+            print(f"порт {port}: свободен — swap не запущен")
         if st.get("running"):
             print(json.dumps(st["running"], ensure_ascii=False, indent=1)[:2000])
         if st.get("error"):
@@ -1307,8 +1320,14 @@ def cmd_swap(args) -> int:
         outp.write_text(text, encoding="utf-8")
         print(f"записано: {outp}")
         binp = swap.find_binary()
+        host, port = swap.parse_listen(swap.SWAP_LISTEN)
         print(f"запуск: {binp or 'llama-swap'} "
-              f"--config {outp} --listen 0.0.0.0:8080")
+              f"--config {outp} --listen {swap.SWAP_LISTEN}")
+        if swap.is_port_busy(host, port):
+            print(f"! порт {port} уже занят: "
+                  f"{swap.describe_owner(swap.port_owner(port))}")
+            print(f"  запускай swap на свободном порту, например "
+                  f"--listen 127.0.0.1:8090")
         return 0
     print(text)
     return 0
