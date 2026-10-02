@@ -1,6 +1,6 @@
 ---
 name: llamastery
-description: Управление сборками и форками llama.cpp, пресетами роутера (models.ini / --models-preset), автотюнинг параметров и учёт бюджета VRAM. Используй, когда задача про llama.cpp/llama-server/llama-cli: выбор или сборка форка, настройка параметров запуска, пресеты моделей, падение с OOM, подбор n-cpu-moe/ctx/ubatch/KV-кэша, маршрутизация нескольких моделей, перенос пресетов из чужого репозитория. Триггеры: llama.cpp, llama-server, llama-faks, ik_llama, models.ini, --models-preset, пресет, n-cpu-moe, n-gpu-layers, cache-type-k, ubatch, mmproj, spec-type, router mode, VRAM не хватает.
+description: "Управление сборками и форками llama.cpp, пресетами роутера (models.ini / --models-preset), автотюнинг параметров и учёт бюджета VRAM. Используй, когда задача про llama.cpp/llama-server/llama-cli: выбор или сборка форка, настройка параметров запуска, пресеты моделей, падение с OOM, подбор n-cpu-moe/ctx/ubatch/KV-кэша, маршрутизация нескольких моделей, перенос пресетов из чужого репозитория. Триггеры: llama.cpp, llama-server, llama-faks, ik_llama, models.ini, --models-preset, пресет, n-cpu-moe, n-gpu-layers, cache-type-k, ubatch, mmproj, spec-type, router mode, VRAM не хватает."
 ---
 
 # llamastery

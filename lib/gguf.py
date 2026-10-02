@@ -36,6 +36,12 @@ class ModelMeta:
     size_bytes: int = 0
     arch: str = ""
     kv: dict = field(default_factory=dict)
+    # таблица тензоров: (имя, ggml-тип, offset в секции данных, число элементов).
+    # Читается из шапки, сами веса не трогаем. Пусто, если в файле нет
+    # тензоров или таблицу не удалось разобрать.
+    tensors: list = field(default_factory=list)
+    # файловый offset начала секции данных (после выравнивания)
+    data_start: int = 0
 
     # ── производные величины ──
     @property
@@ -113,6 +119,44 @@ class ModelMeta:
     def n_vocab(self) -> int:
         return int(self.kv.get("llama.vocab_size", 0) or 0)
 
+    # ── MLA и MTP ──
+    @property
+    def kv_lora_rank(self) -> int:
+        """Ранг сжатия KV у MLA-моделей (0 — обычное GQA/MHA внимание)."""
+        return int(self.kv.get(f"{self.arch}.attention.kv_lora_rank", 0) or 0)
+
+    @property
+    def rope_dim(self) -> int:
+        """Размерность RoPE-части MLA-ключа (k_pe)."""
+        return int(self.kv.get(f"{self.arch}.rope.dimension_count", 0) or 0)
+
+    @property
+    def is_mla(self) -> bool:
+        """Сжатый MLA-KV: одна строка (latent + rope) вместо голов K/V."""
+        return self.kv_lora_rank > 0 and self.rope_dim > 0
+
+    @property
+    def n_layer_nextn(self) -> int:
+        """Число MTP-слоёв в хвосте (0 — нет встроенной MTP-головы)."""
+        return int(self.kv.get(f"{self.arch}.nextn_predict_layers", 0) or 0)
+
+    def tensor_sizes(self) -> list[tuple[str, int]]:
+        """(имя, байты) для каждого тензора.
+
+        Размер — через разность offsets соседних тензоров, поэтому включает
+        выравнивающие промежутки. Это честно для VRAM: llama.cpp тоже
+        кладёт тензоры с выравниванием.
+        """
+        out = []
+        n = len(self.tensors)
+        for i, (name, _dtype, off, _nelem) in enumerate(self.tensors):
+            if i + 1 < n:
+                size = self.tensors[i + 1][2] - off
+            else:
+                size = self.size_bytes - self.data_start - off
+            out.append((name, max(0, size)))
+        return out
+
     def summary(self) -> str:
         bits = [f"arch={self.arch or '?'}", f"layers={self.n_layer}",
                 f"embd={self.n_embd}", f"head={self.n_head}/{self.n_head_kv}",
@@ -137,6 +181,12 @@ class _Reader:
 
     def uint(self, fmt: str, size: int) -> int:
         return struct.unpack(fmt, self.read(size))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self.read(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self.read(8))[0]
 
     def string(self) -> str:
         n = self.uint("<Q", 8)
@@ -178,7 +228,7 @@ def read_meta(path: str | Path) -> ModelMeta:
         version = r.uint("<I", 4)
         if version not in (1, 2, 3):
             raise GGUFError(f"версия GGUF v{version} не поддерживается")
-        r.uint("<Q", 8)  # tensor_count
+        n_tensors = r.uint("<Q", 8)
         n_kv = r.uint("<Q", 8)
         if n_kv > 1 << 20:
             raise GGUFError(f"подозрительное число KV: {n_kv}")
@@ -186,8 +236,43 @@ def read_meta(path: str | Path) -> ModelMeta:
             key = r.string()
             vtype = r.uint("<I", 4)
             meta.kv[key] = r.value(vtype)
-    meta.arch = str(meta.kv.get("general.architecture", ""))
+        meta.arch = str(meta.kv.get("general.architecture", ""))
+        # таблица тензоров идёт сразу за KV. Битый хвост не должен ронять
+        # метаданные: не разобралось — останется пустой список.
+        try:
+            _read_tensor_infos(fh, r, meta, n_tensors)
+        except (GGUFError, struct.error, OSError, ValueError):
+            meta.tensors = []
+            meta.data_start = 0
     return meta
+
+
+def _read_tensor_infos(fh, r: _Reader, meta: ModelMeta, n_tensors: int) -> None:
+    """Читает (имя, тип, offset, nelem) всех тензоров. Веса не трогает."""
+    if n_tensors > 1 << 20:
+        raise GGUFError(f"подозрительное число тензоров: {n_tensors}")
+    infos = []
+    for _ in range(n_tensors):
+        name = r.string()
+        n_dims = r.u32()
+        if n_dims > 8:
+            raise GGUFError(f"подозрительная размерность тензора {name!r}: {n_dims}")
+        nelem = 1
+        for _ in range(n_dims):
+            nelem *= r.u64()
+        dtype = r.u32()
+        offset = r.u64()
+        infos.append((name, dtype, offset, nelem))
+    align = meta.kv.get("general.alignment", 32) or 32
+    try:
+        align = int(align)
+    except (TypeError, ValueError):
+        align = 32
+    if align < 1:
+        align = 32
+    pos = fh.tell()
+    meta.tensors = infos
+    meta.data_start = pos + (-pos % align)
 
 
 def probe(path: str | Path) -> ModelMeta:

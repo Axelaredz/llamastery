@@ -93,6 +93,64 @@ def attention_layers(meta: ModelMeta) -> int:
     return n
 
 
+def _mtp_active(pairs: dict[str, str]) -> bool:
+    """Встроенная MTP-голова (хвостовые nextn-слои) реально загружается?"""
+    spec = _flag_str(pairs, "spec-type", "spec", default="").lower()
+    draft = _flag_str(pairs, "model-draft", "draft", default="").strip()
+    return bool(draft) or "draft-mtp" in spec
+
+
+def override_cpu_bytes(pairs: dict[str, str], meta: ModelMeta | None
+                       ) -> tuple[float, int, str]:
+    """Байты весов, уходящие в RAM через override-tensor (флаг -ot).
+
+    Семантика повторяет llama.cpp (llama-model-loader.cpp): запятые делят
+    записи pattern=device, сопоставление — regex_search, на тензор действует
+    ПЕРВОЕ совпавшее правило. В VRAM не считаются только device=CPU.
+    Возвращает (байты, число тензоров, заметка).
+    """
+    import re
+    if meta is None or not meta.tensors:
+        return 0.0, 0, ""
+    raw = _flag_str(pairs, "override-tensor", "ot", default="").strip()
+    if not raw:
+        return 0.0, 0, ""
+    entries = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if "=" not in chunk:
+            continue
+        pat, dev = chunk.split("=", 1)
+        pat, dev = pat.strip(), dev.strip()
+        if not pat:
+            continue
+        try:
+            rx = re.compile(pat)
+        except re.error:
+            continue
+        entries.append((pat, rx, dev.lower() == "cpu"))
+    if not entries:
+        return 0.0, 0, ""
+    cpu_bytes, matched = 0, 0
+    for name, size in meta.tensor_sizes():
+        for pat, rx, is_cpu in entries:
+            try:
+                hit = rx.search(name) is not None
+            except re.error:
+                hit = False
+            if hit:
+                if is_cpu:
+                    cpu_bytes += size
+                    matched += 1
+                break
+    note = ""
+    if matched:
+        pats = ", ".join(f"{p}=CPU" if c else f"{p}=…" for p, _, c in entries)
+        note = (f"override-tensor [{pats}] → в RAM уходит "
+                f"{cpu_bytes / GIB:.2f} GiB ({matched} тензоров)")
+    return float(cpu_bytes), matched, note
+
+
 def expert_weight_share(meta: ModelMeta) -> float:
     """Доля весов, приходящаяся на экспертов MoE (для оценки n-cpu-moe)."""
     if not meta.is_moe or not meta.n_embd or not meta.n_layer:
@@ -163,6 +221,12 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
 
     est.n_layer = meta.n_layer
     est.n_attn_layer = attention_layers(meta)
+    if meta.n_layer_nextn and est.n_attn_layer > meta.n_layer_nextn:
+        # хвостовые MTP-слои (nextn) KV-кэш не хранят
+        est.n_attn_layer -= meta.n_layer_nextn
+        est.notes.append(
+            f"минус {meta.n_layer_nextn} MTP-слоёв без KV: "
+            f"слоёв внимания {est.n_attn_layer}")
     est.ctx = _flag_int(pairs, "c", "ctx-size", default=meta.n_ctx_trained) or 0
     est.cpu_moe = _flag_int(pairs, "n-cpu-moe", "ncmoe", "cmoe", default=0) or 0
 
@@ -172,7 +236,30 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
     # Коэффициент калибруется по замерам (см. llamastery calibrate --from-tune).
     realization = cal.get("offload_realization", 0.76)
     weights = meta.size_bytes / GIB
-    if est.cpu_moe and meta.n_layer:
+    if meta.n_layer_nextn and not _mtp_active(pairs) and meta.tensors:
+        # встроенная MTP-голова при выключенном MTP: загрузчик помечает
+        # хвостовые nextn-слои как unused — в VRAM их нет
+        import re as _re
+        first_nextn = meta.n_layer - meta.n_layer_nextn
+        skip = 0
+        for _name, _size in meta.tensor_sizes():
+            _m = _re.match(r"blk\.(\d+)\.", _name)
+            if _m and int(_m.group(1)) >= first_nextn:
+                skip += _size
+        if skip:
+            weights -= skip / GIB
+            est.notes.append(
+                f"MTP выключен: хвостовые {meta.n_layer_nextn} nextn-слоёв "
+                f"не грузятся (−{skip / GIB:.2f} GiB)")
+    ot_bytes, ot_n, ot_note = override_cpu_bytes(pairs, meta)
+    if ot_bytes:
+        # точный учёт через таблицу тензоров — вместо эвристики n-cpu-moe
+        weights -= ot_bytes / GIB
+        est.notes.append(ot_note)
+        if est.cpu_moe:
+            est.notes.append(
+                "n-cpu-moe проигнорирован: override-tensor уже учтён точно")
+    elif est.cpu_moe and meta.n_layer:
         share = expert_weight_share(meta)
         frac = min(1.0, (est.cpu_moe / meta.n_layer) * share * realization)
         weights *= (1.0 - frac)
@@ -192,8 +279,18 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
     ctv = kv_bytes_for(_flag_str(pairs, "cache-type-v", "ctv", default="f16"))
     np_ = _flag_int(pairs, "parallel", "np", default=1) or 1
     kv_unified = _flag_str(pairs, "kv-unified", "kvu", default="")
-    per_token = est.n_attn_layer * meta.n_head_kv * (ctk * meta.head_dim
-                                                     + ctv * meta.v_head_dim)
+    if meta.is_mla:
+        # MLA (DeepSeek-стиль, xing4_0): KV — одна строка на слой,
+        # latent (kv_lora_rank) + rope-часть. В llama.cpp весь MLA-кэш —
+        # один тензор типа cache-type-k, отдельной V нет.
+        per_token = (est.n_attn_layer
+                     * (meta.kv_lora_rank + meta.rope_dim) * ctk)
+        est.notes.append(
+            f"MLA-KV: {meta.kv_lora_rank}+{meta.rope_dim} эл/токен/слой "
+            f"(тип {ctk})")
+    else:
+        per_token = est.n_attn_layer * meta.n_head_kv * (ctk * meta.head_dim
+                                                         + ctv * meta.v_head_dim)
     if np_ > 0 and kv_unified.lower() in ("off", "0", "false", "disabled"):
         slots = np_
     elif np_ < 0:

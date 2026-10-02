@@ -943,5 +943,136 @@ def test_readme_navigation_resolves() -> None:
         check(anchor in anchors or anchor in heads,
               f"есть якорь языка: {anchor}")
 
+def _fake_xing4_gguf(path: Path) -> None:
+    """Минимальный xing4_0-GGUF с таблицей тензоров (веса — нули)."""
+    import struct
+
+    def s(x):
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+
+    def kv_str(k, v):
+        return s(k) + struct.pack("<I", 8) + s(v)
+
+    def kv_i32(k, v):
+        return s(k) + struct.pack("<I", 4) + struct.pack("<i", v)
+
+    kv = [
+        kv_str("general.architecture", "xing4_0"),
+        kv_i32("xing4_0.block_count", 41),
+        kv_i32("xing4_0.embedding_length", 3584),
+        kv_i32("xing4_0.attention.head_count", 32),
+        kv_i32("xing4_0.attention.head_count_kv", 1),
+        kv_i32("xing4_0.attention.key_length", 576),
+        kv_i32("xing4_0.attention.value_length", 512),
+        kv_i32("xing4_0.attention.kv_lora_rank", 512),
+        kv_i32("xing4_0.rope.dimension_count", 64),
+        kv_i32("xing4_0.context_length", 262144),
+        kv_i32("xing4_0.expert_count", 64),
+        kv_i32("xing4_0.expert_feed_forward_length", 1024),
+        kv_i32("xing4_0.nextn_predict_layers", 1),
+    ]
+    # (имя, тип, offset, nelem) — offsets с шагом 1000 байт
+    tensors = [
+        ("blk.2.ffn_gate_exps.weight", 22, 0, 1000),
+        ("blk.2.ffn_up_exps.weight", 22, 1000, 1000),
+        ("blk.2.attn_output.weight", 14, 2000, 100),
+        ("blk.40.nextn.eh_proj.weight", 12, 3000, 500),
+        ("output.weight", 14, 4000, 200),
+    ]
+    infos = []
+    for name, dtype, off, nelem in tensors:
+        infos.append(s(name) + struct.pack("<I", 1)
+                     + struct.pack("<Q", nelem) + struct.pack("<I", dtype)
+                     + struct.pack("<Q", off))
+    head = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", len(tensors))
+            + struct.pack("<Q", len(kv)) + b"".join(kv) + b"".join(infos))
+    pad = b"\0" * (-len(head) % 32)   # выравнивание секции данных
+    path.write_bytes(head + pad + b"\0" * 5000)
+
+
+def test_xing4_tensors(tmp: Path):
+    print("xing4_0: таблица тензоров и MLA-метаданные")
+    p = tmp / "xing4.gguf"
+    _fake_xing4_gguf(p)
+    m = gguf.probe(p)
+    check(m.arch == "xing4_0", "архитектура прочитана", m.arch)
+    check(len(m.tensors) == 5, "все тензоры прочитаны", len(m.tensors))
+    check(m.is_mla, "MLA обнаружен", (m.kv_lora_rank, m.rope_dim))
+    check(m.n_layer_nextn == 1, "nextn=1 прочитан", m.n_layer_nextn)
+    sizes = dict(m.tensor_sizes())
+    check(sizes["blk.2.ffn_gate_exps.weight"] == 1000,
+          "размер через разность offsets", sizes["blk.2.ffn_gate_exps.weight"])
+    check(sizes["output.weight"] == 1000,
+          "последний тензор — до конца файла", sizes["output.weight"])
+    check(sum(sizes.values()) == 5000, "сумма сходится", sum(sizes.values()))
+
+
+def test_xing4_mla_kv(tmp: Path):
+    print("xing4_0: бюджет считает MLA-KV, а не GQA")
+    p = tmp / "xing4.gguf"
+    _fake_xing4_gguf(p)
+    m = gguf.probe(p)
+    base = {"c": "114688", "cache-type-k": "q8_0", "cache-type-v": "q8_0",
+            "parallel": "1"}
+    e = budget.estimate(base, m, compute_gb=0.0)
+    # 40 слоёв × (512+64) × 1.0625 × 114688 ≈ 2.6 GiB; GQA-формула дала бы ~5
+    check(2.4 < e.kv_gb < 2.9, "MLA-KV около 2.6 GiB", round(e.kv_gb, 2))
+    check(e.n_attn_layer == 40, "MTP-слой без KV вычтен", e.n_attn_layer)
+
+
+def test_xing4_override_tensor(tmp: Path):
+    print("xing4_0: override-tensor вычитает веса из VRAM")
+    p = tmp / "xing4.gguf"
+    _fake_xing4_gguf(p)
+    m = gguf.probe(p)
+    base = {"c": "65536", "cache-type-k": "q8_0", "cache-type-v": "q8_0"}
+    e0 = budget.estimate(base, m, compute_gb=0.0)
+    e1 = budget.estimate({**base,
+                          "override-tensor": r"blk\.(2)\.ffn_.*_exps\.weight=CPU"},
+                         m, compute_gb=0.0)
+    # 2 тензора по 1000 байт + хвост blk.40 (1000) уже вычтен в обоих
+    check(abs((e0.weights_gb - e1.weights_gb) * budget.GIB - 2000) < 1,
+          "ровно совпавшие тензоры ушли в RAM",
+          (e0.weights_gb, e1.weights_gb))
+    # first-match-wins: первое правило забирает тензор
+    e_first = budget.estimate(
+        {**base, "override-tensor": r"blk\.2\..*=CPU,blk\.(2)\.ffn_.*=CUDA"},
+        m, compute_gb=0.0)
+    check(abs((e0.weights_gb - e_first.weights_gb) * budget.GIB - 3000) < 1,
+          "первое совпавшее правило побеждает (3 тензора blk.2)",
+          (e0.weights_gb, e_first.weights_gb))
+    # битый regex не роняет оценку
+    e_bad = budget.estimate({**base, "override-tensor": r"blk\.([0-9=CPU"},
+                            m, compute_gb=0.0)
+    check(abs(e_bad.weights_gb - e0.weights_gb) < 1e-9,
+          "битый regex молча пропускается")
+
+
+def test_xing4_nextn_weights(tmp: Path):
+    print("xing4_0: неиспользуемый nextn-хвост не считается в VRAM")
+    p = tmp / "xing4.gguf"
+    _fake_xing4_gguf(p)
+    m = gguf.probe(p)
+    base = {"c": "65536", "cache-type-k": "q8_0", "cache-type-v": "q8_0"}
+    e_off = budget.estimate(base, m, compute_gb=0.0)
+    e_mtp = budget.estimate({**base, "model-draft": "m.gguf"}, m,
+                            compute_gb=0.0)
+    # хвост blk.40 = 1000 байт: без MTP вычтен, с model-draft — загружен
+    check(abs((e_mtp.weights_gb - e_off.weights_gb) * budget.GIB - 1000) < 1,
+          "nextn грузится только при активном MTP",
+          (e_off.weights_gb, e_mtp.weights_gb))
+
+
+def test_xing4_in_candidates():
+    print("xing4_0: сборка известна detect")
+    from lib import builds
+    names = [c[0] for c in builds.CANDIDATES]
+    check("xing4" in names, "xing4 в CANDIDATES", names)
+    x = [c for c in builds.CANDIDATES if c[0] == "xing4"][0]
+    check("jmarceno" in x[2] and x[3] is True,
+          "remote jmarceno, роутер есть", x[2])
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

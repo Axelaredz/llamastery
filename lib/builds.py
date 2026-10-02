@@ -290,6 +290,9 @@ CANDIDATES = [
     ("faks", "~/git/llama-faks", "https://github.com/Faks/llama.cpp", True, ""),
     ("upstream", "~/llama-upstream", "https://github.com/ggml-org/llama.cpp", True, ""),
     ("ik", "~/llama-ik", "https://github.com/ik_llama.cpp/ik_llama.cpp", False, ""),
+    # xing4_0-порт (jmarceno): единственная сборка с архитектурой xing4_0.
+    # В стоковом llama.cpp её нет — пресет xing4 там не загрузится.
+    ("xing4", "~/git/llama-xing4", "https://github.com/jmarceno/llama.cpp-xing4", True, ""),
 ]
 
 # форковые оптимизации: знание о них живёт в реестре, а не в коде
