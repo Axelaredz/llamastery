@@ -1,30 +1,132 @@
 # llamastery
 
-Управление сборками и форками llama.cpp, пресетами роутера и бюджетом VRAM.
-Скилл для агентов (Skill-формат) плюс обычный CLI, который можно звать руками.
+Уложи модель в VRAM с первого раза: проверка пресетов, честный прогноз памяти, замер факта.
 
-Только стандартная библиотека Python 3.11+. Внешних зависимостей нет.
-Отдельных скриптов-менеджеров не требуется: `llamastery` сам поднимает сервер,
-грузит и выгружает модели для любой зарегистрированной сборки, включая
-сборки без роутер-режима.
+`llamastery` — CLI и скилл для агента вокруг `llama-server`. Знает твои сборки и форки
+(`faks`, `upstream`, `ik_llama`, `xing4`), проверяет пресет по схеме **именно той** сборки,
+считает, влезет ли он в видеокарту, грузит его и меряет реальную скорость на длинном контексте.
+Только стандартная библиотека Python 3.11+, зависимостей нет.
+
+[English](#llamastery-en) · [中文](#llamastery-中文)
 
 ## Навигация
 
-- [Документация](#документация) · [Что внутри](#что-внутри) · [Быстрый старт](#быстрый-старт)
-- [Установка как скилла для агента](#установка-как-скилла-для-агента) · [Переменные окружения](#переменные-окружения)
-- [Метки в комментариях пресетов](#метки-в-комментариях-пресетов) · [Принципы](#принципы) · [Тесты](#тесты)
-- [Быстрый старт](#быстрый-старт) · [Документация](#документация) · [Принципы](#принципы)
-- [Documentation](#documentation) · [What is inside](#what-is-inside) · [Quick start](#quick-start)
-- [Install as an agent skill](#install-as-an-agent-skill) · [Environment variables](#environment-variables)
-- [Principles](#principles) · [Tests](#tests) · [Quick start](#quick-start)
-- [文档](#文档) · [目录结构](#目录结构) · [快速开始](#快速开始)
-- [作为 Agent 技能安装](#作为-agent-技能安装) · [环境变量](#环境变量) · [原则](#原则) · [测试](#测试)
+- [За 60 секунд](#за-60-секунд) · [Кому это нужно](#кому-это-нужно) · [Как это работает](#как-это-работает)
+- [Быстрый старт](#быстрый-старт) · [Команды по задачам](#команды-по-задачам) · [Что внутри](#что-внутри)
+- [Документация](#документация) · [Метки](#метки) · [Установка](#установка)
+- [Переменные окружения](#переменные-окружения) · [Гарантии](#гарантии) · [Тесты](#тесты)
+- [За 60 секунд](#за-60-секунд) · [Быстрый старт](#быстрый-старт) · [Гарантии](#гарантии)
+- [In 60 seconds](#in-60-seconds) · [Quick start](#quick-start) · [Commands by task](#commands-by-task)
+- [Whats inside](#whats-inside) · [Documentation](#documentation) · [Tests](#tests)
+- [60秒速览](#60秒速览) · [快速开始](#快速开始) · [按任务查命令](#按任务查命令)
+- [目录结构](#目录结构) · [文档](#文档) · [测试](#测试)
 - [llamastery](#llamastery) · [llamastery (EN)](#llamastery-en) · [llamastery (中文)](#llamastery-中文)
+
+## За 60 секунд
+
+```bash
+bin/llamastery doctor                  # что видно: сборки, пресет, замеры, калибровка
+bin/llamastery validate                # пресет проходит схему твоей сборки?
+bin/llamastery budget --models-max 2   # влезет ли, и что влезет одновременно
+bin/llamastery load <пресет>           # загрузить в VRAM (с предпроверкой)
+bin/llamastery measure                 # сколько реально занято на карте
+bin/llamastery probe --tokens 110000   # честная скорость на глубине 110k
+```
+
+Типичный ответ `budget`:
+
+```
+пресет: qwen-32B-128ctx — веса 19.2G, KV 2.6G, всего 22.8G
+  влезает: qwen-32B-128ctx (замер 21.9 GiB, замер)
+  не влезает: big-70B (нужно 38.1 GiB, осталось 2.0 GiB)
+```
+
+Если вместо прогноза есть живой замер — решение принимается по замеру, оценка показывается рядом.
+
+## Кому это нужно
+
+- У тебя несколько сборок `llama.cpp` (апстрим + форки) и надо понять, **чем они отличаются** и что умеет каждая.
+- У тебя один GPU на 8–24 ГБ и вопрос **«влезет ли модель с контекстом 100k+»** возникает раньше, чем вопрос скорости.
+- Ты правишь `models.ini` руками и хочешь узнать об ошибке **до** загрузки, а не по падению CUDA в середине запроса.
+
+Не нужно, если: одна стоковая сборка, одна модель, короткий контекст — хватит обычного `llama-server`.
+
+## Как это работает
+
+1. **Проверь.** `validate` сверяет каждую секцию `models.ini` со схемой флагов, разобранной из
+   `llama-server --help` именно твоей сборки. Форковые флаги (`n-cpu-moe`, `spec-type`, `override-tensor`)
+   видны автоматически, плюс ловятся известные грабли (например `ubatch 2048 + спекулятивный декодер = падение`).
+2. **Спрогнозируй.** `budget` раскладывает VRAM на веса / KV / mmproj / compute buffer.
+   Веса — по размеру GGUF с учётом `n-cpu-moe` и `-ot`, KV — по слоям внимания (у гибридов и MLA — своя формула),
+   compute buffer — подогнанная константа. Пока калибровки нет, инструмент честно пишет «оценка занижена».
+3. **Загрузи.** `load` сам поднимает сервер (роутер или single-режим для сборок без `--models-preset`),
+   перед загрузкой показывает прогноз и отказывается грузить заведомо падающее (обходится `--force`).
+4. **Замерь.** `measure` снимает факт с `nvidia-smi`, `probe` меряет tg/prefill на **реальном** длинном
+   промпте (с выключенным prompt cache — прогретые пробы помечаются 🔥 и в статистику не идут).
+   Замеры имеют приоритет над оценкой везде: в `budget`, `validate` и комментариях пресетов.
+
+Падения на глубоком контексте запоминаются (`crashes`) — пресет, ронявший сервер, помечается 💥.
+
+## Быстрый старт
+
+Требования: Python 3.11+, собранный `llama-server` хотя бы одной сборки. Собирать ничего не надо —
+`llamastery` только регистрирует готовые.
+
+```bash
+git clone <репозиторий> ~/git/llamastery
+cd ~/git/llamastery
+bin/llamastery doctor              # проверить окружение
+bin/llamastery builds detect       # найти форки (только просмотр)
+bin/llamastery builds detect --apply   # записать в реестр
+bin/llamastery validate            # проверить все секции models.ini
+bin/llamastery budget              # прогноз по всем пресетам
+bin/llamastery runtime start --build faks  # поднять сервер
+bin/llamastery load <пресет> --dry-run    # проверка без загрузки
+bin/llamastery load <пресет>               # загрузить
+bin/llamastery probe --tokens 110000 --from-file server.cpp  # скорость на реальном коде
+bin/llamastery runtime stop
+```
+
+Порядок важен: `measure` и `probe` — только при загруженном пресете.
+Импорт чужих пресетов всегда начинается с `--dry-run` (см. [Пресеты](docs/ru/presets.md)).
+
+## Команды по задачам
+
+| Хочу | Команда |
+|---|---|
+| Понять, что вообще видно | `llamastery doctor` |
+| Зарегистрировать сборки | `llamastery builds list` / `detect` / `show <имя>` / `stale` |
+| Узнать флаги своей сборки | `llamastery schema --build faks --grep moe` |
+| Проверить пресет | `llamastery validate [секция]` |
+| Посчитать память | `llamastery budget [секции] --models-max 2 --explain` |
+| Откалибровать прогноз | `llamastery calibrate --free-mib 1147` / `--from-log` / `--from-tune` |
+| Загрузить / выгрузить | `llamastery load <пресет>` / `llamastery runtime unload` |
+| Померить скорость | `llamastery probe --tokens 110000 --from-file <код>` |
+| Снять факт VRAM | `llamastery measure` / `measure --recalibrate` |
+| Перенести чужой пресет | `llamastery presets import --source <файл|URL|git> --dry-run` |
+| Оформить комментарии | `llamastery presets annotate --apply` (сначала без `--apply`) |
+| Разобрать падение | `llamastery crashes` / `crashes --forget <пресет>` |
+| Подобрать параметры | `llamastery tune <ini> <секция> --build faks --extra ...` (грузит GPU, только с согласия) |
+
+Полный разбор каждой команды — в [SKILL.md](SKILL.md) и `docs/`.
+
+## Что внутри
+
+Три слоя, снизу вверх:
+
+- **Знание о железе и файлах:** `lib/gguf.py` (читает шапку GGUF: слои, головы, MLA/MTP, таблица тензоров),
+  `lib/schema.py` (флаги из `--help` с кэшем по mtime), `lib/builds.py` (реестр сборок).
+- **Решение «можно ли»:** `lib/budget.py` (прогноз VRAM), `lib/validate.py` (проверка + грабли форков),
+  `lib/server.py` (жизненный цикл сервера), `lib/vram.py` + `lib/measure.py` (замеры важнее оценки).
+- **Интерфейс:** `bin/llamastery` (единый CLI), `tools/tune_models.py` (автотюнер),
+  `lib/annotate.py` (стандарт комментариев), `lib/probe.py`, `lib/crashes.py`, `lib/presets.py`, `lib/inifile.py`.
+
+Детально по файлам — в [Документация](#документация).
 
 ## Документация
 
-Подробные файлы лежат отдельно на каждом языке. Начинать лучше с того,
-который читается быстрее; содержание одинаковое.
+Читай на том языке, который быстрее идёт — содержание одинаковое.
+Краткая памятка для агента — только на русском: [SKILL.md](SKILL.md).
 
 | Тема | RU | EN | 中文 |
 |---|---|---|---|
@@ -33,118 +135,137 @@
 | Пресеты: формат, правка, оформление | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
 | Бюджет VRAM и замеры | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
 | Автотюнинг: методика и ловушки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| Краткая памятка для агента | [SKILL.md](SKILL.md) | — | — |
 
-## Что внутри
+Новичкам: `getting-started` → `builds` → `presets` → `measure`. Остальное — по мере вопросов.
 
-```
-bin/llamastery              единый CLI
-lib/
-  schema.py             схема флагов из `llama-server --help` (с кэшем по mtime)
-  inifile.py            INI с сохранением комментариев (в отличие от configparser)
-  presets.py            импорт/экспорт/слияние пресетов (файл, URL, git)
-  gguf.py               ридер метаданных GGUF (для оценки памяти)
-  budget.py             разложение VRAM на слагаемые + калибровка
-  measure.py            сбор замеров из tune-results и комментариев models.ini
-  validate.py           проверка пресетов + грабли форков
-  builds.py             реестр сборок/форков + проверка актуальности
-  crashes.py            журнал падений: какие пресеты роняют сервер
-  runtime.py            пред-проверка пресета и выбор менеджера (необязателен)
-  server.py             свой жизненный цикл сервера: start/stop/load/unload
-  vram.py               живой замер VRAM с карты и перекалибровка
-  annotate.py           единый стандарт комментариев над пресетами
-  probe.py              замер tg/prefill на живом сервере
-tools/tune_models.py    автотюнер (двухэтапный, stdlib only)
-docs/                   подробная документация: ru / en / zh
-```
+## Метки
 
-## Быстрый старт
+Комментарии над секциями пишет `llamastery presets annotate`, руками их править не надо.
+Слова в файле русские, в EN/ZH-документации показаны символами.
 
-```bash
-bin/llamastery doctor              # проверить окружение
-bin/llamastery builds detect --apply   # зарегистрировать форки
-bin/llamastery validate
-bin/llamastery budget --models-max 2
-bin/llamastery load <пресет> --dry-run     # проверка без загрузки
-bin/llamastery runtime start --build faks  # поднять роутер
-bin/llamastery load <пресет>               # загрузить в VRAM
-bin/llamastery measure                     # снять факт памяти
-bin/llamastery probe --tokens 110000        # скорость на реальной глубине
-```
+| Символ | В файле | Смысл |
+|---|---|---|
+| ✅ | `[замер]` | измерено прогоном, а не посчитано |
+| 🧮 | `[оценка]` | расчёт `budget` |
+| 🔬 | `Замер:` | условия измерения |
+| ⚠️ | `Нюанс:` | ловушки и условия применения |
+| 💬 | `Заметка:` | старая проза дословно |
+| 🔥 | `ПРОГРЕТО` | проба из тёплого KV — в prefill не считается |
+| 💥 | `ПАДАЕТ` | пресет ронял сервер |
 
-## Установка как скилла для агента
+## Установка
+
+Как скилл агента (симлинк, а не копия — правки видны всем сразу):
 
 ```bash
 ln -s ~/git/llamastery ~/.config/opencode/skills/llamastery
 ln -s ~/git/llamastery ~/.claude/skills/llamastery
 ```
 
-Один репозиторий — много агентов: правки видны всем сразу.
+Как обычный CLI — никак: `bin/llamastery` работает из любого места, ставить ничего не надо.
 
 ## Переменные окружения
 
-| Переменная | По умолчанию | Смысл |
+| Переменная | По умолчанию | Зачем менять |
 |---|---|---|
-| `LLAMA_MODELS_INI` | `~/.config/llama/models.ini` | пресет роутера |
-| `LLAMA_SERVER_BIN` | из реестра | путь к llama-server |
-| `LLAMA_SERVER` | `http://127.0.0.1:8099` | адрес сервера |
+| `LLAMA_MODELS_INI` | `~/.config/llama/models.ini` | пресет лежит в другом месте |
+| `LLAMA_SERVER_BIN` | из реестра | обойти реестр одним бинарём |
+| `LLAMA_SERVER` | `http://127.0.0.1:8099` | сервер на другом порту |
 | `LLAMASTERY_CONFIG_DIR` | `~/.config/llamastery` | реестр сборок |
-| `LLAMASTERY_STATE_DIR` | `~/.local/state/llamastery` | замеры, калибровка, журнал падений |
+| `LLAMASTERY_STATE_DIR` | `~/.local/state/llamastery` | замеры, калибровка, журнал падений, лог |
 | `LLAMASTERY_CACHE_DIR` | `~/.cache/llamastery` | кэш схемы флагов |
 
-## Метки в комментариях пресетов
+## Гарантии
 
-Формат задан инструментом, слова в нём русские — их пишет
-`llamastery presets annotate`. В документации на других языках они показаны
-символами (см. `docs/en/comments.md`, `docs/zh/comments.md`).
-
-| Символ | Слово в файле | Смысл |
-|---|---|---|
-| ✅ | `[замер]` | фактически измеренный прогон |
-| 🧮 | `[оценка]` | расчёт `budget`, не измерение |
-| 🔬 | `Замер:` | условия измерения |
-| ⚠️ | `Нюанс:` | ловушки и условия применения |
-| 💬 | `Заметка:` | старая проза дословно |
-| 🔥 | `ПРОГРЕТО` | проба из прогретого KV, в prefill не идёт |
-| 💥 | `ПАДАЕТ` | пресет ронял сервер |
-
-## Принципы
-
-1. **Ничего не пишет молча.** Импорт по умолчанию `--dry-run`, перед реальной
-   записью — `.bak-<время>`. Тюнинг и запись требуют явного согласия.
-2. **Замер важнее расчёта.** `measurements.json` собирается из реальных
-   прогонов; `validate` и `budget` используют его в приоритете. Если по
-   пресету есть фактический `used_mib`, решение «влезает ли» принимается по
-   замеру, а оценка показывается рядом для сверки.
-3. **Схема — из help конкретной сборки.** Форки добавляют и переименовывают
-   флаги, захардкоженный список устаревает.
-4. **Честность оценок.** Если `calibrate` не запускался или разброс остатков
-   большой, инструмент об этом говорит, а не делает вид, что знает.
-5. **Падения запоминаются.** Пресет может пройти валидацию и упасть только на
-   глубоком контексте. Такое попадает в журнал, и `validate` об этом
-   предупреждает.
+1. **Ничего не пишет молча.** Импорт — с `--dry-run` по умолчанию, запись — после `.bak-<время>`.
+2. **Замер важнее расчёта.** Есть факт — решение по факту, оценка рядом для сверки.
+3. **Схема — от твоей сборки.** Не хардкод: форковые флаги подхватываются из `--help`.
+4. **Честно про неточность.** Нет калибровки или большой разброс — так и пишет.
+5. **Падения не забываются.** Упал на глубине — помечен, `validate` предупредит.
 
 ## Тесты
 
 ```bash
-python3 tests/run_tests.py           # без зависимостей
+python3 tests/run_tests.py           # без зависимостей, ~37 проверок
 ```
 
 ---
 
 # llamastery (EN)
 
-Managing llama.cpp builds and forks, router presets, and the VRAM budget.
-An agent skill (Skill format) plus a plain CLI you can run by hand.
+Fit the model into VRAM on the first try: preset validation, honest memory forecast, measured fact.
 
-Standard library Python 3.11+ only. No external dependencies. No separate
-manager scripts needed: `llamastery` starts the server itself and loads and
-unloads models for any registered build, including builds without router mode.
+`llamastery` is a CLI and agent skill around `llama-server`. It knows your builds and forks
+(`faks`, `upstream`, `ik_llama`, `xing4`), validates each preset against **that** build's flag schema,
+predicts whether it fits your GPU, loads it, and measures real speed at long context.
+Python 3.11+ standard library only, no dependencies.
+
+## Navigation
+
+- [In 60 seconds](#in-60-seconds) · [Quick start](#quick-start) · [Commands by task](#commands-by-task)
+- [Whats inside](#whats-inside) · [Documentation](#documentation) · [Tests](#tests)
+- [In 60 seconds](#in-60-seconds) · [Quick start](#quick-start)
+
+## In 60 seconds
+
+```bash
+bin/llamastery doctor                  # what is visible: builds, preset, measurements, calibration
+bin/llamastery validate                # does the preset match your build's schema?
+bin/llamastery budget --models-max 2   # does it fit, and what fits together
+bin/llamastery load <preset>           # load into VRAM (with preflight check)
+bin/llamastery measure                 # real usage from the card
+bin/llamastery probe --tokens 110000   # honest speed at 110k depth
+```
+
+Where a live measurement exists, the "does it fit" decision uses it; the estimate is shown alongside.
+
+## Quick start
+
+Requirements: Python 3.11+, at least one built `llama-server`. `llamastery` only registers ready builds.
+
+```bash
+bin/llamastery doctor
+bin/llamastery builds detect --apply   # register forks
+bin/llamastery validate
+bin/llamastery budget
+bin/llamastery runtime start --build faks
+bin/llamastery load <preset> --dry-run    # check without loading
+bin/llamastery load <preset>
+bin/llamastery probe --tokens 110000 --from-file server.cpp
+```
+
+`measure` and `probe` only make sense with a loaded preset. Import foreign presets with `--dry-run` first.
+
+## Commands by task
+
+| I want | Command |
+|---|---|
+| See what is visible | `llamastery doctor` |
+| Register builds | `llamastery builds list` / `detect` / `show <name>` / `stale` |
+| Learn my build's flags | `llamastery schema --build faks --grep moe` |
+| Validate a preset | `llamastery validate [section]` |
+| Estimate memory | `llamastery budget [sections] --models-max 2 --explain` |
+| Load / unload | `llamastery load <preset>` / `llamastery runtime unload` |
+| Measure speed | `llamastery probe --tokens 110000 --from-file <code>` |
+| Capture real VRAM | `llamastery measure` |
+| Import a foreign preset | `llamastery presets import --source <file\|URL\|git> --dry-run` |
+
+Details: [SKILL.md](SKILL.md) (Russian) and [Documentation](#documentation).
+
+## Whats inside
+
+Three layers, bottom up:
+
+- **Hardware and file knowledge:** `lib/gguf.py` (GGUF header: layers, heads, MLA/MTP, tensor table),
+  `lib/schema.py` (flags from `--help`, cached by mtime), `lib/builds.py` (build registry).
+- **The "may I" decision:** `lib/budget.py` (VRAM forecast), `lib/validate.py` (checks + fork traps),
+  `lib/server.py` (server lifecycle), `lib/vram.py` + `lib/measure.py` (measurements beat estimates).
+- **Interface:** `bin/llamastery` (single CLI), `tools/tune_models.py` (auto-tuner),
+  `lib/annotate.py` (comment standard), `lib/probe.py`, `lib/crashes.py`, `lib/presets.py`, `lib/inifile.py`.
 
 ## Documentation
 
-Detailed files are provided per language. Pick whichever you read fastest;
-the content is the same.
+Read in whichever language is fastest — the content is the same.
 
 | Topic | RU | EN | 中文 |
 |---|---|---|---|
@@ -153,79 +274,8 @@ the content is the same.
 | Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
 | VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
 | Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| Short agent cheat sheet | [SKILL.md](SKILL.md) | — | — |
 
-## What is inside
-
-```
-bin/llamastery              single CLI
-lib/
-  schema.py             flag schema parsed from `llama-server --help` (cached by mtime)
-  inifile.py            INI that preserves comments (unlike configparser)
-  presets.py            preset import/export/merge (file, URL, git)
-  gguf.py               GGUF metadata reader (for memory estimation)
-  budget.py             VRAM broken into components + calibration
-  measure.py            gathers measurements from tune-results and models.ini comments
-  validate.py           preset validation + known fork traps
-  builds.py             build/fork registry + freshness check
-  crashes.py            crash journal: which presets bring the server down
-  runtime.py            preset preflight and manager selection (optional)
-  server.py             own server lifecycle: start/stop/load/unload
-  vram.py               live VRAM reading from the card and recalibration
-  annotate.py           one comment standard for presets
-  probe.py              tg/prefill measurement on a live server
-tools/tune_models.py    auto-tuner (two-stage, stdlib only)
-docs/                   detailed documentation: ru / en / zh
-```
-
-## Quick start
-
-```bash
-bin/llamastery doctor              # check the environment
-bin/llamastery builds detect --apply   # register forks
-bin/llamastery validate
-bin/llamastery budget --models-max 2
-bin/llamastery load <preset> --dry-run     # check without loading
-bin/llamastery runtime start --build faks  # start the router
-bin/llamastery load <preset>               # load into VRAM
-bin/llamastery measure                     # capture real memory use
-bin/llamastery probe --tokens 110000        # speed at real depth
-```
-
-## Install as an agent skill
-
-```bash
-ln -s ~/git/llamastery ~/.config/opencode/skills/llamastery
-ln -s ~/git/llamastery ~/.claude/skills/llamastery
-```
-
-One repository, many agents: every edit is visible to all of them at once.
-
-## Environment variables
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `LLAMA_MODELS_INI` | `~/.config/llama/models.ini` | router preset |
-| `LLAMA_SERVER_BIN` | from registry | path to llama-server |
-| `LLAMA_SERVER` | `http://127.0.0.1:8099` | server address |
-| `LLAMASTERY_CONFIG_DIR` | `~/.config/llamastery` | build registry |
-| `LLAMASTERY_STATE_DIR` | `~/.local/state/llamastery` | measurements, calibration, crash journal |
-| `LLAMASTERY_CACHE_DIR` | `~/.cache/llamastery` | flag schema cache |
-
-## Principles
-
-1. **Never writes silently.** Import defaults to `--dry-run`; a real write gets
-   a `.bak-<timestamp>` first. Tuning and writing need explicit consent.
-2. **Measurement beats calculation.** `measurements.json` is built from real
-   runs and takes priority in `validate` and `budget`. If a preset has a real
-   `used_mib`, the "does it fit" decision uses that number, and the estimate is
-   shown alongside for cross-checking.
-3. **The schema comes from that build's help.** Forks add and rename flags, so
-   a hardcoded list goes stale.
-4. **Honest estimates.** If `calibrate` has never run, or the spread of
-   residuals is large, the tool says so instead of pretending to know.
-5. **Crashes are remembered.** A preset can pass validation and still fall over
-   only at deep context. That lands in the journal, and `validate` warns.
+Beginners: `getting-started` → `builds` → `presets` → `measure`.
 
 ## Tests
 
@@ -237,16 +287,79 @@ python3 tests/run_tests.py           # no dependencies
 
 # llamastery (中文)
 
-管理 llama.cpp 的各个构建与分支、路由的 preset 配置，以及显存预算。
-既是 Agent 技能（Skill 格式），也是可以直接手动调用的 CLI。
+一次就把模型装进显存：校验 preset、诚实的显存预测、实测为准。
 
-仅依赖 Python 3.11+ 标准库，没有任何第三方依赖。不需要额外的管理脚本：
-`llamastery` 自己负责启动服务器，为任何已注册的构建加载和卸载模型，
-包括不具备路由模式的构建。
+`llamastery` 是围绕 `llama-server` 的 CLI 和 Agent 技能。它认得你的构建与分支
+（`faks`、`upstream`、`ik_llama`、`xing4`），按**当前构建**的参数表校验 preset，
+预测能否装进显卡，负责加载，并在长上下文下实测真实速度。
+仅需 Python 3.11+ 标准库，零第三方依赖。
+
+## 导航
+
+- [60秒速览](#60秒速览) · [快速开始](#快速开始) · [按任务查命令](#按任务查命令)
+- [目录结构](#目录结构) · [文档](#文档) · [测试](#测试)
+- [60秒速览](#60秒速览) · [快速开始](#快速开始)
+
+## 60秒速览
+
+```bash
+bin/llamastery doctor                  # 可见：构建、preset、实测、校准
+bin/llamastery validate                # preset 是否符合当前构建的参数表？
+bin/llamastery budget --models-max 2   # 装不装得下，哪些能同时装下
+bin/llamastery load <preset>           # 加载进显存（含预检）
+bin/llamastery measure                 # 显卡真实占用
+bin/llamastery probe --tokens 110000   # 110k 深度下的真实速度
+```
+
+已有实测的地方，“装不装得下”以实测为准，估算值并列显示以便核对。
+
+## 快速开始
+
+要求：Python 3.11+，至少一个已编译好的 `llama-server`。`llamastery` 只做注册，不负责编译。
+
+```bash
+bin/llamastery doctor
+bin/llamastery builds detect --apply   # 注册各分支
+bin/llamastery validate
+bin/llamastery budget
+bin/llamastery runtime start --build faks
+bin/llamastery load <preset> --dry-run    # 只检查不加载
+bin/llamastery load <preset>
+bin/llamastery probe --tokens 110000 --from-file server.cpp
+```
+
+`measure` 和 `probe` 只有在 preset 已加载时才有意义。导入外部 preset 先用 `--dry-run`。
+
+## 按任务查命令
+
+| 想做 | 命令 |
+|---|---|
+| 看清现状 | `llamastery doctor` |
+| 注册构建 | `llamastery builds list` / `detect` / `show <name>` / `stale` |
+| 查构建的参数 | `llamastery schema --build faks --grep moe` |
+| 校验 preset | `llamastery validate [section]` |
+| 估算显存 | `llamastery budget [sections] --models-max 2 --explain` |
+| 加载 / 卸载 | `llamastery load <preset>` / `llamastery runtime unload` |
+| 测速 | `llamastery probe --tokens 110000 --from-file <code>` |
+| 实测显存 | `llamastery measure` |
+| 导入外部 preset | `llamastery presets import --source <file\|URL\|git> --dry-run` |
+
+详情见 [SKILL.md](SKILL.md)（俄文）与[文档](#文档)。
+
+## 目录结构
+
+自下而上三层：
+
+- **硬件与文件知识：** `lib/gguf.py`（GGUF 头：层数、注意力头、MLA/MTP、张量表）、
+  `lib/schema.py`（从 `--help` 解析参数表，按 mtime 缓存）、`lib/builds.py`（构建注册表）。
+- **“能不能”决策：** `lib/budget.py`（显存预测）、`lib/validate.py`（校验 + 各分支陷阱）、
+  `lib/server.py`（服务器生命周期）、`lib/vram.py` + `lib/measure.py`（实测胜过推算）。
+- **接口：** `bin/llamastery`（统一 CLI）、`tools/tune_models.py`（自动调优器）、
+  `lib/annotate.py`（注释规范）、`lib/probe.py`、`lib/crashes.py`、`lib/presets.py`、`lib/inifile.py`。
 
 ## 文档
 
-详细文档按语言分别提供。选择你读起来最快的那一份即可，内容完全一致。
+选读起来最快的那份即可，内容完全一致。
 
 | 主题 | RU | EN | 中文 |
 |---|---|---|---|
@@ -255,78 +368,8 @@ python3 tests/run_tests.py           # no dependencies
 | preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) |
 | 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
 | 自动调优：方法与陷阱 | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| Agent 速查表 | [SKILL.md](SKILL.md) | — | — |
 
-## 目录结构
-
-```
-bin/llamastery              统一的 CLI
-lib/
-  schema.py             从 `llama-server --help` 解析参数表（按 mtime 缓存）
-  inifile.py            保留注释的 INI（不同于 configparser）
-  presets.py            preset 导入/导出/合并（文件、URL、git）
-  gguf.py               GGUF 元数据读取（用于估算显存）
-  budget.py             将显存拆分为各项 + 校准
-  measure.py            从 tune-results 与 models.ini 注释中汇总实测数据
-  validate.py           preset 校验 + 各分支的已知陷阱
-  builds.py             构建/分支注册表 + 版本新鲜度检查
-  crashes.py            崩溃日志：哪些 preset 会让服务崩溃
-  runtime.py            preset 预检查与管理器选择（可选）
-  server.py             自带服务器生命周期：start/stop/load/unload
-  vram.py               从显卡实时读取显存并重新校准
-  annotate.py           preset 上方的统一注释规范
-  probe.py              在运行中的服务器上实测 tg/prefill
-tools/tune_models.py    自动调优器（两阶段，仅用标准库）
-docs/                   详细文档：ru / en / zh
-```
-
-## 快速开始
-
-```bash
-bin/llamastery doctor              # 检查环境
-bin/llamastery builds detect --apply   # 注册各分支
-bin/llamastery validate
-bin/llamastery budget --models-max 2
-bin/llamastery load <preset> --dry-run     # 只检查不加载
-bin/llamastery runtime start --build faks  # 启动路由
-bin/llamastery load <preset>               # 加载进显存
-bin/llamastery measure                     # 实测显存占用
-bin/llamastery probe --tokens 110000        # 真实深度下的速度
-```
-
-## 作为 Agent 技能安装
-
-```bash
-ln -s ~/git/llamastery ~/.config/opencode/skills/llamastery
-ln -s ~/git/llamastery ~/.claude/skills/llamastery
-```
-
-一个仓库，多个 Agent 共用：任何修改所有 Agent 立刻可见。
-
-## 环境变量
-
-| 变量 | 默认值 | 含义 |
-|---|---|---|
-| `LLAMA_MODELS_INI` | `~/.config/llama/models.ini` | 路由 preset |
-| `LLAMA_SERVER_BIN` | 取自注册表 | llama-server 路径 |
-| `LLAMA_SERVER` | `http://127.0.0.1:8099` | 服务器地址 |
-| `LLAMASTERY_CONFIG_DIR` | `~/.config/llamastery` | 构建注册表 |
-| `LLAMASTERY_STATE_DIR` | `~/.local/state/llamastery` | 实测数据、校准、崩溃日志 |
-| `LLAMASTERY_CACHE_DIR` | `~/.cache/llamastery` | 参数表缓存 |
-
-## 原则
-
-1. **绝不静默写入。** 导入默认带 `--dry-run`，真正写入前先做
-   `.bak-<时间戳>` 备份。调优与写入都需要明确同意。
-2. **实测胜过推算。** `measurements.json` 来自真实运行，并在 `validate` 与
-   `budget` 中优先生效。若某个 preset 已有真实的 `used_mib`，
-   「装不装得下」的判断以实测为准，估算值并列显示以便核对。
-3. **参数表来自具体构建的 help。** 各分支会新增和重命名参数，
-   硬编码的清单必然过时。
-4. **诚实的估算。** 如果从没跑过 `calibrate`，或残差离散度很大，
-   工具会明确说明，而不是假装知道。
-5. **记住崩溃。** 某个 preset 可能通过校验，却只在深上下文下崩溃。
-   这类情况会进入日志，`validate` 随后给出警告。
+新手顺序：`getting-started` → `builds` → `presets` → `measure`。
 
 ## 测试
 
