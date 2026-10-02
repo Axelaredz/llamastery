@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -1260,9 +1261,6 @@ def cmd_swap(args) -> int:
               f"build={srv.get('build')} pid={srv.get('pid')}")
         return 0 if st["up"] else 1
     if args.action == "install":
-        import shutil
-        import subprocess
-        import sys
         ver = args.version or "v261"
         arch = "linux_amd64" if sys.platform.startswith("linux") else None
         if not arch:

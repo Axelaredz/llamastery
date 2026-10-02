@@ -11,6 +11,7 @@
 """
 
 import json
+import shlex
 import shutil
 import urllib.request
 from pathlib import Path
@@ -63,7 +64,10 @@ def section_to_cmd(section_name: str, pairs: dict, build: builds.Build) -> tuple
     bindir = str(build.server_bin.parent)
     if "LD_LIBRARY_PATH" not in env:
         env["LD_LIBRARY_PATH"] = bindir
-    return " ".join(_quote(p) for p in parts), warns, env
+    # вся команда — одна YAML-строка: несколько quoted-сегментов подряд
+    # YAML не принимает ("did not find expected key"), поэтому shlex внутри,
+    # json.dumps снаружи
+    return json.dumps(" ".join(shlex.quote(p) for p in parts)), warns, env
 
 
 def export_yaml(ini_path: str | None = None, build_name: str | None = None,
@@ -115,9 +119,11 @@ def export_yaml(ini_path: str | None = None, build_name: str | None = None,
         lines.append(f"  {_quote(name)}:")
         lines.append(f"    cmd: {cmd}")
         if env:
+            # swap ждёт env СПИСКОМ строк KEY=VALUE, мапу не ест
+            # (cannot unmarshal !!map into []string)
             lines.append("    env:")
             for k, v in env.items():
-                lines.append(f"      {k}: {_quote(str(v))}")
+                lines.append(f"      - {_quote(f'{k}={v}')}")
         if ttl:
             lines.append(f"    ttl: {ttl}")
         # alias = имя секции по умолчанию и так; явные aliases не дублируем
