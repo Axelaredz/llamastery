@@ -18,13 +18,14 @@ from . import measure, paths
 MIN_OVERHEAD_MIB = 128
 
 
-def gpu_used_mib(index: int = 0) -> int | None:
+def _query_nvidia_smi(field: str, index: int = 0) -> int | None:
+    """Один запрос к nvidia-smi; field — memory.used / memory.total и т.д."""
     exe = shutil.which("nvidia-smi")
     if not exe:
         return None
     try:
         r = subprocess.run(
-            [exe, f"--id={index}", "--query-gpu=memory.used",
+            [exe, f"--id={index}", f"--query-gpu={field}",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=20)
         if r.returncode == 0 and r.stdout.strip():
@@ -32,22 +33,14 @@ def gpu_used_mib(index: int = 0) -> int | None:
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return None
+
+
+def gpu_used_mib(index: int = 0) -> int | None:
+    return _query_nvidia_smi("memory.used", index)
 
 
 def gpu_total_mib(index: int = 0) -> int | None:
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None
-    try:
-        r = subprocess.run(
-            [exe, f"--id={index}", "--query-gpu=memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and r.stdout.strip():
-            return int(r.stdout.strip().splitlines()[0])
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return None
+    return _query_nvidia_smi("memory.total", index)
 
 
 def capture_preset(index: int = 0, allow_single: bool = False) -> dict:
@@ -61,8 +54,23 @@ def capture_preset(index: int = 0, allow_single: bool = False) -> dict:
         name = server.identify(pf)
         if name:
             server.use_build(name)
-    used = gpu_used_mib(index)
-    total = gpu_total_mib(index)
+    exe = shutil.which("nvidia-smi")
+    used = total = None
+    if exe:
+        try:
+            r = subprocess.run(
+                [exe, f"--id={index}", "--query-gpu=memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and r.stdout.strip():
+                parts = r.stdout.strip().splitlines()[0].split(",")
+                used = int(parts[0].strip())
+                total = int(parts[1].strip()) if len(parts) > 1 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    if used is None:
+        used = gpu_used_mib(index)
+        total = gpu_total_mib(index)
     if used is None:
         return {"ok": False, "error": "nvidia-smi недоступен"}
     loaded = [m for m in server.models()
@@ -120,12 +128,7 @@ def calibrate_from_measurement(pairs: dict, meta_used_mib: int,
     cal["compute_gb"] = round(new, 3)
     # константа измерена при СВОЁМ ubatch этого пресета — опорный тоже меняем,
     # иначе последующие оценки пересчитают масштабирование второй раз
-    ub = 0
-    low = {k.lower(): str(v or "") for k, v in pairs.items()}
-    for key in ("ubatch-size", "ub"):
-        if low.get(key, "").strip().isdigit():
-            ub = int(low[key].strip())
-            break
+    ub = budget._flag_int(pairs, "ubatch-size", "ub", default=0) or 0
     if ub:
         cal["compute_ref_ubatch"] = ub
     cal["vram_total_mib"] = gpu_total_mib() or cal.get("vram_total_mib")

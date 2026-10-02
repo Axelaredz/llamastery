@@ -307,7 +307,7 @@ def cmd_presets(args) -> int:
             print("\n(dry-run: файл не тронут)")
             return 0
         if args.conflicts and args.on_conflict == "skip":
-            print("\nесть конфликты — нужен --on-conflict overwrite или --allow-conflicts")
+            print("\nесть конфликты — нужен --on-conflict overwrite или --conflicts")
             return 3
         bk = (presets.backup(target_path) if target_path.exists()
               else None)
@@ -486,9 +486,11 @@ def _say_crash(name: str) -> None:
 
 def calibrate_from_log() -> int:
     """Калибровка compute buffer по собственному отчёту сервера."""
-    import re
     import statistics
     import json as _json
+
+    _UB_RE = re.compile(r"n_ubatch\s*=\s*(\d+)")
+    _BUF_RE = re.compile(r"CUDA0 compute buffer size =\s*([\d.]+) MiB")
 
     pts: dict[int, list[float]] = {}
     try:
@@ -498,10 +500,10 @@ def calibrate_from_log() -> int:
         return 1
     ub = None
     for ln in text.splitlines():
-        m = re.search(r"n_ubatch\s*=\s*(\d+)", ln)
+        m = _UB_RE.search(ln)
         if m:
             ub = int(m.group(1))
-        m = re.search(r"CUDA0 compute buffer size =\s*([\d.]+) MiB", ln)
+        m = _BUF_RE.search(ln)
         if m and ub:
             pts.setdefault(ub, []).append(float(m.group(1)))
     if not pts:
@@ -523,7 +525,7 @@ def calibrate_from_log() -> int:
     old = cal.get("compute_gb", 0.0)
     cal["compute_gb"] = round(mib / 1024.0, 3)
     cal["compute_ref_ubatch"] = ub_ref
-    cal["compute_source"] = (f"ж��ой отчёт сервера: {mib:.0f} MiB при "
+    cal["compute_source"] = (f"живой отчёт сервера: {mib:.0f} MiB при "
                              f"n_ubatch={ub_ref} (точек в логе: "
                              f"{sum(len(v) for v in pts.values())})")
     budget.save_calibration(cal)
@@ -702,6 +704,16 @@ def cmd_budget(args) -> int:
     store = measure.load_store()
 
     rows = []
+    meta_cache: dict[str, object | None] = {}
+
+    def _probe_cached(path: str):
+        if path not in meta_cache:
+            try:
+                meta_cache[path] = gguf.probe(path)
+            except (gguf.GGUFError, OSError):
+                meta_cache[path] = None
+        return meta_cache[path]
+
     for name in names:
         sec = ini.section(name)
         if not sec:
@@ -711,17 +723,11 @@ def cmd_budget(args) -> int:
         meta = None
         mp = pairs.get("mmproj")
         mm = None
-        if model and gguf.is_gguf(model):
-            try:
-                meta = gguf.probe(model)
-            except gguf.GGUFError:
-                meta = None
-        if mp and gguf.is_gguf(mp):
-            try:
-                mm = gguf.probe(mp)
-            except gguf.GGUFError:
-                mm = None
-        est = budget.estimate(pairs, meta, mmproj_meta=mm)
+        if model:
+            meta = _probe_cached(model)
+        if mp:
+            mm = _probe_cached(mp)
+        est = budget.estimate(pairs, meta, mmproj_meta=mm, _cal=cal)
         meas = measure.lookup(pairs, store)
         if meas and meas.get("min_free_mib") is not None:
             est.measured_min_free_mib = meas["min_free_mib"]
@@ -826,13 +832,20 @@ def cmd_calibrate(args) -> int:
             continue
         pairs = sec.pairs()
         model = pairs.get("model") or ""
-        if not model or not gguf.is_gguf(model):
+        if not model:
             print(f"{name}: нет модели — пропуск")
             continue
-        meta = gguf.probe(model)
+        try:
+            meta = gguf.probe(model)
+        except (gguf.GGUFError, OSError):
+            print(f"{name}: нет модели — пропуск")
+            continue
         mm = None
-        if pairs.get("mmproj") and gguf.is_gguf(pairs["mmproj"]):
-            mm = gguf.probe(pairs["mmproj"])
+        if pairs.get("mmproj"):
+            try:
+                mm = gguf.probe(pairs["mmproj"])
+            except (gguf.GGUFError, OSError):
+                mm = None
         est = budget.estimate(pairs, meta, compute_gb=0.0, mmproj_meta=mm)
         def pick(arg):
             """Значение можно задать общим флагом или точечно: секция=значение."""

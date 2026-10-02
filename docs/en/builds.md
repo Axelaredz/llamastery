@@ -98,3 +98,25 @@ separate process.
 A build is recognised by comparing `/proc/<pid>/exe` against `server_bin` from
 the registry. So if you rebuild a build at a new path without fixing the
 registry entry, `status` stops recognising whoever holds the port.
+
+## xing4_0 port
+
+The `xing4_0` architecture does not exist in stock llama.cpp — neither in any
+local build nor upstream. The only working option is the `xing4_0-port` branch
+of the `jmarceno/llama.cpp-xing4` fork (previously maintained by
+`shuxiaoqiong`). In `detect` it is known as `xing4` (`~/git/llama-xing4`).
+
+Three consequences to keep in mind:
+
+1. **No fork flags.** This is almost pure upstream: no `n-cpu-moe`, no fork
+   `load-mode`/`ctx-checkpoints`. Hybrid expert offload is done with stock
+   `-ot`/`override-tensor` (`blk.(…).ffn_*_exps.weight=CPU`) — `budget`
+   accounts for it exactly, from the GGUF tensor table.
+2. **KV follows MLA.** `xing4_0` has compressed KV (`kv_lora_rank` + rope
+   part, 576 elements/token/layer); the plain GQA formula overestimates it
+   almost 2× — `budget` applies the MLA formula itself.
+3. **Commits affect speed.** Verified: `b2056929` ("faster decode on
+   quantised MLA KV") is slower than its parent `63c16fb` everywhere on an
+   RTX 3060 (gen 30.7 vs 36.7 t/s @10k, prefill 178 vs 639 t/s, collapse at
+   depth). Pinning the commit is deliberate; `builds stale` warns about new
+   commits.

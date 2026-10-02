@@ -15,7 +15,9 @@ llama.cpp, и он зависит от аллокатора CUDA, unified KV, SS
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from . import paths
 from .gguf import ModelMeta
@@ -61,8 +63,12 @@ class Estimate:
         return d
 
 
-def _flag_int(pairs: dict[str, str], *names: str, default=None):
-    low = {k.lower(): v for k, v in pairs.items()}
+def _norm(pairs: dict[str, str]) -> dict[str, str]:
+    """Нижнерегистровые ключи один раз — вместо перестройки в каждом геттере."""
+    return {k.lower(): v for k, v in pairs.items()}
+
+
+def _get_int(low: dict[str, str], *names: str, default=None):
     for n in names:
         if n in low:
             try:
@@ -72,12 +78,19 @@ def _flag_int(pairs: dict[str, str], *names: str, default=None):
     return default
 
 
-def _flag_str(pairs: dict[str, str], *names: str, default=""):
-    low = {k.lower(): v for k, v in pairs.items()}
+def _get_str(low: dict[str, str], *names: str, default=""):
     for n in names:
         if n in low and str(low[n]).strip() != "":
             return str(low[n]).strip()
     return default
+
+
+def _flag_int(pairs: dict[str, str], *names: str, default=None):
+    return _get_int(_norm(pairs), *names, default=default)
+
+
+def _flag_str(pairs: dict[str, str], *names: str, default=""):
+    return _get_str(_norm(pairs), *names, default=default)
 
 
 def attention_layers(meta: ModelMeta) -> int:
@@ -95,27 +108,24 @@ def attention_layers(meta: ModelMeta) -> int:
 
 def _mtp_active(pairs: dict[str, str]) -> bool:
     """Встроенная MTP-голова (хвостовые nextn-слои) реально загружается?"""
-    spec = _flag_str(pairs, "spec-type", "spec", default="").lower()
-    draft = _flag_str(pairs, "model-draft", "draft", default="").strip()
+    low = _norm(pairs)
+    spec = _get_str(low, "spec-type", "spec", default="").lower()
+    draft = _get_str(low, "model-draft", "draft", default="").strip()
     return bool(draft) or "draft-mtp" in spec
 
 
-def override_cpu_bytes(pairs: dict[str, str], meta: ModelMeta | None
-                       ) -> tuple[float, int, str]:
-    """Байты весов, уходящие в RAM через override-tensor (флаг -ot).
+_BLK_RE = re.compile(r"blk\.(\d+)\.")
 
-    Семантика повторяет llama.cpp (llama-model-loader.cpp): запятые делят
-    записи pattern=device, сопоставление — regex_search, на тензор действует
-    ПЕРВОЕ совпавшее правило. В VRAM не считаются только device=CPU.
-    Возвращает (байты, число тензоров, заметка).
+
+@lru_cache(maxsize=128)
+def _compile_ot_entries(raw: str) -> tuple[tuple[str, str, bool], ...]:
+    """Компилирует -ot один раз на уникальную строку (кэш между пресетами).
+
+    Хранит (pattern, device, is_cpu); сам regex компилируется при
+    использовании и тоже кэшируется через re-модуль. Битые паттерны
+    молча пропускаются — как и раньше.
     """
-    import re
-    if meta is None or not meta.tensors:
-        return 0.0, 0, ""
-    raw = _flag_str(pairs, "override-tensor", "ot", default="").strip()
-    if not raw:
-        return 0.0, 0, ""
-    entries = []
+    out = []
     for chunk in raw.split(","):
         chunk = chunk.strip()
         if "=" not in chunk:
@@ -125,14 +135,35 @@ def override_cpu_bytes(pairs: dict[str, str], meta: ModelMeta | None
         if not pat:
             continue
         try:
-            rx = re.compile(pat)
+            re.compile(pat)
         except re.error:
             continue
-        entries.append((pat, rx, dev.lower() == "cpu"))
+        out.append((pat, dev, dev.lower() == "cpu"))
+    return tuple(out)
+
+
+def override_cpu_bytes(pairs: dict[str, str], meta: ModelMeta | None,
+                       _sizes: list[tuple[str, int]] | None = None
+                       ) -> tuple[float, int, str]:
+    """Байты весов, уходящие в RAM через override-tensor (флаг -ot).
+
+    Семантика повторяет llama.cpp (llama-model-loader.cpp): запятые делят
+    записи pattern=device, сопоставление — regex_search, на тензор действует
+    ПЕРВОЕ совпавшее правило. В VRAM не считаются только device=CPU.
+    Возвращает (байты, число тензоров, заметка).
+    """
+    if meta is None or not meta.tensors:
+        return 0.0, 0, ""
+    raw = _flag_str(pairs, "override-tensor", "ot", default="").strip()
+    if not raw:
+        return 0.0, 0, ""
+    compiled = [(pat, re.compile(pat), is_cpu)
+                for pat, _dev, is_cpu in _compile_ot_entries(raw)]
+    entries = [(pat, rx, is_cpu) for pat, rx, is_cpu in compiled]
     if not entries:
         return 0.0, 0, ""
     cpu_bytes, matched = 0, 0
-    for name, size in meta.tensor_sizes():
+    for name, size in (_sizes if _sizes is not None else meta.tensor_sizes()):
         for pat, rx, is_cpu in entries:
             try:
                 hit = rx.search(name) is not None
@@ -171,10 +202,16 @@ def expert_weight_share(meta: ModelMeta) -> float:
 
 def estimate(pairs: dict[str, str], meta: ModelMeta | None,
              compute_gb: float | None = None,
-             mmproj_meta: ModelMeta | None = None) -> Estimate:
-    """Оценка VRAM для одного пресета."""
+             mmproj_meta: ModelMeta | None = None,
+             _cal: dict | None = None) -> Estimate:
+    """Оценка VRAM для одного пресета.
+
+    _cal — уже загруженная калибровка (чтобы цикл по N пресетам не читал
+    JSON-файл N раз). Если None — читается с диска, как раньше.
+    """
     est = Estimate(model=meta.path.name if meta else "?")
-    cal = load_calibration()
+    cal = _cal if _cal is not None else load_calibration()
+    low = _norm(pairs)
     if compute_gb is None:
         compute_gb = cal.get("compute_gb", 0.0)
     # Калибровка compute_gb — это остаток (всего минус веса минус KV), а не сам
@@ -187,7 +224,7 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
     # Рост теперь затухающий; точный наклон не откалиброван (одна точка), поэтому
     # формула подобрана так, чтобы остаться ближе к измеренному, а не завышать.
     ref_ub = cal.get("compute_ref_ubatch") or 0
-    ub = _flag_int(pairs, "ubatch-size", "ub", default=0) or 0
+    ub = _get_int(low, "ubatch-size", "ub", default=0) or 0
     if compute_gb and ref_ub and ub and ub != ref_ub:
         scaled = compute_gb * (0.9 + 0.1 * ub / ref_ub)
         est.notes.append(
@@ -206,7 +243,7 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
     # сдвинулся с 512 на 1024) значение 2048 перестало помечаться — при том
     # что именно 2048 подтверждённо роняет сервер. Эвристика о молчании при
     # перекалибровке опаснее неточности.
-    spec = _flag_str(pairs, "spec-type", "spec", default="").lower()
+    spec = _get_str(low, "spec-type", "spec", default="").lower()
     if spec and ub > SPEC_UBATCH_LIMIT:
         est.notes.append(
             f"ВНИМАНИЕ: spec-type={spec} при ubatch={ub} — на глубоком контексте "
@@ -227,8 +264,8 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
         est.notes.append(
             f"минус {meta.n_layer_nextn} MTP-слоёв без KV: "
             f"слоёв внимания {est.n_attn_layer}")
-    est.ctx = _flag_int(pairs, "c", "ctx-size", default=meta.n_ctx_trained) or 0
-    est.cpu_moe = _flag_int(pairs, "n-cpu-moe", "ncmoe", "cmoe", default=0) or 0
+    est.ctx = _get_int(low, "c", "ctx-size", default=meta.n_ctx_trained) or 0
+    est.cpu_moe = _get_int(low, "n-cpu-moe", "ncmoe", "cmoe", default=0) or 0
 
     # ── веса ──
     # Структурная доля экспертов (аналитика по метаданным) завышает эффект
@@ -236,14 +273,15 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
     # Коэффициент калибруется по замерам (см. llamastery calibrate --from-tune).
     realization = cal.get("offload_realization", 0.76)
     weights = meta.size_bytes / GIB
-    if meta.n_layer_nextn and not _mtp_active(pairs) and meta.tensors:
+    # таблицу тензоров строим один раз — она нужна и MTP-скипу, и -ot
+    sizes = meta.tensor_sizes() if meta.tensors else []
+    if meta.n_layer_nextn and not _mtp_active(pairs) and sizes:
         # встроенная MTP-голова при выключенном MTP: загрузчик помечает
         # хвостовые nextn-слои как unused — в VRAM их нет
-        import re as _re
         first_nextn = meta.n_layer - meta.n_layer_nextn
         skip = 0
-        for _name, _size in meta.tensor_sizes():
-            _m = _re.match(r"blk\.(\d+)\.", _name)
+        for _name, _size in sizes:
+            _m = _BLK_RE.match(_name)
             if _m and int(_m.group(1)) >= first_nextn:
                 skip += _size
         if skip:
@@ -251,7 +289,7 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
             est.notes.append(
                 f"MTP выключен: хвостовые {meta.n_layer_nextn} nextn-слоёв "
                 f"не грузятся (−{skip / GIB:.2f} GiB)")
-    ot_bytes, ot_n, ot_note = override_cpu_bytes(pairs, meta)
+    ot_bytes, ot_n, ot_note = override_cpu_bytes(pairs, meta, _sizes=sizes)
     if ot_bytes:
         # точный учёт через таблицу тензоров — вместо эвристики n-cpu-moe
         weights -= ot_bytes / GIB
@@ -268,17 +306,17 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
             f"n-cpu-moe={est.cpu_moe}/{meta.n_layer} → в RAM уходит "
             f"~{per_layer * est.cpu_moe:.2f} GiB ({per_layer:.3f} GiB на слой, "
             f"коэффициент {realization})")
-    ngl = _flag_int(pairs, "n-gpu-layers", "ngl", "gpu-layers")
+    ngl = _get_int(low, "n-gpu-layers", "ngl", "gpu-layers")
     if ngl is not None and 0 <= ngl < meta.n_layer:
         weights *= (ngl + 1) / meta.n_layer
         est.notes.append(f"n-gpu-layers={ngl} → только {ngl + 1}/{meta.n_layer} слоёв в VRAM")
     est.weights_gb = weights
 
     # ── KV-кэш ──
-    ctk = kv_bytes_for(_flag_str(pairs, "cache-type-k", "ctk", default="f16"))
-    ctv = kv_bytes_for(_flag_str(pairs, "cache-type-v", "ctv", default="f16"))
-    np_ = _flag_int(pairs, "parallel", "np", default=1) or 1
-    kv_unified = _flag_str(pairs, "kv-unified", "kvu", default="")
+    ctk = kv_bytes_for(_get_str(low, "cache-type-k", "ctk", default="f16"))
+    ctv = kv_bytes_for(_get_str(low, "cache-type-v", "ctv", default="f16"))
+    np_ = _get_int(low, "parallel", "np", default=1) or 1
+    kv_unified = _get_str(low, "kv-unified", "kvu", default="")
     if meta.is_mla:
         # MLA (DeepSeek-стиль, xing4_0): KV — одна строка на слой,
         # latent (kv_lora_rank) + rope-часть. В llama.cpp весь MLA-кэш —
@@ -304,7 +342,7 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
 
     # ── mmproj ──
     if mmproj_meta is not None:
-        offload = _flag_str(pairs, "mmproj-offload", default="1").lower()
+        offload = _get_str(low, "mmproj-offload", default="1").lower()
         if offload not in ("0", "off", "false", "disabled"):
             est.mmproj_gb = mmproj_meta.size_bytes / GIB
 

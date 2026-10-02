@@ -613,13 +613,16 @@ def test_freshness_reports_staleness() -> None:
         g("config", "user.email", "t@t"); g("config", "user.name", "t")
         (root / "a.txt").write_text("1\n")
         g("add", "-A"); g("commit", "-qm", "первый")
-        g("checkout", "-qb", "up")
+        # ветка up фиксирует первый коммит; второй коммит идёт в main,
+        # затем main привязывается к up как upstream — main ahead на 1
+        g("branch", "up")
         (root / "a.txt").write_text("2\n")
         g("add", "-A"); g("commit", "-qm", "второй")
-        g("checkout", "-q", "main")
+        g("branch", "--set-upstream-to=up", "main")
 
-        # server_bin — свойство от path, поэтому задаём только path
-        fake = B.Build(name="t", path=str(root / "нет-бинаря"))
+        # server_bin — свойство от path, поэтому задаём только path;
+        # .git ищется в b.path — указываем корень репозитория
+        fake = B.Build(name="t", path=str(root))
         B.get = lambda name, *a, **k: fake
         r = B.freshness("t", fetch=False)
         check(r.get("ahead") == 1, "свой коммит опознан как ahead, а не как отставание")
@@ -808,7 +811,7 @@ def test_annotate_canonical_form_is_stable() -> None:
     check(b2.note == b.note, "текст нюансов пережил печать без потерь")
     check(len(b2.provenance) == len(b.provenance),
           "поле «Замер» не рассыпалось на пункты")
-    check(rendered.count("- " + "-" * 20) == 2,
+    check(rendered.count("; " + "-" * 20) == 2,
           "разделителей ровно два: верх и низ блока")
 
 

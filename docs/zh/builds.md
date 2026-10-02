@@ -93,3 +93,24 @@ llamastery load <preset> --build ik
 构建的识别方式是把 `/proc/<pid>/exe` 与注册表中的 `server_bin` 路径做比较。
 因此，如果你把某个构建重建到了新路径，却没有同步更新注册表条目，
 `status` 就无法再认出占用端口的进程。
+
+## xing4_0 移植版
+
+原生 llama.cpp 中没有 `xing4_0` 架构 —— 本地构建和上游都没有。唯一可用的
+是 `jmarceno/llama.cpp-xing4` 仓库的 `xing4_0-port` 分支（此前由
+`shuxiaoqiong` 维护同一分支）。在 `detect` 中它叫 `xing4`
+（`~/git/llama-xing4`）。
+
+需要记住三点：
+
+1. **没有 fork 专属参数。** 这几乎就是纯上游：没有 `n-cpu-moe`，也没有
+   `load-mode`/`ctx-checkpoints`。专家混合 offload 用原生
+   `-ot`/`override-tensor`（`blk.(…).ffn_*_exps.weight=CPU`）完成 ——
+   `budget` 按 GGUF 张量表精确计算。
+2. **KV 按 MLA 计算。** `xing4_0` 使用压缩 KV（`kv_lora_rank` + rope 部分，
+   每 token 每层 576 个元素），普通 GQA 公式会高估近一倍 —— `budget`
+   会自动采用 MLA 公式。
+3. **提交影响速度。** 已验证：`b2056929`（“量化 MLA KV 解码加速”）在
+   RTX 3060 上处处慢于父提交 `63c16fb`（gen 30.7 对 36.7 t/s @10k，
+   prefill 178 对 639 t/s，深上下文崩溃）。锁定提交是有意为之，
+   `builds stale` 会提示新提交。

@@ -234,6 +234,10 @@ def wait_status(model_id: str, want: tuple[str, ...], timeout: int = 900,
     return last
 
 
+import re as _re
+
+_PID_RE = _re.compile(r"pid=(\d+)")
+
 # ── владение портом ──
 def pid_on_port(port: int | None = None) -> int | None:
     port = port or port_number()
@@ -242,8 +246,7 @@ def pid_on_port(port: int | None = None) -> int | None:
                            capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
-    import re
-    m = re.search(r"pid=(\d+)", r.stdout)
+    m = _PID_RE.search(r.stdout)
     return int(m.group(1)) if m else None
 
 

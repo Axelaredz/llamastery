@@ -30,6 +30,12 @@ class GGUFError(Exception):
     pass
 
 
+_FIXED_SKIP = {
+    UINT8: 1, INT8: 1, UINT16: 2, INT16: 2, UINT32: 4, INT32: 4,
+    FLOAT32: 4, BOOL: 1, UINT64: 8, INT64: 8, FLOAT64: 8,
+}
+
+
 @dataclass
 class ModelMeta:
     path: Path
@@ -105,10 +111,6 @@ class ModelMeta:
 
     @property
     def quant(self) -> str:
-        parts = []
-        for k, v in self.kv.items():
-            if k.endswith("general.file_type") or k == "general.file_type":
-                parts.append(f"{v}")
         return str(self.kv.get("general.file_type", ""))
 
     @property
@@ -208,7 +210,12 @@ class _Reader:
             if n > MAX_ARRAY_ELEMS:
                 raise GGUFError(f"подозрительно длинный массив: {n}")
             if n > MAX_ARRAY_STORED:
-                # длинные массивы (словарь, merges) нам не нужны — вычитываем в никуда
+                # длинные массивы (словарь, merges) нам не нужны.
+                # Скаляры фиксированной длины пропускаем seek'ом вместо
+                # тысяч мелких read() — меньше syscall на больших словарях.
+                if etype in _FIXED_SKIP:
+                    self.fh.seek(n * _FIXED_SKIP[etype], 1)
+                    return f"<array of {n} elems, elided>"
                 for _ in range(n):
                     self.value(etype, depth + 1)
                 return f"<array of {n} elems, elided>"
@@ -311,7 +318,8 @@ def find_mmproj_near(model: str | Path, max_scanned: int = 400) -> str | None:
     stem = m.stem.split("-G")[0].lower()
     best, best_score = None, -1
     for c in cands:
-        score = sum(1 for tok in stem.split("-") if tok and tok in c.stem.lower())
+        cstem = c.stem.lower()
+        score = sum(1 for tok in stem.split("-") if tok and tok in cstem)
         if score > best_score:
             best, best_score = c, score
     return str(best)

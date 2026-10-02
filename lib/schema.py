@@ -238,9 +238,10 @@ def load(binary: str | Path | None, use_cache: bool = True,
     binary = Path(binary).expanduser()
     if not binary.exists():
         return {}, {"error": f"нет такого бинаря: {binary}"}
-    mtime = binary.stat().st_mtime
+    st = binary.stat()
+    mtime = st.st_mtime
     meta = {"binary": str(binary), "mtime": mtime,
-            "size": binary.stat().st_size}
+            "size": st.st_size}
 
     cached = paths.schema_cache(binary)
     if use_cache and cached.exists() and not refresh:
@@ -281,17 +282,21 @@ def resolve(flags: dict[str, Flag], key: str) -> Flag | None:
     if k in flags:
         return flags[k]
 
-    unique = {id(v): v for v in flags.values()}.values()
-    for f in unique:                       # точно, с дефисами и без
-        if low_is := (f.canonical.lstrip("-") == k):
+    # один проход по уникальным флагам; ini_keys считаем один раз на флаг,
+    # а не дважды (иначе O(ключи × флаги × формы) на каждый пресет)
+    uniq = list({id(v): v for v in flags.values()}.values())
+    forms = [(f, [x.lstrip("-") for x in f.ini_keys()]) for f in uniq]
+    for f, stripped in forms:          # точно, с дефисами и без
+        if f.canonical.lstrip("-") == k:
             return f
-    for f in unique:                       # любая форма записи, регистр значим
-        if k in [x.lstrip("-") for x in f.ini_keys()]:
+    for f, stripped in forms:          # любая форма записи, регистр значим
+        if k in stripped:
             return f
     low = k.lower()
-    for f in unique:                       # последний рубеж — без регистра
-        if low in [x.lstrip("-").lower() for x in f.ini_keys()]:
-            return f
+    for f, stripped in forms:          # последний рубеж — без регистра
+        for x in stripped:
+            if x.lower() == low:
+                return f
     return None
 
 
