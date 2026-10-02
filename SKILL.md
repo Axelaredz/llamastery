@@ -214,6 +214,21 @@ buffer. Пока `calibrate` не запускался, оценка заниж�
 точек бывает мало. Остаток от общего (старый способ) включает постоянные
 накладные расходы и потому завышает буфер примерно на 0.3 GiB.
 
+## llama-swap (экспорт, не загрузка)
+
+`llamastery` — источник правды, swap — только прокси. Замеры и бюджет
+всегда напрямую, не через `:8080`. Одна swap-конфигурация — одна сборка.
+Подробности и таблица «с какой сборкой запускать»: `docs/ru/swap.md`.
+
+```bash
+llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml --dry-run
+llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml
+llamastery swap status
+```
+
+Дефолт связки — `faks`. `ik` в swap только отдельным конфигом (старая
+схема режет часть флагов), рекорды — напрямую `load --build ik`.
+
 ## Журнал падений
 
 ```bash

@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib import (budget, builds, crashes, gguf, measure, paths, presets,  # noqa: E402
-                 runtime, schema, server, validate)
+                 runtime, schema, server, swap, validate)
 from lib.inifile import IniFile  # noqa: E402
 
 MIB = 2 ** 20
@@ -1212,7 +1212,7 @@ def cmd_doctor(args) -> int:
 
     print("\nменеджеры на PATH")
     for cmd in ("llama", "llama-faks", "llama-ik", "catapult", "catapult-cn",
-                "llm-preset-manager"):
+                "llm-preset-manager", "llama-swap"):
         import shutil
         found = shutil.which(cmd)
         print(f"  {'ok ' if found else '—  '} {cmd:<22} {found or '—'}")
@@ -1242,6 +1242,78 @@ def cmd_doctor(args) -> int:
         print("    → подробности: llamastery builds stale   "
               "(обновление и пересборка — решение человека)")
     return 0 if ok else 1
+
+
+# ─────────────────────────── swap ───────────────────────────
+def cmd_swap(args) -> int:
+    if args.action == "status":
+        binp = swap.find_binary()
+        print(f"бинарь: {binp or 'НЕ НАЙДЕН (swap install)'}")
+        st = swap.status(args.url)
+        print(f"прокси {st['url']}: {'up' if st['up'] else 'down'}")
+        if st.get("running"):
+            print(json.dumps(st["running"], ensure_ascii=False, indent=1)[:2000])
+        if st.get("error"):
+            print(f"! {st['error']}")
+        srv = server.status()
+        print(f"прямой сервер: {srv['url']} up={srv['up']} "
+              f"build={srv.get('build')} pid={srv.get('pid')}")
+        return 0 if st["up"] else 1
+    if args.action == "install":
+        import shutil
+        import subprocess
+        import sys
+        ver = args.version or "v261"
+        arch = "linux_amd64" if sys.platform.startswith("linux") else None
+        if not arch:
+            print("install пока только для Linux x64", file=sys.stderr)
+            return 1
+        num = ver[1:] if ver.startswith("v") else ver
+        url = (f"https://github.com/mostlygeek/llama-swap/releases/download/"
+               f"{ver}/llama-swap_{num}_{arch}.tar.gz")
+        dest = Path("~/.local/bin").expanduser()
+        dest.mkdir(parents=True, exist_ok=True)
+        print(f"качаю {url}")
+        print(f"цель: {dest}/llama-swap")
+        print("(dry-run)" if args.dry_run else "")
+        if args.dry_run:
+            return 0
+        try:
+            tmp = Path("/tmp") / f"llama-swap-{ver}.tar.gz"
+            subprocess.run(["curl", "-fL", url, "-o", str(tmp)], check=True)
+            subprocess.run(["tar", "-xzf", str(tmp), "-C", str(dest)], check=True)
+            print(f"готово: {dest}/llama-swap --version")
+            print("проверь PATH: ~/.local/bin должен быть в $PATH")
+            return 0
+        except subprocess.CalledProcessError as exc:
+            print(f"не скачалось: {exc}", file=sys.stderr)
+            return 1
+    # export
+    text, warns = swap.export_yaml(args.ini, args.build, args.only,
+                                   ttl=args.ttl or 0)
+    for w in warns:
+        print(f"! {w}")
+    if not text:
+        return 1
+    if args.output:
+        outp = Path(args.output).expanduser()
+        if args.dry_run:
+            print(f"(dry-run) записалось бы в {outp}:\n")
+            print(text[:4000])
+            return 0
+        if outp.exists():
+            bak = outp.with_suffix(outp.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            shutil.copy2(outp, bak)
+            print(f"бэкап: {bak}")
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        outp.write_text(text, encoding="utf-8")
+        print(f"записано: {outp}")
+        binp = swap.find_binary()
+        print(f"запуск: {binp or 'llama-swap'} "
+              f"--config {outp} --listen 0.0.0.0:8080")
+        return 0
+    print(text)
+    return 0
 
 
 # ─────────────────────────── main ───────────────────────────
@@ -1396,6 +1468,20 @@ def main(argv=None) -> int:
     d = sub.add_parser("doctor", help="проверка окружения")
     d.add_argument("--build")
     d.set_defaults(func=cmd_doctor)
+
+    sw = sub.add_parser("swap", help="llama-swap: экспорт models.ini в swap-YAML")
+    sw.add_argument("action", nargs="?", default="export",
+                    choices=["export", "status", "install"])
+    sw.add_argument("--ini", help="пресет (по умолчанию models.ini)")
+    sw.add_argument("--build", help="какой сборкой транслировать (по умолчанию faks)")
+    sw.add_argument("--only", nargs="*", help="только эти секции")
+    sw.add_argument("--output", "-o", help="куда записать YAML (по умолчанию stdout)")
+    sw.add_argument("--ttl", type=int, default=0, help="ttl выгрузки моделей, сек")
+    sw.add_argument("--url", default="http://127.0.0.1:8080",
+                    help="адрес swap для status")
+    sw.add_argument("--version", help="версия для install (по умолчанию v261)")
+    sw.add_argument("--dry-run", action="store_true")
+    sw.set_defaults(func=cmd_swap)
 
     args = p.parse_args(argv)
     return args.func(args)

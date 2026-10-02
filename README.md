@@ -107,6 +107,7 @@ bin/llamastery runtime stop
 | Оформить комментарии | `llamastery presets annotate --apply` (сначала без `--apply`) |
 | Разобрать падение | `llamastery crashes` / `crashes --forget <пресет>` |
 | Подобрать параметры | `llamastery tune <ini> <секция> --build faks --extra ...` (грузит GPU, только с согласия) |
+| Выгрузить в llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run` (дефолт связки — faks, см. docs/ru/swap.md) |
 
 Полный разбор каждой команды — в [SKILL.md](SKILL.md) и `docs/`.
 
@@ -135,6 +136,7 @@ bin/llamastery runtime stop
 | Пресеты: формат, правка, оформление | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
 | Бюджет VRAM и замеры | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
 | Автотюнинг: методика и ловушки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
+| llama-swap: экспорт и связка | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
 
 Новичкам: `getting-started` → `builds` → `presets` → `measure`. Остальное — по мере вопросов.
 
@@ -249,6 +251,7 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 | Measure speed | `llamastery probe --tokens 110000 --from-file <code>` |
 | Capture real VRAM | `llamastery measure` |
 | Import a foreign preset | `llamastery presets import --source <file\|URL\|git> --dry-run` |
+| Export to llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run` (default backend — faks, see docs/en/swap.md) |
 
 Details: [SKILL.md](SKILL.md) (Russian) and [Documentation](#documentation).
 
@@ -274,6 +277,7 @@ Read in whichever language is fastest — the content is the same.
 | Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
 | VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
 | Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
+| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
 
 Beginners: `getting-started` → `builds` → `presets` → `measure`.
 
@@ -343,6 +347,7 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 | 测速 | `llamastery probe --tokens 110000 --from-file <code>` |
 | 实测显存 | `llamastery measure` |
 | 导入外部 preset | `llamastery presets import --source <file\|URL\|git> --dry-run` |
+| 导出到 llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run`（默认后端 faks，见 docs/zh/swap.md）|
 
 详情见 [SKILL.md](SKILL.md)（俄文）与[文档](#文档)。
 
@@ -368,6 +373,7 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 | preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) |
 | 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
 | 自动调优：方法与陷阱 | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
+| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
 
 新手顺序：`getting-started` → `builds` → `presets` → `measure`。
 
