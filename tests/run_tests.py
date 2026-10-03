@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from lib import budget, gguf, inifile, measure, presets, schema, swap, validate  # noqa: E402
+from lib import budget, gguf, inifile, measure, presets, schema, swap, validate, wizard  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -749,6 +749,35 @@ def test_swap_port_check() -> None:
             check(isinstance(swap.describe_owner(owner), str), "описание — строка")
     finally:
         srv.close()
+
+
+def test_wizard_defaults(tmp: Path) -> None:
+    """Мастер: дефолты — самый эффективный вариант, мусор ввода безопасен."""
+    from lib import builds as B
+
+    print("wizard: дефолты")
+    check(wizard.clamp_choice("2", 3, 1) == 2, "номер принят")
+    check(wizard.clamp_choice("xx", 3, 1) == 1, "мусор = дефолт")
+    check(wizard.clamp_choice("9", 3, 1) == 1, "вне диапазона = дефолт")
+    check(wizard.ngram_default({}) is True, "ngram без mmproj — да")
+    check(wizard.ngram_default({"mmproj": "f"}) is False, "ngram с mmproj — нет")
+    check(wizard.mtp_default("x-mtp", {}) is True, "mtp в имени — да")
+    check(wizard.mtp_default("plain", {}) is False, "без mtp — нет")
+    check(wizard.find_mmproj_sibling(["a", "a-mmproj"], "a") == "a-mmproj",
+          "близнец mmproj найден")
+    check(wizard.find_mmproj_sibling(["a"], "a") is None, "без близнеца — None")
+
+    def _mk(name: str, router: bool) -> B.Build:
+        d = tmp / name
+        (d / "build" / "bin").mkdir(parents=True)
+        (d / "build" / "bin" / "llama-server").touch()
+        return B.Build(name=name, path=str(d), router=router)
+
+    reg = {"ik": _mk("ik", False), "faks": _mk("faks", True)}
+    check(wizard.recommend_build(reg) == "faks", "дефолт сборки — faks")
+    reg2 = {"ik": _mk("ik2", False), "upstream": _mk("up", True)}
+    check(wizard.recommend_build(reg2) == "upstream", "без faks — роутерная")
+    check(wizard.recommend_build({}) is None, "пусто — None")
 
 
 def test_probe_retries_on_immediate_stop() -> None:

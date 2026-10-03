@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib import (budget, builds, crashes, gguf, measure, paths, presets,  # noqa: E402
-                 runtime, schema, server, swap, validate)
+                 runtime, schema, server, swap, validate, wizard)
 from lib.inifile import IniFile  # noqa: E402
 
 MIB = 2 ** 20
@@ -1333,12 +1333,17 @@ def cmd_swap(args) -> int:
     return 0
 
 
+# ─────────────────────────── wizard ───────────────────────────
+def cmd_wizard(args) -> int:
+    return wizard.run()
+
+
 # ─────────────────────────── main ───────────────────────────
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="llamastery",
         description="сборки/форки llama.cpp, пресеты, бюджет VRAM")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     b = sub.add_parser("builds", help="реестр сборок и форков")
     b.add_argument("action",
@@ -1500,7 +1505,12 @@ def main(argv=None) -> int:
     sw.add_argument("--dry-run", action="store_true")
     sw.set_defaults(func=cmd_swap)
 
+    w = sub.add_parser("wizard", help="интерактивный мастер: сервер → swap → пресет → план")
+    w.set_defaults(func=cmd_wizard)
+
     args = p.parse_args(argv)
+    if args.cmd is None:
+        return cmd_wizard(args)
     return args.func(args)
 
 

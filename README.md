@@ -108,6 +108,7 @@ bin/llamastery runtime stop
 | Разобрать падение | `llamastery crashes` / `crashes --forget <пресет>` |
 | Подобрать параметры | `llamastery tune <ini> <секция> --build faks --extra ...` (грузит GPU, только с согласия) |
 | Выгрузить в llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run` (дефолт связки — faks, см. docs/ru/swap.md) |
+| Мастер настройки | `llamastery` без команды или `llamastery wizard` (дефолты ★ = самый эффективный вариант) |
 
 Полный разбор каждой команды — в [SKILL.md](SKILL.md) и `docs/`.
 
@@ -252,6 +253,7 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 | Capture real VRAM | `llamastery measure` |
 | Import a foreign preset | `llamastery presets import --source <file\|URL\|git> --dry-run` |
 | Export to llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run` (default backend — faks, see docs/en/swap.md) |
+| Setup wizard | bare `llamastery` or `llamastery wizard` (defaults ★ = most effective option) |
 
 Details: [SKILL.md](SKILL.md) (Russian) and [Documentation](#documentation).
 
@@ -348,6 +350,7 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 | 实测显存 | `llamastery measure` |
 | 导入外部 preset | `llamastery presets import --source <file\|URL\|git> --dry-run` |
 | 导出到 llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run`（默认后端 faks，见 docs/zh/swap.md）|
+| 设置向导 | 不带参数的 `llamastery` 或 `llamastery wizard`（默认值 ★ = 最优选项）|
 
 详情见 [SKILL.md](SKILL.md)（俄文）与[文档](#文档)。
 
