@@ -870,7 +870,32 @@ def test_wizard_defaults(tmp: Path) -> None:
     check(wizard.mtp_default("plain", {}) is False, "без mtp — нет")
     check(wizard.find_mmproj_sibling(["a", "a-mmproj"], "a") == "a-mmproj",
           "близнец mmproj найден")
+
+    # замер ищется по подписи конфигурации, а не по имени секции
+    pairs = {"c": "32768", "n-cpu-moe": "8"}
+    from lib import measure as M
+    sig = M.signature(pairs)
+    recs = {sig: {"vram_mib": 10800, "runs": 1, "deep_tps": None}}
+    m = wizard.measurement_of(pairs, recs)
+    check(m is not None and m["vram_gb"] == 10.55, "замер по подписи найден", m)
+    check(wizard.measurement_of({"c": "1024"}, recs) is None,
+          "чужая конфигурация — замера нет")
     check(wizard.find_mmproj_sibling(["a"], "a") is None, "без близнеца — None")
+
+    # меню строится по состоянию: нельзя предложить «остановить» то, что не живо
+    down = wizard.menu_for(False, [], False)
+    up = wizard.menu_for(True, ["qwen"], True)
+    check(any("Остановить роутер" in o[0] for o in down) is False,
+          "роутер не запущен — нет пункта «Остановить роутер»", down)
+    check(any("Остановить роутер" in o[0] for o in up),
+          "роутер запущен — есть «Остановить роутер»", up)
+    check(any("Загрузить" in o[0] for o in up), "загруженная модель — есть загрузка")
+    check(any("Остановить llama-swap" in o[0] for o in up),
+          "swap жив — есть пункт его остановки", up)
+    check(any("Запустить llama-swap" in o[0] for o in down),
+          "swap не жив — есть пункт его запуска", down)
+    check(wizard.menu_default(up, True) == 2, "дефолт при живом роутере — рестарт/загрузка")
+    check(wizard.menu_default(down, False) == 1, "дефолт при мёртвом — запуск+загрузка")
 
     def _mk(name: str, router: bool) -> B.Build:
         d = tmp / name

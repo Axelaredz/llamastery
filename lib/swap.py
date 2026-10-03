@@ -14,8 +14,10 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
+import time
 import urllib.request
 from pathlib import Path
 
@@ -203,6 +205,110 @@ def parse_listen(text: str) -> tuple[str, int]:
     else:
         host, port = "", s
     return host or "0.0.0.0", int(port)
+
+
+# ── демон: своими руками, как роутер ──
+def _state() -> Path:
+    d = paths.state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def pid_file() -> Path:
+    return _state() / "swap.pid"
+
+
+def log_file() -> Path:
+    return _state() / "swap.log"
+
+
+def daemon_pid() -> int | None:
+    try:
+        pid = int(pid_file().read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid
+    return pid
+
+
+def up(config: str | None = None, listen: str = SWAP_LISTEN,
+       timeout: int = 20) -> dict:
+    """Поднимает llama-swap демоном: свой pid-файл, лог, проверка /health.
+
+    Отдельный демон, а не `&` в терминале: иначе никто не знает, кто его
+    запустил, и остановить его можно только руками. Роутер поднимается
+    ровно так же, поэтому поведение знакомое.
+    """
+    binary = find_binary()
+    if binary is None:
+        return {"ok": False, "message": "бинарь llama-swap не найден "
+                                        "(llamastery swap install)"}
+    cfg = Path(config).expanduser() if config else default_output()
+    if not cfg.exists():
+        return {"ok": False, "message": f"нет конфига: {cfg}\n"
+                                        f"  собери его: llamastery swap export "
+                                        f"-o {cfg}"}
+    host, port = parse_listen(listen)
+    if is_port_busy(host, port):
+        pid = daemon_pid()
+        if pid:
+            return {"ok": True, "pid": pid,
+                    "message": f"уже работает (pid {pid}) на {listen}"}
+        return {"ok": False,
+                "message": f"порт {port} занят: {describe_owner(port_owner(port))}"}
+    log = open(log_file(), "a")
+    log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} llama-swap "
+              f"--config {cfg} --listen {listen}\n")
+    log.flush()
+    argv = [str(binary), "--config", str(cfg), "--listen", listen]
+    try:
+        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        return {"ok": False, "message": f"не запустился: {exc}"}
+    pid_file().write_text(str(proc.pid))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return {"ok": False, "pid": proc.pid,
+                    "message": f"процесс умер (код {proc.returncode}). "
+                               f"лог: {log_file()}"}
+        if status(f"http://{host}:{port}", timeout=2.0)["up"]:
+            return {"ok": True, "pid": proc.pid, "url": f"http://{listen}",
+                    "message": f"swap поднят на {listen} (pid {proc.pid})"}
+        time.sleep(0.5)
+    return {"ok": False, "pid": proc.pid,
+            "message": f"не ответил за {timeout} с. лог: {log_file()}"}
+
+
+def down(timeout: int = 20) -> dict:
+    """Останавливает демон swap. Модели в VRAM уходят вместе с ним."""
+    pid = daemon_pid()
+    if not pid:
+        return {"ok": True, "message": "swap не запущен (или не нашим pid-файлом)"}
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        return {"ok": False, "message": f"не удалось SIGTERM: {exc}"}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and daemon_pid():
+        time.sleep(0.3)
+    if daemon_pid():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(0.5)
+    try:
+        pid_file().unlink()
+    except OSError:
+        pass
+    return {"ok": True, "message": f"swap остановлен (pid {pid})"}
 
 
 def is_port_busy(host: str, port: int, timeout: float = 1.0) -> bool:
