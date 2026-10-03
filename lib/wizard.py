@@ -398,7 +398,7 @@ def _report_files(ini) -> None:
     note(f"  {ISVALORUM}")
 
 
-def _do_router(build: str | None, action: str) -> int:
+def _do_router(action: str, build: str | None = None) -> int:
     if action == "start":
         return _run_cli("runtime", "start", "--build", build)
     if action == "restart":
@@ -538,17 +538,17 @@ def _dispatch(action: str, swap_url: str):
     if action.startswith("Запустить llama-swap"):
         return _do_swap("start", swap_url)
     if action == "Остановить llama-swap":
-        return _do_swap("stop")
+        return _do_swap("stop", swap_url)
     if action == "Перезапустить роутер":
         build = _ask_build()
         if build == BACK:
             return "menu"
-        return _do_router(build, "restart")
+        return _do_router("restart", build)
     if action.startswith("Запустить роутер"):
         build = _ask_build()
         if build == BACK:
             return "menu"
-        _do_router(build, "start")
+        _do_router("start", build)
         if action == "Запустить роутер и загрузить пресет":
             return _preset_after_router(build, swap_url)
         return 0

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Тесты без внешних зависимостей: python3 tests/run_tests.py"""
 
+import ast
 import json
 import os
 import subprocess
@@ -891,6 +892,64 @@ def test_bool_flag_ini_value_respected() -> None:
     check(args == [], "без --no- флаг не добавляется (иначе включилось бы)", args)
     check(any("потеряно" in w for w in warns), "предупреждение о потере значения",
           warns)
+
+
+def test_wizard_dispatch_signatures() -> None:
+    """Каждый пункт меню вызывается с теми аргументами, что есть в сигнатуре.
+
+    Регрессия: `_do_swap("stop")` вызвали без `swap_url`, а `_do_router("stop")`
+    без `action` — мастер падал с TypeError прямо на вопросе человека. Проверяем
+    не вызовом (у заглушки `*args` любой вызов проходит), а `inspect.bind`.
+    """
+    import inspect
+    from lib import wizard as W
+
+    print("wizard: пункты меня вызываются по сигнатуре")
+    orig = {k: getattr(W, k) for k in
+            ("_do_router", "_do_swap", "_preset_flow", "_setup_flow", "_ask_build")}
+    W._do_router = lambda *a, **k: 0
+    W._do_swap = lambda *a, **k: 0
+    W._preset_flow = lambda *a, **k: 0
+    W._setup_flow = lambda *a, **k: 0
+    W._ask_build = lambda: "faks"
+    try:
+        labels = set()
+        for router_up in (False, True):
+            for swap_up in (False, True):
+                for _, label in W.menu_for(router_up, [], swap_up):
+                    labels.add(label)
+        errs = []
+        for label in sorted(labels):
+            try:
+                rc = W._dispatch(label, "http://127.0.0.1:8087")
+                # что бы ни вернул диспетчер, строки должны быть валидными
+                if rc == "menu":
+                    rc = W._dispatch(label, "http://127.0.0.1:8087")
+            except TypeError as exc:
+                errs.append(f"{label}: {exc}")
+        check(not errs, f"все {len(labels)} пунктов без TypeError", errs)
+
+        # прямая проверка арности внутренних вызовов
+        src = (Path(__file__).resolve().parents[1] / "lib" / "wizard.py")
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        # сигнатуры берём из модуля (FunctionDef не callable), арности
+        # достаточно: обязательных позиционных и дефолтов
+        want = ("_do_router", "_do_swap", "_preset_flow", "_setup_flow")
+        sigs = {n.name: inspect.signature(getattr(W, n.name))
+                for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name in want}
+        mism = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in sigs):
+                try:
+                    sigs[node.func.id].bind(*node.args)
+                except TypeError as exc:
+                    mism.append(f"строка {node.lineno}: {exc}")
+        check(not mism, "внутренние вызовы по сигнатуре", mism)
+    finally:
+        for k, v in orig.items():
+            setattr(W, k, v)
 
 
 def test_wizard_state_printed_once() -> None:
