@@ -395,11 +395,22 @@ def preset_to_argv(pairs: dict, flags: dict, defaults: dict | None = None,
                 args.append(canon)
             continue
         text = str(val).strip()
-        # булевы флаги (в т.ч. --no-mmproj-offload) значения не принимают:
-        # в INI они либо пустые, либо «true» — в обоих случаях сам факт
-        # присутствия ключа означает «включить»
+        # Булевы флаги значения не принимают, но в INI пользователь пишет
+        # `mmproj-offload = 0`, имея в виду «выключить». Если раньше значение
+        # просто выбрасывалось, ключ превращался в `--mmproj-offload`, то есть
+        # во включённое состояние — ровно наоборот. Поэтому `0/false/no/off`
+        # ищут парную `--no-` форму, и только если её нет — предупреждение.
         if f.kind == "flag":
-            args.append(canon)
+            if text.lower() in FALSE_WORDS:
+                neg = next((a for a in f.aliases
+                            if a.startswith("--no-")), None)
+                if neg:
+                    args.append(neg)
+                else:
+                    warns.append(f"{key}: {text!r} — у флага {canon} нет формы "
+                                 f"--no-*, значение потеряно (включено)")
+            else:
+                args.append(canon)
             continue
         if f.kind == "int" or f.kind == "float":
             try:

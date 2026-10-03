@@ -751,6 +751,44 @@ def test_swap_port_check() -> None:
         srv.close()
 
 
+def test_bool_flag_ini_value_respected() -> None:
+    """`mmproj-offload = 0` должен выключать, а не включать.
+
+    Раньше значение булева флага отбрасывалось, и ключ превращался в
+    `--mmproj-offload`, то есть ровно в противоположное намерению. INI пишут
+    именно так («выключи выгрузку mmproj в GPU»), поэтому `0/false/no/off`
+    обязаны давать парную `--no-` форму.
+    """
+    from lib import schema, server
+
+    print("булевы флаги: значение из INI уважается")
+    flags = {
+        "mmproj-offload": schema.Flag(
+            canonical="--mmproj-offload", short=None,
+            aliases=["--no-mmproj-offload"], kind="flag", default="enabled"),
+    }
+    args, warns = server.preset_to_argv({"mmproj-offload": "0"}, flags)
+    check(args == ["--no-mmproj-offload"], "0 -> --no-mmproj-offload", args)
+    check(not warns, "без предупреждения", warns)
+
+    args, _ = server.preset_to_argv({"mmproj-offload": "1"}, flags)
+    check(args == ["--mmproj-offload"], "1 -> --mmproj-offload", args)
+    args, _ = server.preset_to_argv({"mmproj-offload": "true"}, flags)
+    check(args == ["--mmproj-offload"], "true -> --mmproj-offload", args)
+    args, _ = server.preset_to_argv({"mmproj-offload": ""}, flags)
+    check(args == ["--mmproj-offload"], "пусто -> включить", args)
+
+    # у флага без пары --no- значение потерять нельзя молча
+    solo = {"ctx-shift": schema.Flag(canonical="--context-shift", short=None,
+                                     kind="flag", default="disabled")}
+    # у флага без пары --no- «0» означает «не включать»: добавлять флаг
+    # означало бы сделать обратное, поэтому его не добавляем вовсе
+    args, warns = server.preset_to_argv({"ctx-shift": "0"}, solo)
+    check(args == [], "без --no- флаг не добавляется (иначе включилось бы)", args)
+    check(any("потеряно" in w for w in warns), "предупреждение о потере значения",
+          warns)
+
+
 def test_wizard_defaults(tmp: Path) -> None:
     """Мастер: дефолты — самый эффективный вариант, мусор ввода безопасен."""
     from lib import builds as B
