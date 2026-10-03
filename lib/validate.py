@@ -173,6 +173,22 @@ KNOWN_TRAPS = [
         "level": "error", "kind": "crash",
     },
     {
+        # Порог уточнён живьём: mmproj в VRAM стоит ~0.7 GiB, и на 12 ГБ
+        # при 114688 контексте этого не хватает префиллу — CUDA OOM
+        # («CUDA error: out of memory» в update_slots). Наблюдалось на
+        # qwen3.8-35B-A3B-miniplus-128ctx-ngram-mmproj-vram с ubatch 512.
+        "id": "mmproj-vram-ubatch",
+        "applies": lambda p: str(p.get("mmproj", "")).strip() != ""
+                              and str(p.get("mmproj-offload", "")).strip()
+                              in ("1", "true", "yes", "on")
+                              and int(budget._flag_int(p, "ubatch-size", "ub") or 512) >= 512,
+        "message": "mmproj в VRAM при ubatch-size >= 512 — не хватает VRAM "
+                   "префиллу на 12 ГБ (проверено: CUDA OOM при 114688)",
+        "hint": "либо ubatch-size = 256, либо mmproj-offload = 0 "
+                "(тогда картинка кодируется на CPU в 2-3 раза дольше)",
+        "level": "warn", "kind": "crash",
+    },
+    {
         # Порог уточнён живьём: сам по себе ubatch-size=2048 на 12 ГБ работает
         # (tiel-coder-nanoplus-128ctx-mmproj-moe16 измерен: 29.3 t/s, 1616 MiB
         # свободно). Падает он в паре с ускорителем — 2048 + ngram-mod роняет
