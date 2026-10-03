@@ -1253,10 +1253,29 @@ def cmd_doctor(args) -> int:
 
 # ─────────────────────────── swap ───────────────────────────
 def cmd_swap(args) -> int:
+    if args.action == "up":
+        binp = swap.find_binary()
+        print(f"бинарь: {binp or 'НЕ НАЙДЕН (swap install)'}")
+        cfg = args.config or str(swap.default_output())
+        res = swap.up(config=cfg, listen=args.listen,
+                      auto_port=not args.no_auto_port)
+        print(res["message"])
+        if not res["ok"]:
+            return 1
+        if res.get("url") and not args.quiet:
+            print("дальше:")
+            for s in swap.next_steps(res["url"]):
+                print(f"  {s}")
+        return 0
+    if args.action == "down":
+        res = swap.down()
+        print(res["message"])
+        return 0 if res["ok"] else 1
     if args.action == "status":
         binp = swap.find_binary()
         print(f"бинарь: {binp or 'НЕ НАЙДЕН (swap install)'}")
-        st = swap.status(args.url)
+        url = args.url or swap.load_state().get("url") or swap.SWAP_LISTEN
+        st = swap.status(url)
         print(f"прокси {st['url']}: {'up' if st['up'] else 'down'}")
         try:
             host, port = swap.parse_listen(st["url"])
@@ -1326,14 +1345,13 @@ def cmd_swap(args) -> int:
         outp.write_text(text, encoding="utf-8")
         print(f"записано: {outp}")
         binp = swap.find_binary()
-        host, port = swap.parse_listen(swap.SWAP_LISTEN)
-        print(f"запуск: {binp or 'llama-swap'} "
-              f"--config {outp} --listen {swap.SWAP_LISTEN}")
-        if swap.is_port_busy(host, port):
-            print(f"! порт {port} уже занят: "
-                  f"{swap.describe_owner(swap.port_owner(port))}")
-            print(f"  запускай swap на свободном порту, например "
-                  f"--listen 127.0.0.1:8090")
+        listen, why = swap.resolve_listen(args.listen)
+        if why:
+            print(f"! {why}")
+        print(f"запуск: {binp or 'llama-swap'} --config {outp} "
+              f"--listen {listen}")
+        print("  (или одной командой: llamastery swap up "
+              f"--listen {listen})")
         return 0
     print(text)
     return 0
@@ -1503,14 +1521,21 @@ def main(argv=None) -> int:
 
     sw = sub.add_parser("swap", help="llama-swap: экспорт models.ini в swap-YAML")
     sw.add_argument("action", nargs="?", default="export",
-                    choices=["export", "status", "install"])
+                    choices=["export", "status", "install", "up", "down"])
     sw.add_argument("--ini", help="пресет (по умолчанию models.ini)")
     sw.add_argument("--build", help="какой сборкой транслировать (по умолчанию faks)")
     sw.add_argument("--only", nargs="*", help="только эти секции")
     sw.add_argument("--output", "-o", help="куда записать YAML (по умолчанию stdout)")
     sw.add_argument("--ttl", type=int, default=0, help="ttl выгрузки моделей, сек")
-    sw.add_argument("--url", default="http://127.0.0.1:8080",
-                    help="адрес swap для status")
+    sw.add_argument("--url",
+                    help="адрес swap для status (по умолчанию — из swap.json)")
+    sw.add_argument("--listen", help="host:port для запуска (up) и подсказки")
+    sw.add_argument("--config", help="конфиг swap для up "
+                                    "(по умолчанию ~/.config/llama-swap/config.yaml)")
+    sw.add_argument("--no-auto-port", action="store_true",
+                    help="не искать свободный порт, а падать на занятом")
+    sw.add_argument("--quiet", action="store_true",
+                    help="после up не печатать дальнейшие шаги")
     sw.add_argument("--version", help="версия для install (по умолчанию v261)")
     sw.add_argument("--dry-run", action="store_true")
     sw.set_defaults(func=cmd_swap)

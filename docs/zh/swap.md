@@ -10,9 +10,25 @@
 llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml --dry-run  # 先检查
 llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml             # 写入（自动 .bak-<时间> 备份）
 llamastery swap export --build faks --only qwen3.8-35B-A3B-miniplus-v2.1-128ctx     # 子集输出到 stdout
-llamastery swap status                                # 代理 :8080 + 直连服务器状态
-llamastery swap install                               # 下载 v261 二进制到 ~/.local/bin（仅 Linux x64）
+llamastery swap up                           # 以守护进程启动，端口自动挑选
+llamastery swap status                       # 代理 + 直连服务器状态
+llamastery swap down                         # 停止守护进程
+llamastery swap install                      # 下载 v261 二进制到 ~/.local/bin（仅 Linux x64）
 ```
+
+## 端口自动选择
+
+默认 `127.0.0.1:8087`（本机 8080 被 searxng 容器占用）。端口被占时自动取下一个
+空闲端口，并说明挤掉了谁：
+
+```
+swap поднят на 127.0.0.1:8088 (pid 392842)
+  порт 8087 занят (pid 392830; /usr/bin/python3.14) — выбран свободный
+```
+
+不会挤掉自己的 swap。手动指定端口用 `--listen 127.0.0.1:8090`，禁止自动挑选用
+`--no-auto-port`。状态（端口、pid、配置）写在
+`~/.local/state/llamastery/swap.json`，因此 `swap status` 不带 `--url` 也知道地址。
 
 ## 规则
 

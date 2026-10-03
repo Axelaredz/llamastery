@@ -10,9 +10,28 @@
 llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml --dry-run  # сначала проверка
 llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml             # запись (бэкап .bak-<время> сам)
 llamastery swap export --build faks --only qwen3.8-35B-A3B-miniplus-v2.1-128ctx     # подмножество в stdout
-llamastery swap status                                # прокси :8080 + прямой сервер рядом
-llamastery swap install                               # скачать бинарь v261 в ~/.local/bin (только Linux x64)
+llamastery swap up                           # поднять демоном, порт подберётся сам
+llamastery swap status                       # прокси + прямой сервер рядом
+llamastery swap down                         # остановить демон
+llamastery swap install                      # скачать бинарь v261 в ~/.local/bin (только Linux x64)
 ```
+
+## Порт подбирается сам
+
+Дефолт — `127.0.0.1:8087` (8080 на этой машине занят контейнером searxng).
+Если порт занят кем-то ещё, берётся следующий свободный, и в выводе видно
+кого именно вытеснили:
+
+```
+swap поднят на 127.0.0.1:8088 (pid 392842)
+  порт 8087 занят (pid 392830; /usr/bin/python3.14) — выбран свободный
+```
+
+Свой собственный swap не вытесняется: если порт из `swap.json` занят нашим
+процессом, он остаётся. Задать порт руками — `--listen 127.0.0.1:8090`;
+запретить автоподбор — `--no-auto-port`. Состояние (порт, pid, конфиг)
+пишется в `~/.local/state/llamastery/swap.json`, поэтому `swap status`
+без `--url` знает адрес сам.
 
 ## Правила
 

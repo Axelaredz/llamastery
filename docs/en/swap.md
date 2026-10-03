@@ -10,9 +10,27 @@ hot-swap, `ttl`. This page covers how to export and which build to run behind it
 llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml --dry-run  # check first
 llamastery swap export --build faks -o ~/.config/llama-swap/config.yaml             # write (.bak-<time> backup automatic)
 llamastery swap export --build faks --only qwen3.8-35B-A3B-miniplus-v2.1-128ctx     # subset to stdout
-llamastery swap status                                # proxy :8080 plus direct server
-llamastery swap install                               # download v261 binary to ~/.local/bin (Linux x64 only)
+llamastery swap up                           # start as daemon, port picked automatically
+llamastery swap status                       # proxy plus direct server
+llamastery swap down                         # stop the daemon
+llamastery swap install                      # download v261 binary to ~/.local/bin (Linux x64 only)
 ```
+
+## The port picks itself
+
+Default is `127.0.0.1:8087` (8080 is taken by the searxng container here).
+If the port is busy, the next free one is used and the output says who was
+displaced:
+
+```
+swap поднят на 127.0.0.1:8088 (pid 392842)
+  порт 8087 занят (pid 392830; /usr/bin/python3.14) — выбран свободный
+```
+
+Our own swap is never displaced. Force a port with `--listen 127.0.0.1:8090`;
+forbid auto-picking with `--no-auto-port`. State (port, pid, config) lives in
+`~/.local/state/llamastery/swap.json`, so `swap status` without `--url` knows
+the address.
 
 ## Rules
 

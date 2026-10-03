@@ -23,8 +23,12 @@ from pathlib import Path
 
 from . import builds, paths, server
 
-SWAP_PORT = 8080
-SWAP_LISTEN = "0.0.0.0:8080"
+# Порт по умолчанию. 8080 на этой машине занят контейнером searxng, поэтому
+# дефолт — 8087, и он же первый кандидат при поиске свободного.
+SWAP_PORT = 8087
+SWAP_HOST = "127.0.0.1"
+SWAP_LISTEN = f"{SWAP_HOST}:{SWAP_PORT}"
+PORT_SCAN_SPAN = 200      # сколько портов перебрать, прежде чем сдаться
 
 # ключи models.ini, которые НЕ являются флагами llama-server,
 # а управляют роутером/комментариями — в cmd их не несём
@@ -218,6 +222,80 @@ def pid_file() -> Path:
     return _state() / "swap.pid"
 
 
+def state_file() -> Path:
+    """Что запустили и на каком порту. Без этого «а где оно?» — частый вопрос."""
+    return _state() / "swap.json"
+
+
+def save_state(listen: str, config: str, pid: int) -> None:
+    host, port = parse_listen(listen)
+    state_file().write_text(json.dumps(
+        {"listen": listen, "host": host, "port": port,
+         "url": f"http://{host}:{port}", "config": str(config),
+         "pid": pid, "started_at": int(time.time())},
+        ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(state_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def clear_state() -> None:
+    try:
+        state_file().unlink()
+    except OSError:
+        pass
+
+
+def find_free_port(host: str = SWAP_HOST, preferred: int = SWAP_PORT,
+                   span: int = PORT_SCAN_SPAN) -> int:
+    """Первый свободный порт начиная с preferred.
+
+    Ручной подбор порта — это то, что человек всегда забывает сделать,
+    поэтому подбор автоматический: занят 8087 — берём 8088 и говорим об этом.
+    """
+    probe = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+    for port in range(preferred, preferred + span):
+        if not is_port_busy(probe, port):
+            return port
+    return preferred
+
+
+def resolve_listen(listen: str | None = None, auto: bool = True) -> tuple[str, str]:
+    """Возвращает (listen, причина).
+
+    Порядок: явный --listen → порт уже запущенного swap → свободный порт
+    от дефолта. `auto=False` означает «не смещать молча».
+    """
+    if listen:
+        host, port = parse_listen(listen)
+        if auto and is_port_busy(host, port):
+            if daemon_pid():
+                return listen, f"уже запущен на {listen}"
+            return (f"{host}:{find_free_port(host, port)}",
+                    f"порт {port} занят ({describe_owner(port_owner(port))}) — "
+                    f"выбран свободный")
+        return listen, ""
+    st = load_state()
+    if st.get("listen"):
+        host, port = parse_listen(st["listen"])
+        if not is_port_busy(host, port):
+            return st["listen"], "порт из прошлого запуска"
+        if not auto:
+            return st["listen"], f"порт {port} занят, а он записан у нас"
+    host = st.get("host") or SWAP_HOST
+    preferred = int(st.get("port") or SWAP_PORT)
+    free = find_free_port(host, preferred)
+    if free == preferred:
+        return f"{host}:{preferred}", ""
+    return (f"{host}:{free}",
+            f"порт {preferred} занят ({describe_owner(port_owner(preferred))}) — "
+            f"выбран свободный")
+
+
 def log_file() -> Path:
     return _state() / "swap.log"
 
@@ -236,8 +314,8 @@ def daemon_pid() -> int | None:
     return pid
 
 
-def up(config: str | None = None, listen: str = SWAP_LISTEN,
-       timeout: int = 20) -> dict:
+def up(config: str | None = None, listen: str | None = None,
+       timeout: int = 20, auto_port: bool = True) -> dict:
     """Поднимает llama-swap демоном: свой pid-файл, лог, проверка /health.
 
     Отдельный демон, а не `&` в терминале: иначе никто не знает, кто его
@@ -253,14 +331,20 @@ def up(config: str | None = None, listen: str = SWAP_LISTEN,
         return {"ok": False, "message": f"нет конфига: {cfg}\n"
                                         f"  собери его: llamastery swap export "
                                         f"-o {cfg}"}
+    pid = daemon_pid()
+    if pid:
+        st = load_state()
+        at = st.get("listen") or listen or SWAP_LISTEN
+        return {"ok": True, "pid": pid, "url": f"http://{at}",
+                "message": f"уже работает (pid {pid}) на {at}"}
+    listen, why = resolve_listen(listen, auto=auto_port)
     host, port = parse_listen(listen)
     if is_port_busy(host, port):
-        pid = daemon_pid()
-        if pid:
-            return {"ok": True, "pid": pid,
-                    "message": f"уже работает (pid {pid}) на {listen}"}
         return {"ok": False,
-                "message": f"порт {port} занят: {describe_owner(port_owner(port))}"}
+                "message": f"порт {port} занят: {describe_owner(port_owner(port))}"
+                           + (f"\n  освободи его или укажи другой: "
+                              f"--listen {host}:{port + 1}"
+                              if not auto_port else "")}
     log = open(log_file(), "a")
     log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} llama-swap "
               f"--config {cfg} --listen {listen}\n")
@@ -279,11 +363,25 @@ def up(config: str | None = None, listen: str = SWAP_LISTEN,
                     "message": f"процесс умер (код {proc.returncode}). "
                                f"лог: {log_file()}"}
         if status(f"http://{host}:{port}", timeout=2.0)["up"]:
+            save_state(listen, str(cfg), proc.pid)
             return {"ok": True, "pid": proc.pid, "url": f"http://{listen}",
-                    "message": f"swap поднят на {listen} (pid {proc.pid})"}
+                    "message": (f"swap поднят на {listen} (pid {proc.pid})"
+                                + (f"\n  {why}" if why else ""))}
         time.sleep(0.5)
     return {"ok": False, "pid": proc.pid,
             "message": f"не ответил за {timeout} с. лог: {log_file()}"}
+
+
+def next_steps(url: str) -> list[str]:
+    """Что делать сразу после старта — иначе «поднял и забыл»."""
+    return [
+        f"проверить:      curl {url}/health",
+        f"список моделей: curl {url}/v1/models",
+        f"веб-интерфейс:  {url}/ui",
+        f"OpenAI base_url: {url}/v1  (model = имя секции models.ini)",
+        "остановить:     llamastery swap down",
+        "статус:         llamastery swap status",
+    ]
 
 
 def down(timeout: int = 20) -> dict:
@@ -304,10 +402,11 @@ def down(timeout: int = 20) -> dict:
         except OSError:
             pass
         time.sleep(0.5)
-    try:
-        pid_file().unlink()
-    except OSError:
-        pass
+    for f in (pid_file(), state_file()):
+        try:
+            f.unlink()
+        except OSError:
+            pass
     return {"ok": True, "message": f"swap остановлен (pid {pid})"}
 
 

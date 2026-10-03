@@ -718,6 +718,43 @@ def test_stop_covers_all_build_ports() -> None:
           in body, "stop перебирает порты всех сборок")
 
 
+def test_swap_auto_port() -> None:
+    """Занятый порт не должен валить запуск — берём следующий свободный.
+
+    Ручной подбор порта — то, что человек забывает сделать; раньше мастер
+    печатал «порт занят» и swap не поднимался. Занятость подменяется
+    заглушкой: реальный сокет в backlog даёт плавающий результат.
+    """
+    print("swap: автоподбор порта")
+    busy, free1, free2 = 45001, 45002, 45003
+    orig_busy, orig_pid = swap.is_port_busy, swap.daemon_pid
+    swap.is_port_busy = lambda host, port, timeout=1.0: port == busy
+    swap.daemon_pid = lambda: None
+    try:
+        check(swap.find_free_port("127.0.0.1", busy) == free1,
+              "следующий порт свободен", swap.find_free_port("127.0.0.1", busy))
+        listen, why = swap.resolve_listen(f"127.0.0.1:{busy}")
+        check(swap.parse_listen(listen)[1] == free1, "resolve сдвинул порт", listen)
+        check("занят" in why and "выбран свободный" in why, "причина названа", why)
+        # автоподбор выключен — порт не трогаем
+        listen2, why2 = swap.resolve_listen(f"127.0.0.1:{busy}", auto=False)
+        check(listen2 == f"127.0.0.1:{busy}", "auto=False не сдвигает", listen2)
+        # наш же swap на занятом порте — не вытесняем: порт его
+        swap.daemon_pid = lambda: 4242
+        listen3, why3 = swap.resolve_listen(f"127.0.0.1:{busy}")
+        check(listen3 == f"127.0.0.1:{busy}" and "уже запущен" in why3,
+              "свой swap не вытесняем", (listen3, why3))
+    finally:
+        swap.is_port_busy, swap.daemon_pid = orig_busy, orig_pid
+    # свободный порт остаётся как есть
+    swap.is_port_busy = lambda host, port, timeout=1.0: False
+    try:
+        check(swap.find_free_port("127.0.0.1", free2) == free2,
+              "свободный не двигается")
+    finally:
+        swap.is_port_busy = orig_busy
+
+
 def test_swap_port_check() -> None:
     """Проверка занятости порта: парсинг, свободен/занят, владелец без падений."""
     import socket as _sock

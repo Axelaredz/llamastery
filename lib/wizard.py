@@ -383,12 +383,20 @@ def _do_swap(action: str, swap_url: str, build: str) -> int:
     if action == "start":
         _run_cli("swap", "export", "--build", build, "-o",
                  str(swap.default_output()))
-        listen = swap_url.split("//", 1)[-1].rstrip("/")
-        res = swap.up(listen=listen)
+        # порт не передаём: swap сам берёт свободный, если дефолтный занят
+        res = swap.up(auto_port=True)
         note(res["message"])
         if res["ok"]:
-            note(f"проверка: curl {swap_url}/health")
-            note(f"модели: curl {swap_url}/v1/models")
+            url = res.get("url") or swap_url
+            note("")
+            note("дальше:")
+            for s in swap.next_steps(url):
+                note(s)
+            head("быстрая проверка", "первый запрос грузит модель — это минуты")
+            note(f"curl -s -m 900 -X POST {url}/v1/chat/completions \\")
+            note("  -H 'Content-Type: application/json' \\")
+            note("  -d '{\"model\":\"qwen3.8-35B-A3B-miniplus-128ctx-ngram-mmproj\",")
+            note("       \"messages\":[{\"role\":\"user\",\"content\":\"2+2?\"}],\"max_tokens\":32}'")
         return 0 if res["ok"] else 1
     return 1
 
@@ -404,7 +412,7 @@ def run() -> int:
     print("Замер важнее расчёта. Ничего не гружу и не правлю без твоего «да».")
 
     reset_questions()
-    swap_url = "http://127.0.0.1:8087"
+    swap_url = swap.load_state().get("url") or f"http://{swap.SWAP_LISTEN}"
     s = _state_lines(swap_url)
     print_state(s, swap_url)
 
