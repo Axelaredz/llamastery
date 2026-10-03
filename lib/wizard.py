@@ -62,6 +62,52 @@ def warn(text: str) -> None:
     print(f"  ! {text}")
 
 
+BACK = "◄ назад"
+MAX_STEPS = 500          # предохранитель от бесконечного «назад»
+
+
+class Nav:
+    """Экран за экраном: 0 = вернуться на шаг назад и переспросить.
+
+    Ответы хранятся по ключу, поэтому при возврате значения после него
+    помечаются как несвежие: зависеть от них дальше нельзя, их либо
+    переспрашивают, либо пересчитывают.
+    """
+
+    def __init__(self) -> None:
+        self.i = 0
+        self.answers: dict = {}
+        self.stale: set = set()
+
+    def walk(self, steps: list[tuple]) -> dict | None:
+        """steps: [(ключ, функция(answers))].
+
+        Функция возвращает значение или BACK. Возврат BACK уводит на
+        предыдущий экран; если он первый — возвращается None, и вызывающий
+        код показывает главное меню заново.
+        """
+        self.i = 0
+        self.stale = set()
+        # предохранитель: экран, который всегда отвечает «назад», иначе
+        # увел бы мастера в бесконечный цикл (и тесты — тоже)
+        for _ in range(MAX_STEPS):
+            if not 0 <= self.i < len(steps):
+                return self.answers if self.i >= len(steps) else None
+            key, fn = steps[self.i]
+            val = fn(self.answers)
+            if val is BACK or val == BACK:
+                if self.i == 0:
+                    return None
+                self.i -= 1
+                self.stale.add(steps[self.i][0])
+                continue
+            self.stale.discard(key)
+            self.answers[key] = val
+            self.i += 1
+        warn("слишком много переходов назад — возвращаюсь в меню")
+        return None
+
+
 def _read(prompt: str) -> str:
     try:
         return input(f"  {ARROW} {prompt} ").strip()
@@ -81,7 +127,10 @@ def ask(title: str, options: list[tuple[str, str]], default: int,
         mark = f" {STAR}" if i == default else "  "
         tail = f"  {desc}" if desc else ""
         print(f"    {i}.{mark} {label}{tail}")
-    raw = _read(f"ответ (Enter = {default}) ▸")
+    raw = _read(f"ответ (Enter = {default}, 0 = {BACK}) ▸")
+    if raw == "0":
+        print(f"    {ARROW} ответ: {BACK}")
+        return BACK
     return clamp_choice(raw, len(options), default) - 1
 
 
@@ -89,6 +138,8 @@ def ask_pick(title: str, options: list[tuple[str, str]], default: int,
              sub: str = "") -> str:
     """Вопрос со списком → возвращает выбранную метку."""
     idx = ask(title, options, default, sub)
+    if idx == BACK:
+        return BACK
     label = options[idx][0]
     print(f"    {ARROW} ответ: {label}")
     return label
@@ -97,7 +148,11 @@ def ask_pick(title: str, options: list[tuple[str, str]], default: int,
 def ask_yn(title: str, default_yes: bool, sub: str = "") -> bool:
     head(title, sub)
     hint = "Y/n" if default_yes else "y/N"
-    raw = _read(f"{hint} {STAR} ответ (Enter = {'да' if default_yes else 'нет'}) ▸").lower()
+    raw = _read(f"{hint} {STAR} ответ (Enter = "
+                f"{'да' if default_yes else 'нет'}, 0 = {BACK}) ▸").lower()
+    if raw == "0":
+        print(f"    {ARROW} ответ: {BACK}")
+        return BACK
     yes = default_yes if not raw else raw in ("y", "yes", "д", "да")
     print(f"    {ARROW} ответ: {'да' if yes else 'нет'}")
     return yes
@@ -105,7 +160,10 @@ def ask_yn(title: str, default_yes: bool, sub: str = "") -> bool:
 
 def ask_text(title: str, default: str, sub: str = "") -> str:
     head(title, sub)
-    raw = _read(f"Enter = {default} ▸")
+    raw = _read(f"Enter = {default}, 0 = {BACK} ▸")
+    if raw == "0":
+        print(f"    {ARROW} ответ: {BACK}")
+        return BACK
     val = raw or default
     print(f"    {ARROW} ответ: {val}")
     return val
@@ -340,7 +398,7 @@ def _report_files(ini) -> None:
     note(f"  {ISVALORUM}")
 
 
-def _do_router(build: str, action: str) -> int:
+def _do_router(build: str | None, action: str) -> int:
     if action == "start":
         return _run_cli("runtime", "start", "--build", build)
     if action == "restart":
@@ -375,12 +433,15 @@ def _do_preset(ini, build: str, swap_url: str) -> int:
     return _run_cli("budget", name, "--explain")
 
 
-def _do_swap(action: str, swap_url: str, build: str) -> int:
+def _do_swap(action: str, swap_url: str) -> int:
     if action == "stop":
         res = swap.down()
         note(res["message"])
         return 0 if res["ok"] else 1
     if action == "start":
+        build = _ask_build()
+        if build == BACK:
+            return "menu"
         _run_cli("swap", "export", "--build", build, "-o",
                  str(swap.default_output()))
         # порт не передаём: swap сам берёт свободный, если дефолтный занят
@@ -411,11 +472,30 @@ def run() -> int:
     print("Проверка пресетов, честный прогноз VRAM, замер факта.")
     print("Замер важнее расчёта. Ничего не гружу и не правлю без твоего «да».")
 
-    reset_questions()
     swap_url = swap.load_state().get("url") or f"http://{swap.SWAP_LISTEN}"
     s = _state_lines(swap_url)
     print_state(s, swap_url)
 
+    while True:
+        reset_questions()      # новый проход по меню — нумерация с нуля
+        rc, action = _main_menu(swap_url)
+        if rc != 0 or action is None:
+            return rc
+        if action == "Только показать состояние":
+            print()
+            note("ничего не менял")
+            return 0
+
+        rc = _dispatch(action, swap_url)
+        if rc == "menu":             # 0 дошёл до начала — снова меню
+            continue
+        return rc
+
+
+def _main_menu(swap_url: str) -> tuple[int, str | None]:
+    """Главное меню. Возвращает (код, действие); действие None — 0, выход."""
+    s = _state_lines(swap_url)
+    print_state(s, swap_url)
     router_up = bool(s["router"]["up"])
     loaded = [m["id"] for m in s["router"].get("models", [])
               if m["status"] in ("loaded", "sleeping")]
@@ -424,44 +504,68 @@ def run() -> int:
     labels = [o[0] for o in options]
     idx = ask(f"Вопрос {qnum()} · что делаем?", options,
               menu_default(options, router_up),
-              sub="меню построено по состоянию выше; Enter — "
-                  "рекомендованный пункт")
+              sub="меню построено по состоянию выше; Enter — рекомендованный пункт, "
+                  "0 — выход")
+    if idx == BACK:
+        print()
+        note("вышел из мастера")
+        return 0, None
     action = labels[idx]
     print(f"    {ARROW} ответ: {action}")
+    return 0, action
 
-    # ── дальше только то, что относится к выбору ──
-    if action == "Только показать состояние":
-        print()
-        note("ничего не менял")
-        return 0
 
+def _ask_build() -> str:
+    """Вопрос о сборке. BACK, если человек ушёл назад."""
     reg = _pick_build_registry()
     if not reg:
-        return 1
-    build = _pick_build(reg)
+        raise SystemExit(1)
+    return _pick_build(reg)
 
-    if action == "Начать с нуля" or action == "Настроить заново":
-        return _setup_flow(build, swap_url)
 
+def _dispatch(action: str, swap_url: str):
+    """Что делать после выбора в меню. 'menu' = вернуться к меню.
+
+    Вопрос о сборке задаётся только там, где он реально нужен, и внутри
+    потока — ровно один раз. Раньше он спрашивался и в меню, и первым шагом
+    потока, то есть человек отвечал на него дважды подряд.
+    """
+    if action == "Настроить заново":
+        return _setup_flow(swap_url)
+    if action == "Остановить роутер":
+        return _do_router("stop")
+    if action == "Загрузить или сменить пресет":
+        return _preset_flow(swap_url)
+    if action.startswith("Запустить llama-swap"):
+        return _do_swap("start", swap_url)
+    if action == "Остановить llama-swap":
+        return _do_swap("stop")
+    if action == "Перезапустить роутер":
+        build = _ask_build()
+        if build == BACK:
+            return "menu"
+        return _do_router(build, "restart")
     if action.startswith("Запустить роутер"):
+        build = _ask_build()
+        if build == BACK:
+            return "menu"
         _do_router(build, "start")
         if action == "Запустить роутер и загрузить пресет":
-            return _preset_flow(build, swap_url)
+            return _preset_after_router(build, swap_url)
         return 0
-    if action == "Перезапустить роутер":
-        return _do_router(build, "restart")
-    if action == "Остановить роутер":
-        return _do_router(build, "stop")
-    if action in ("Загрузить или сменить пресет",):
-        return _preset_flow(build, swap_url)
-    if action.startswith("Запустить llama-swap"):
-        return _do_swap("start", swap_url, build)
-    if action.startswith("Остановить llama-swap"):
-        return _do_swap("stop", swap_url, build)
     return 0
 
 
-def _preset_flow(build: str, swap_url: str) -> int:
+def _preset_after_router(build: str, swap_url: str):
+    """Роутер уже поднят выбранной сборкой — вопрос о ней не повторяем."""
+    return _preset_flow(swap_url, preset_build=build)
+
+
+def _preset_flow(swap_url: str, preset_build: str | None = None):
+    """Пресет: выбрать сборку → показать файлы → выбрать пресет → глубину.
+
+    0 = на шаг назад; на первом экране 0 возвращает в главное меню.
+    """
     from .inifile import IniFile
     try:
         ini = IniFile.load(str(paths.default_ini()))
@@ -469,11 +573,56 @@ def _preset_flow(build: str, swap_url: str) -> int:
         warn(f"не читается {paths.default_ini()}: {exc}")
         return 1
     _report_files(ini)
-    return _do_preset(ini, build, swap_url)
+    nav = Nav()
+
+    def pick_build(a: dict):
+        if preset_build:
+            note(f"сборка: {preset_build}")
+            return preset_build
+        return _ask_build()
+
+    def pick_preset(a: dict):
+        opts, sections, default_name = _preset_options(ini)
+        if not opts:
+            warn(f"в {ini.path} нет ни одного пресета")
+            return None
+        return ask_pick(f"Вопрос {qnum()} · какой пресет грузим", opts,
+                        sections.index(default_name) + 1 if default_name else 1,
+                        sub="★ = есть живой замер VRAM или скорости — "
+                            "ему верь, а не оценке")
+
+    def pick_depth(a: dict):
+        return ask_pick(f"Вопрос {qnum()} · глубина проверки",
+                        [("Загрузить сейчас", "займёт VRAM и время"),
+                         ("Только проверить бюджет VRAM", "ничего не грузить"),
+                         ("Загрузить и снять факт VRAM", "load + measure")], 2)
+
+    res = nav.walk([
+        ("build", pick_build),
+        ("preset", pick_preset),
+        ("depth", pick_depth),
+    ])
+    if res is None:
+        return "menu"
+    if res.get("build") == BACK:
+        return "menu"
+    name = res.get("preset")
+    if not name:
+        return 1
+    _run_cli("validate", name, "--build", res["build"])
+    depth = res.get("depth") or "Только проверить бюджет VRAM"
+    if depth == "Загрузить сейчас":
+        return _run_cli("load", name, "--build", res["build"])
+    if depth == "Загрузить и снять факт VRAM":
+        rc = _run_cli("load", name, "--build", res["build"])
+        _run_cli("measure", "--swap-url", swap_url, name)
+        return rc
+    return _run_cli("budget", name, "--explain")
 
 
-def _setup_flow(build: str, swap_url: str) -> int:
-    """Полный маршрут: swap → модели → пресет → контекст → зрение → ускорители → план."""
+def _setup_flow(swap_url: str):
+    """Полный маршрут: сборка → swap → пресет → тюн → контекст → зрение →
+    ускорители → план. На каждом экране 0 = на шаг назад."""
     from .inifile import IniFile
     try:
         ini = IniFile.load(str(paths.default_ini()))
@@ -481,71 +630,134 @@ def _setup_flow(build: str, swap_url: str) -> int:
         warn(f"не читается {paths.default_ini()}: {exc}")
         return 1
 
-    # swap
-    if swap.find_binary():
-        note("llama-swap уже установлен")
-    elif ask_yn(f"Вопрос {qnum()} · установить llama-swap?", True,
-                sub="прокси для хот-свапа: один порт, модели меняются полем model"):
-        _run_cli("swap", "install")
+    nav = Nav()
 
-    _report_files(ini)
-    opts, sections, default_name = _preset_options(ini)
-    preset = ask_pick(f"Вопрос {qnum()} · какой пресет берём за основу", opts,
-                      sections.index(default_name) + 1 if default_name else 1)
-    pairs = ini.section(preset).pairs()
+    def s_build(a: dict):
+        return _ask_build()
 
-    if ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?", False,
-              sub="долго (10–30 мин) и грузит GPU на 100% — запускай в свободное время"):
-        tune = (f"tune {paths.default_ini()} {preset} --build {build} "
-                f"--extra c={pairs.get('c', 32768)} "
-                f"n-cpu-moe={pairs.get('n-cpu-moe', 0)} "
-                f"ubatch=1024 reserve=1024 min-tps=25")
-        print()
-        print(f"  {ARROW} команда: llamastery {tune}")
+    def s_swap(a: dict):
+        if swap.find_binary():
+            note("llama-swap уже установлен")
+            return "установлен"
+        if ask_yn(f"Вопрос {qnum()} · установить llama-swap?", True,
+                  sub="прокси для хот-свапа: один порт, модели меняются полем model"):
+            _run_cli("swap", "install")
+            return "установлен"
+        return "пропущен"
 
-    ctx = ask_text(f"Вопрос {qnum()} · контекст", str(pairs.get("c", "?")),
-                   sub="больше контекст = больше KV = больше VRAM")
+    def s_files(a: dict):
+        _report_files(ini)
+        return "проверено"
 
-    low = {k.lower(): v for k, v in pairs.items()}
-    sibling = find_mmproj_sibling(sections, preset)
-    if "mmproj" in low:
-        note("зрение: в пресете уже есть mmproj")
-    elif sibling:
-        if ask_yn(f"Вопрос {qnum()} · взять близнец с mmproj ({sibling})?", False,
-                  sub="в нём включено зрение; текстовый быстрее"):
-            preset = sibling
-            pairs = ini.section(preset).pairs()
-    else:
+    def s_preset(a: dict):
+        opts, sections, default_name = _preset_options(ini)
+        if not opts:
+            return None
+        return ask_pick(f"Вопрос {qnum()} · какой пресет берём за основу", opts,
+                        sections.index(default_name) + 1 if default_name else 1)
+
+    def s_tune(a: dict):
+        preset = a.get("preset")
+        if not preset:
+            return None
+        pairs = ini.section(preset).pairs()
+        if ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?", False,
+                  sub="долго (10–30 мин) и грузит GPU на 100% — "
+                      "запускай в свободное время"):
+            tune = (f"tune {paths.default_ini()} {preset} "
+                    f"--build {a.get('build')} "
+                    f"--extra c={pairs.get('c', 32768)} "
+                    f"n-cpu-moe={pairs.get('n-cpu-moe', 0)} "
+                    f"ubatch=1024 reserve=1024 min-tps=25")
+            print()
+            print(f"  {ARROW} команда: llamastery {tune}")
+            return "показан"
+        return "не просил"
+
+    def s_ctx(a: dict):
+        preset = a.get("preset")
+        cur = ini.section(preset).pairs().get("c", "?") if preset else "?"
+        return ask_text(f"Вопрос {qnum()} · контекст", str(cur),
+                        sub="больше контекст = больше KV = больше VRAM")
+
+    def s_vision(a: dict):
+        preset = a.get("preset")
+        if not preset:
+            return None
+        low = {k.lower() for k in ini.section(preset).pairs()}
+        sections = [n for n in ini.names() if n != "*"]
+        sibling = find_mmproj_sibling(sections, preset)
+        if "mmproj" in low:
+            note("зрение: в пресете уже есть mmproj")
+            return "включено"
+        if sibling:
+            if ask_yn(f"Вопрос {qnum()} · взять близнец с mmproj ({sibling})?",
+                      False, sub="в нём включено зрение; текстовый быстрее"):
+                return sibling
+            return "текстовый"
         ask_yn(f"Вопрос {qnum()} · нужен анализ картинок?", False,
                sub="понадобится mmproj-файл модели")
+        return "текстовый"
 
-    use_ngram = ask_yn(f"Вопрос {qnum()} · тестить с ngram (спекулятивный декодер)?",
-                       ngram_default(pairs),
-                       sub="×3–4 на повторяющемся тексте, но медленнее на уникальном")
-    if use_ngram and "mmproj" in {k.lower() for k in pairs}:
-        warn("ngram-mod несовместим с mmproj — при тесте будет отключён")
-    use_mtp = ask_yn(f"Вопрос {qnum()} · тестить с MTP (черновая голова)?",
-                     mtp_default(preset, pairs))
+    def s_ngram(a: dict):
+        preset = a.get("preset") or ""
+        pairs = ini.section(preset).pairs() if preset else {}
+        return ask_yn(f"Вопрос {qnum()} · тестить с ngram (спекулятивный декодер)?",
+                      ngram_default(pairs),
+                      sub="×3–4 на повторяющемся тексте, но медленнее на уникальном")
+
+    def s_mtp(a: dict):
+        preset = a.get("preset") or ""
+        pairs = ini.section(preset).pairs() if preset else {}
+        return ask_yn(f"Вопрос {qnum()} · тестить с MTP (черновая голова)?",
+                      mtp_default(preset, pairs))
+
+    res = nav.walk([
+        ("build", s_build),
+        ("swap", s_swap),
+        ("files", s_files),
+        ("preset", s_preset),
+        ("tune", s_tune),
+        ("ctx", s_ctx),
+        ("vision", s_vision),
+        ("ngram", s_ngram),
+        ("mtp", s_mtp),
+    ])
+    if res is None or res.get("build") == BACK:
+        return "menu"
+
+    preset = res.get("preset")
+    if not preset:
+        warn("без пресета план строить не на чем")
+        return 1
+    # близнец с mmproj мог поменять пресет
+    if res.get("vision") and res["vision"] not in ("включено", "текстовый"):
+        preset = res["vision"]
+    ctx = res.get("ctx")
+    pairs = ini.section(preset).pairs()
 
     head("план", "выполняется по порядку, каждый шаг можно пропустить")
-    steps = [f"validate {preset} --build {build}",
+    steps = [f"validate {preset} --build {res['build']}",
              f"budget {preset} --explain",
-             f"load {preset} --build {build}",
+             f"load {preset} --build {res['build']}",
              f"measure --swap-url {swap_url} {preset}",
              f"probe --tokens 110000 --from-file <реальный-код> --record "
              f"--preset {preset}",
-             f"swap export --build {build} -o {swap.default_output()}"]
+             f"swap export --build {res['build']} -o {swap.default_output()}"]
     for i, st in enumerate(steps, 1):
         print(f"    {i}. llamastery {st}")
-    if use_ngram or use_mtp:
-        note(f"ускорители в тесте: ngram={'да' if use_ngram else 'нет'}, "
-             f"mtp={'да' if use_mtp else 'нет'} (флаги — в пресет перед load)")
-    if ctx != str(pairs.get("c", "")):
+    if res.get("ngram") or res.get("mtp"):
+        note(f"ускорители в тесте: ngram="
+             f"{'да' if res.get('ngram') else 'нет'}, "
+             f"mtp={'да' if res.get('mtp') else 'нет'} "
+             f"(флаги — в пресет перед load)")
+    if ctx and ctx != str(pairs.get("c", "")):
         warn(f"контекст {pairs.get('c')} → {ctx}: сначала правка models.ini")
     print()
     if ask_yn("выполнить первые два шага (validate + budget, безопасно)?", True):
-        _run_cli("validate", preset, "--build", build)
+        _run_cli("validate", preset, "--build", res["build"])
         _run_cli("budget", preset, "--explain")
     print()
-    note(f"готово. загрузка вручную: llamastery load {preset} --build {build}")
+    note(f"готово. загрузка вручную: "
+         f"llamastery load {preset} --build {res['build']}")
     return 0

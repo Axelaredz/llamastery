@@ -919,6 +919,39 @@ def test_wizard_defaults(tmp: Path) -> None:
           "чужая конфигурация — замера нет")
     check(wizard.find_mmproj_sibling(["a"], "a") is None, "без близнеца — None")
 
+    # 0 = назад: экран за экраном. Каждый экран возвращает «назад» не чаще
+    # раза за проход — иначе это уже не человек, а кризис (см. MAX_STEPS).
+    def stepper(name: str, backs: int = 0):
+        left = {"n": backs}
+
+        def step(a):
+            if left["n"] > 0:
+                left["n"] -= 1
+                return wizard.BACK
+            return name
+        return step
+
+    nav = wizard.Nav()
+    res = nav.walk([("a", stepper("a")), ("b", stepper("b", 1)),
+                    ("c", stepper("c"))])
+    check(res is not None and res.get("c") == "c", "прошли до конца", res)
+    check(res.get("b") == "b", "после отката ответ экрана перезаписан", res)
+    check(not nav.stale, "после прохода несвежих ответов нет", nav.stale)
+
+    nav2 = wizard.Nav()
+    res2 = nav2.walk([("a", stepper("a", 1))])
+    check(res2 is None, "0 на первом экране = назад в меню", res2)
+
+    nav3 = wizard.Nav()
+    nav3.walk([("a", stepper("a")), ("b", stepper("b", 1)), ("c", stepper("c"))])
+    check(nav3.i == 3, "индекс финального экрана", nav3.i)
+
+    # экран, который всегда отвечает «назад», не должен вешать мастера
+    nav4 = wizard.Nav()
+    check(nav4.walk([("a", stepper("a")), ("b", stepper("b", 10 ** 6))]) is None,
+          "предохранитель от бесконечного «назад»")
+    check(nav4.answers.get("a") == "a", "ответы до отката сохранены", nav4.answers)
+
     # меню строится по состоянию: нельзя предложить «остановить» то, что не живо
     down = wizard.menu_for(False, [], False)
     up = wizard.menu_for(True, ["qwen"], True)
