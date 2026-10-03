@@ -893,6 +893,25 @@ def test_bool_flag_ini_value_respected() -> None:
           warns)
 
 
+def test_wizard_state_printed_once() -> None:
+    """Состояние рисует только меню.
+
+    Регрессия: `run()` печатал состояние сам, а `_main_menu` рисовал его
+    ещё раз — на старте экран удваивался.
+    """
+    src = Path(__file__).resolve().parents[1] / "lib" / "wizard.py"
+    body = src.read_text(encoding="utf-8")
+
+    print("wizard: состояние печатается один раз")
+    callers = [ln.strip() for ln in body.splitlines()
+               if "print_state(" in ln and not ln.strip().startswith("def ")]
+    check(len(callers) == 1, "print_state вызывается в одном месте", callers)
+    check("_state_lines(swap_url)" in body, "состояние читается")
+    # и вызов этот — внутри _main_menu, а не в run()
+    fn_body = body.split("def _main_menu(", 1)[1]
+    check("print_state(" in fn_body, "печатает именно меню")
+
+
 def test_wizard_defaults(tmp: Path) -> None:
     """Мастер: дефолты — самый эффективный вариант, мусор ввода безопасен."""
     from lib import builds as B

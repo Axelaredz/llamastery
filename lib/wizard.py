@@ -473,9 +473,8 @@ def run() -> int:
     print("Замер важнее расчёта. Ничего не гружу и не правлю без твоего «да».")
 
     swap_url = swap.load_state().get("url") or f"http://{swap.SWAP_LISTEN}"
-    s = _state_lines(swap_url)
-    print_state(s, swap_url)
-
+    # состояние печатает _main_menu: раньше run() рисовал его сам, а меню
+    # рисовало ещё раз — на старте экран удваивался
     while True:
         reset_questions()      # новый проход по меню — нумерация с нуля
         rc, action = _main_menu(swap_url)
