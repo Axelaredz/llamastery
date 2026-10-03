@@ -1076,7 +1076,9 @@ def cmd_measure(args) -> int:
     оценкой в budget и в validate.
     """
     from lib import vram
-    cap = vram.capture_preset(allow_single=True)
+    swap_url = (args.swap_url if args.swap_url
+                else os.environ.get("LLAMA_SWAP_URL"))
+    cap = vram.capture_preset(allow_single=True, swap_url=swap_url)
     if not cap.get("ok"):
         print(cap.get("error"), file=sys.stderr)
         return 1
@@ -1085,8 +1087,12 @@ def cmd_measure(args) -> int:
              if cap.get("total_mib") else ""))
     if not cap["loaded"]:
         print("в VRAM ничего не загружено — снимать нечего")
+        if not swap_url:
+            print("  (модель под llama-swap? укажи --swap-url, "
+                  "напр. --swap-url http://127.0.0.1:8087)")
         return 1
-    print("загружено: " + ", ".join(cap["loaded"]))
+    where = {"swap": " (по данным llama-swap)"}.get(cap.get("source", ""), "")
+    print(f"загружено{where}: " + ", ".join(cap["loaded"]))
 
     ini = _load_ini(args.ini)
     targets = args.names or cap["loaded"]
@@ -1470,6 +1476,10 @@ def main(argv=None) -> int:
     ms.add_argument("names", nargs="*",
                     help="секции пресетов; по умолчанию — загруженные")
     ms.add_argument("--ini")
+    ms.add_argument("--swap-url",
+                    help="адрес llama-swap, если модель живёт под ним "
+                         "(напр. http://127.0.0.1:8087); можно через "
+                         "переменную LLAMA_SWAP_URL")
     ms.add_argument("--recalibrate", action="store_true",
                     help="пересчитать compute buffer по этому замеру")
     ms.set_defaults(func=cmd_measure)

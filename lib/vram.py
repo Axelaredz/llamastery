@@ -43,7 +43,8 @@ def gpu_total_mib(index: int = 0) -> int | None:
     return _query_nvidia_smi("memory.total", index)
 
 
-def capture_preset(index: int = 0, allow_single: bool = False) -> dict:
+def capture_preset(index: int = 0, allow_single: bool = False,
+                   swap_url: str | None = None) -> dict:
     """Снимает показания и привязывает их к единственной загруженной модели."""
     from . import server
     # адрес сервера зависит от сборки (у неё может быть свой порт), а каждый
@@ -75,14 +76,27 @@ def capture_preset(index: int = 0, allow_single: bool = False) -> dict:
         return {"ok": False, "error": "nvidia-smi недоступен"}
     loaded = [m for m in server.models()
               if m["status"] in ("loaded", "sleeping")]
+    source = "server"
     if not loaded and allow_single:
         loaded = server.loaded_models()
+    # Под swap бэкенд живёт на своём порту, а не на 8099: прямой /models
+    # пуст, и замер закончит фразой «в VRAM ничего не загружено», хотя модель в
+    # VRAM есть. Поэтому спрашиваем ещё и swap — он знает свои бэкенды.
+    if not loaded:
+        from . import swap as _swap
+        running = _swap.running_models(swap_url) if swap_url else []
+        if running:
+            loaded = [{"id": r["model"], "status": r["state"],
+                       "failed": r["state"] not in ("ready", "starting")}
+                      for r in running]
+            source = "swap"
     return {
         "ok": True,
         "used_mib": used,
         "free_mib": (total - used) if total else None,
         "total_mib": total,
         "loaded": [m["id"] for m in loaded],
+        "source": source,
         "at": int(time.time()),
     }
 

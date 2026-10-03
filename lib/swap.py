@@ -134,6 +134,37 @@ def export_yaml(ini_path: str | None = None, build_name: str | None = None,
     return "\n".join(lines), warns
 
 
+def running_models(swap_url: str = "http://127.0.0.1:8080",
+                   timeout: float = 5.0) -> list[dict]:
+    """Что swap держит запущенным: [{model, state, proxy_port}].
+
+    Нужно `measure`: под swap бэкенд живёт на своём порту (`${PORT}`), а не
+    на 8099, поэтому прямой сервер не видит ни одной модели и замер по
+    прямому `/models` concludes «в VRAM ничего не загружено».
+    """
+    st = status(swap_url, timeout=timeout)
+    if not st["up"]:
+        return []
+    data = st.get("running")
+    if isinstance(data, dict):
+        data = data.get("running")
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        proxy = str(item.get("proxy") or "")
+        port = None
+        if ":" in proxy:
+            tail = proxy.rsplit(":", 1)[-1].split("/")[0]
+            port = int(tail) if tail.isdigit() else None
+        out.append({"model": item.get("model") or item.get("id") or "?",
+                    "state": item.get("state") or "unknown",
+                    "proxy": proxy, "proxy_port": port})
+    return out
+
+
 def status(swap_url: str = "http://127.0.0.1:8080", timeout: float = 5.0) -> dict:
     """Опрос прокси: /health + /running. Не требует запущенного сервера."""
     out: dict = {"url": swap_url, "up": False, "running": [], "error": None}

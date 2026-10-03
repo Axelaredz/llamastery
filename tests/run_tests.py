@@ -751,6 +751,73 @@ def test_swap_port_check() -> None:
         srv.close()
 
 
+def test_swap_running_models_parses_proxy_port() -> None:
+    """`/running` отдаёт {model,state,proxy} — порт бэкенда нужно вытащить.
+
+    Под swap бэкенд живёт на своём порту, и `measure` обязан уметь понять,
+    что модель загружена, иначе замер молчит при полной VRAM.
+    """
+    from lib import swap as S
+
+    print("swap: разбор /running")
+    fake = {"running": [
+        {"model": "qwen-128ctx", "state": "ready",
+         "proxy": "http://localhost:5800"},
+        {"model": "tiel-65ctx", "state": "stopped", "proxy": ""},
+    ]}
+    orig = S.status
+    S.status = lambda *a, **k: {"up": True, "running": fake, "error": None}
+    try:
+        got = S.running_models("http://127.0.0.1:8087")
+    finally:
+        S.status = orig
+    check(len(got) == 2, "две записи", len(got))
+    check(got[0]["model"] == "qwen-128ctx", "имя модели", got)
+    check(got[0]["proxy_port"] == 5800, "порт бэкенда", got)
+    check(got[1]["proxy_port"] is None, "без proxy — None", got)
+
+    # прокси не поднят: пустой список, а не исключение
+    S.status = lambda *a, **k: {"up": False, "running": [], "error": "down"}
+    try:
+        check(S.running_models() == [], "прокси down — пусто")
+    finally:
+        S.status = orig
+
+
+def test_capture_preset_falls_back_to_swap() -> None:
+    """Замер видит модель под swap, даже когда прямой сервер пуст.
+
+    Регрессия: `measure` рапортовал «в VRAM ничего не загружено», хотя
+    бэкенд swap занимал 9.5 GiB, — порт бэкенда не 8099, и прямой
+    `/models` его не показывает.
+    """
+    from lib import server as Srv
+    from lib import swap as S
+    from lib import vram as V
+
+    print("замер: fallback на llama-swap")
+    orig_models, orig_single = Srv.models, Srv.loaded_models
+    orig_run, orig_pf = S.running_models, Srv.read_pid
+    Srv.models = lambda *a, **k: []
+    Srv.loaded_models = lambda *a, **k: []
+    Srv.read_pid = lambda *a, **k: None
+    S.running_models = lambda *a, **k: [
+        {"model": "qwen-128ctx", "state": "ready",
+         "proxy": "http://localhost:5800", "proxy_port": 5800}]
+    try:
+        cap = V.capture_preset(allow_single=True, swap_url="http://127.0.0.1:8087")
+    finally:
+        Srv.models, Srv.loaded_models = orig_models, orig_single
+        Srv.read_pid = orig_pf
+        S.running_models = orig_run
+    check(cap["loaded"] == ["qwen-128ctx"], "модель видна", cap["loaded"])
+    check(cap["source"] == "swap", "источник — swap", cap["source"])
+    # занятое берётся из nvidia-smi, поэтому сверяем только согласованность:
+    # свободное = полное − занятое, а не выдуманное число
+    check(cap["free_mib"] == cap["total_mib"] - cap["used_mib"],
+          "свободно = полное − занятое", cap)
+
+
 def test_bool_flag_ini_value_respected() -> None:
     """`mmproj-offload = 0` должен выключать, а не включать.
 
