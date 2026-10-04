@@ -180,6 +180,22 @@ def has_flag(text, *names):
     return False
 
 
+def tool_env(tool):
+    """Окружение для запуска бинаря из build/bin.
+
+    Сборки llama.cpp — thin-бинари: рядом лежат libllama-*.so, и без
+    LD_LIBRARY_PATH запуск падает с «error while loading shared libraries».
+    Раньше это приводило к тому, что llama-bench молча не определялся,
+    screening пропускался, и каждый кандидат шёл через полную валидацию
+    сервером — то есть вместо минут получались часы.
+    """
+    env = dict(os.environ)
+    bindir = str(Path(tool).resolve().parent)
+    prev = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = f"{bindir}:{prev}" if prev else bindir
+    return env
+
+
 def run_help(binary):
     try:
         proc = subprocess.run(
@@ -187,6 +203,7 @@ def run_help(binary):
             capture_output=True,
             text=True,
             timeout=30,
+            env=tool_env(binary),
         )
     except Exception:
         return ""
@@ -1225,6 +1242,7 @@ def run_llama_bench(tool, caps, model, ctx, variant, args):
             capture_output=True,
             text=True,
             timeout=args.bench_timeout,
+            env=tool_env(tool),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Таймаут llama-bench: {exc}") from exc
@@ -1799,6 +1817,10 @@ def main():
                         "(по умолчанию ускоритель исключается из замера)")
     p.add_argument("--allow-vision", action="store_true",
                    help="не гасить mmproj и мерить с ним (для пресетов со зрением)")
+    p.add_argument("--ignore-preset", action="store_true",
+                   help="игнорировать значения секции пресета: стартовать "
+                        "от дефолтов и искать все оси свободно (для честного "
+                        "поиска с нуля, а не вокруг прошлой настройки)")
     p.add_argument("--allow-ot", action="store_true")
     p.add_argument("--cache-reuse", type=int, default=0)
 
@@ -2045,9 +2067,14 @@ def main():
                 server_caps.get("n-cpu-moe") and bench_caps_screen.get("moe")
                 and not allow_ot
             )
-            _base = staged_base(args, opts)
-            print("staged-поиск: старт из текущих значений пресета "
-                  f"{json.dumps(_base, ensure_ascii=False)}")
+            if args.ignore_preset:
+                _base = default_variant(args)
+                print("staged-поиск: значения пресета ИГНОРИРОВАНЫ, старт "
+                      f"от дефолтов {json.dumps(_base, ensure_ascii=False)}")
+            else:
+                _base = staged_base(args, opts)
+                print("staged-поиск: старт из текущих значений пресета "
+                      f"{json.dumps(_base, ensure_ascii=False)}")
             print("порядок проверки (по убыванию прироста): "
                   + ", ".join(k for k, _, _ in KNOB_AXES))
             candidates = axis_variants(_base, args, screen_moe_enabled)
