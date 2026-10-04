@@ -172,7 +172,13 @@ def running_models(swap_url: str = "http://127.0.0.1:8080",
 
 
 def status(swap_url: str = "http://127.0.0.1:8080", timeout: float = 5.0) -> dict:
-    """Опрос прокси: /health + /running. Не требует запущенного сервера."""
+    """Опрос прокси: /health + /running. Не требует запущенного сервера.
+
+    Адрес приводится к схеме: в `swap status` без --url подставляется
+    SWAP_LISTEN («host:port»), и без http:// urlopen падал с
+    «unknown url type».
+    """
+    swap_url = swap_url if "://" in swap_url else f"http://{swap_url}"
     out: dict = {"url": swap_url, "up": False, "running": [], "error": None}
     try:
         with urllib.request.urlopen(f"{swap_url.rstrip('/')}/health",
