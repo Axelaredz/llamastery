@@ -26,6 +26,15 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+# реестр осей лежит в lib/axes.py рядом с остальным инструментом; добавляем
+# корень репозитория в путь, только если он рядом (чтобы скрипт оставался
+# запускаемым отдельно, без установки пакета)
+import sys as _sys
+
+_ROOT = Path(__file__).resolve().parent.parent
+if (_ROOT / "lib" / "axes.py").exists() and str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+
 
 TRUE = {"1", "true", "yes", "on"}
 FALSE = {"0", "false", "no", "off"}
@@ -1398,14 +1407,29 @@ def ubatch_value_list(args):
 #   threads — важен, когда эксперты на CPU (это наш случай);
 #   b     — влияет, только если больше ubatch; в новых сборках n_batch
 #           клампится в n_ubatch, поэтому ось последняя.
-KNOB_AXES = (
-    ("moe", 5, "n-cpu-moe: ~260 MiB VRAM на слой, главный рычаг на MoE"),
-    ("kv_cache_type", 4, "тип KV-кэша: экономит VRAM дешевле по скорости"),
-    ("ubatch", 4, "ubatch-size: префилл и размер compute buffer"),
-    ("fa", 3, "flash-attn: сильно влияет на префилл"),
-    ("threads", 3, "потоки: при экспертах на CPU важнее всего"),
-    ("b", 1, "n_batch: имеет смысл только больше ubatch"),
-)
+def knob_axes(present_flags=None):
+    """Порядок осей: из реестра lib/axes.py, приоритет скорректирован замерами.
+
+    Реестр — единственное место, где описаны ось, её флаг и ожидаемый
+    прирост. Тюнер не дублирует список: иначе после обновления сборки
+    (или правки приоритета) они разъезжаются, и тюнер крутит не то.
+    """
+    from lib import axes as _axes
+    learned = _axes.learn()
+    order = _axes.order(learned, present_flags)
+    out = []
+    for key in order:
+        a = _axes.BY_KEY[key]
+        ev = learned.get(key) or {}
+        note = a["why"]
+        if ev.get("pairs", 0) >= 2 and ev.get("values", 0) > 1:
+            note += (f" [замеры: пар {ev['pairs']}, tps x{ev.get('tps_gain')}, "
+                     f"VRAM x{ev.get('vram_gain')}]")
+        out.append((key, a["gain"], note))
+    return out
+
+
+KNOB_AXES = knob_axes()
 
 
 def axis_values(args, key, screen_moe_enabled):

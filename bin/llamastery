@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib import (budget, builds, crashes, gguf, measure, paths, presets,  # noqa: E402
-                 runtime, schema, server, swap, validate, wizard)
+from lib import (axes, budget, builds, crashes, gguf, measure, paths,  # noqa: E402
+                 presets, runtime, schema, server, swap, validate, wizard)
 from lib.inifile import IniFile  # noqa: E402
 
 MIB = 2 ** 20
@@ -1357,6 +1357,59 @@ def cmd_swap(args) -> int:
     return 0
 
 
+# ─────────────────────────── axes ───────────────────────────
+def cmd_axes(args) -> int:
+    """Оси тюнинга: порядок, новые флаги сборки, что говорят замеры."""
+    if args.action == "refresh":
+        b = builds.get(args.build) or builds.get(server.active_build() or "")
+        if b is None:
+            print("сборка не указана и не определяется: --build", file=sys.stderr)
+            return 1
+        res = axes.diff_snapshot(b.name)
+        if res.get("error"):
+            print(res["error"], file=sys.stderr)
+            return 1
+        if res.get("first"):
+            print(f"снимок флагов создан: {res['count']} флагов → "
+                  f"{axes.snapshot_path(b.name)}")
+            return 0
+        print(f"сборка {b.name}: флагов {res['count']}")
+        if res["added"]:
+            print("добавились:")
+            for f in res["added"]:
+                print(f"  + {f}")
+        if res["removed"]:
+            print("исчезли:")
+            for f in res["removed"]:
+                print(f"  - {f}")
+        if not res["added"] and not res["removed"]:
+            print("набор флагов не изменился")
+        return 0
+
+    learned = axes.learn()
+    rows = axes.explain(learned)
+    if args.json:
+        out({"order": [r["key"] for r in rows], "axes": rows,
+             "learned": learned})
+        return 0
+    print("порядок проверки (по убыванию ожидаемого прироста):")
+    for i, r in enumerate(rows, 1):
+        mark = f" [{r['pairs']} пар, tps x{r['tps_gain']}, VRAM x{r['vram_gain']}]" \
+            if r["pairs"] and r["values"] > 1 else ""
+        print(f"  {i}. {r['key']:<14} {r['flag']:<18} приоритет {r['prior']}{mark}")
+        print(f"     {r['why']}")
+    b = builds.get(args.build)
+    if b is not None:
+        new = axes.discover(b.server_bin)
+        if new:
+            print(f"\nне описаны в реестре, но похожи на ручки скорости "
+                  f"({len(new)}):")
+            for f in new[:20]:
+                print(f"  ? {f}")
+            print("  → сначала validate/budget, потом добавь ось в lib/axes.py")
+    return 0
+
+
 # ─────────────────────────── wizard ───────────────────────────
 def cmd_wizard(args) -> int:
     return wizard.run()
@@ -1539,6 +1592,13 @@ def main(argv=None) -> int:
     sw.add_argument("--version", help="версия для install (по умолчанию v261)")
     sw.add_argument("--dry-run", action="store_true")
     sw.set_defaults(func=cmd_swap)
+
+    ax = sub.add_parser("axes", help="оси тюнинга: порядок, новые флаги, замеры")
+    ax.add_argument("action", nargs="?", default="show",
+                    choices=["show", "refresh"])
+    ax.add_argument("--build", help="сборка для обнаружения новых флагов")
+    ax.add_argument("--json", action="store_true")
+    ax.set_defaults(func=cmd_axes)
 
     w = sub.add_parser("wizard", help="интерактивный мастер: сервер → swap → пресет → план")
     w.set_defaults(func=cmd_wizard)

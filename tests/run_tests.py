@@ -894,6 +894,104 @@ def test_bool_flag_ini_value_respected() -> None:
           warns)
 
 
+def test_axes_discover_filters_noise() -> None:
+    """Автообнаружение показывает ручки, а не шум из пресетов и алиасов.
+
+    Без фильтра список новых флагов разрастался до 84 позиций, и сигнал
+    (реально новый параметр) в нём тонул.
+    """
+    from lib import axes as A
+
+    print("axes: обнаружение отфильтровано")
+    fake = {
+        "--n-cpu-moe": None, "-ncmoe": None, "--ubatch-size": None,
+        "--flash-attn": None, "--spec-type": None, "--batch-size": None,
+        "--cache-type-k": None, "--threads": None,
+        "--fim-qwen-7b-default": None, "--draft": None,
+        "--gpt-oss-20b-default": None, "--spec-draft-n-max": None,
+        "--spec-ngram-mod-n-max": None, "--spec-ngram-map-k-size-n": None,
+        "--spec-draft-cpu-mask": None, "--cpu-mask-batch": None,
+        "--brand-new-batch-knob": None, "--n-some-experimental": None,
+        "--unrelated": None,
+    }
+    got = A.discover("нет-бинаря", fake)
+    check("--n-cpu-moe" not in got, "известные оси не в списке", got)
+    check("--fim-qwen-7b-default" not in got, "пресеты отфильтрованы", got)
+    check("--draft" not in got, "устаревшие отфильтрованы", got)
+    check("--spec-draft-n-max" not in got, "ручки драфта отфильтрованы", got)
+    check("--spec-ngram-mod-n-max" in got, "ручки ngram показаны", got)
+    check("--brand-new-batch-knob" in got,
+          "неизвестный фlag с намёком показан", got)
+    check("--unrelated" not in got, "непохожее не показывается", got)
+
+
+def test_axes_learn_only_isolated_pairs() -> None:
+    """Эффект оси считается только по прогонам, отличающимся этой осью.
+
+    В первой версии разброс по t/s и VRAM приписывался всем осям сразу:
+    у ubatch и n-cpu-moe выходили одинаковые 6.22, хотя менялась одна.
+    """
+    from lib import axes as A
+
+    print("axes: приоритет по изолированным парам")
+
+    def run(cfg, tps, vram):
+        return {"ok": True, "config": cfg,
+                "short": {"gen_tps": tps},
+                "min_observed_free_mib": vram}
+
+    fake = [
+        # изолированная пара по moe: 40 t/s против 20, 1000 против 400 MiB
+        run({"n-cpu-moe": 16, "ubatch-size": 1024}, 40, 1000),
+        run({"n-cpu-moe": 32, "ubatch-size": 1024}, 20, 400),
+        # изолированная пара по ubatch: те же 40/20 t/s, VRAM почти не меняется
+        run({"n-cpu-moe": 16, "ubatch-size": 512}, 40, 950),
+        run({"n-cpu-moe": 16, "ubatch-size": 2048}, 40, 900),
+        # moe и ubatch меняются вместе — такая пара не идёт ни в одну ось
+        run({"n-cpu-moe": 32, "ubatch-size": 2048}, 20, 390),
+    ]
+    orig = A._load_results
+    A._load_results = lambda: fake
+    try:
+        learned = A.learn()
+    finally:
+        A._load_results = orig
+    check(learned.get("moe", {}).get("tps_gain") == 2.0,
+          "moe: tps x2 из изолированной пары", learned.get("moe"))
+    check(learned.get("moe", {}).get("vram_gain") == 2.5,
+          "moe: VRAM x2.5", learned.get("moe"))
+    ub = learned.get("ubatch", {})
+    check(ub.get("tps_gain") == 1.0, "ubatch: tps без эффекта", ub)
+    check(ub.get("vram_gain") == 1.11, "ubatch: VRAM x1.11 (берём худший)",
+          ub)
+    check("fa" not in learned, "неизменённая ось не попадает в вывод")
+
+
+def test_axes_order_respects_evidence() -> None:
+    """Замеры переставляют порядок, но не могут выкинуть ось совсем."""
+    from lib import axes as A
+
+    print("axes: порядок подстраивается под замеры")
+    base = A.order(learned={})
+    check(base[0] == "moe", "без замеров первым moe", base)
+    check(base.index("moe") < base.index("fa"), "moe выше fa", base)
+
+    loud_spec = {"spec": {"pairs": 12, "values": 3, "tps_gain": 4.0,
+                          "vram_gain": 1.0}}
+    got = A.order(learned=loud_spec)
+    check(got.index("spec") < got.index("threads"),
+          "измеренный x4 поднял spec выше threads", got)
+    check(len(got) == len(base), "оси не теряются", (got, base))
+
+    # шум (одна пара) не переставляет ничего
+    noise = {"fa": {"pairs": 1, "values": 2, "tps_gain": 9.0, "vram_gain": 9.0}}
+    check(A.order(learned=noise) == base, "одна пара игнорируется")
+
+    # фильтр по наличию в сборке
+    only = A.order(learned={}, present={"--ubatch-size", "--threads"})
+    check(only == ["ubatch", "threads"], "только реально доступные оси", only)
+
+
 def _tune_module():
     import importlib.util
     root = Path(__file__).resolve().parents[1]
@@ -948,11 +1046,17 @@ def test_tune_staged_order_and_saving() -> None:
     cands = m.axis_variants(base, args, True)
     axes = [c["_axis"] for c in cands]
     check(axes[0] == "moe", "первой идёт ось n-cpu-moe", axes)
-    check(axes.index("kv_cache_type") < axes.index("ubatch"),
-          "KV раньше ubatch", axes)
+    # порядок осей в кандидатах обязан совпадать с реестром lib/axes.py
+    # (который, в свою очередь, скорректирован замерами)
+    from lib import axes as _ax
+    reg = [k for k in _ax.order(_ax.learn()) if k in set(axes)]
+    first_seen = list(dict.fromkeys(axes))
+    check(first_seen == reg, "порядок осей совпадает с реестром",
+          (first_seen, reg))
     ranks = [dict((k, r) for k, r, _ in m.KNOB_AXES)[a_] for a_ in axes]
     check(ranks == sorted(ranks, reverse=True), "оси строго по убыванию прироста",
           list(zip(axes, ranks)))
+    ranks = [dict((k, r) for k, r, _ in m.KNOB_AXES)[a_] for a_ in axes]
     def diffs(v, b):
         """Сколько отслеживаемых параметров отличается от базы."""
         keys = ("moe", "ubatch", "threads", "kv_cache_type", "fa")
