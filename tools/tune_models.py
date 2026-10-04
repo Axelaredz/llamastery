@@ -1736,7 +1736,14 @@ def main():
     p.add_argument("--gpu", type=int, default=0)
 
     p.add_argument("--contexts", default="",
-                   help="Дополнительные контексты, например 65536,114688")
+                   help="Дополнительные контексты, например 32768,65536")
+    p.add_argument("--search-ctx", type=int, default=0,
+                   help="Глубина ВАЛИДАЦИИ в токенах; по умолчанию берётся c "
+                        "из пресета. Меньше c — часы вместо часов: эффект "
+                        "осей (n-cpu-moe, ubatch, fa, threads) от глубины "
+                        "почти не зависит, он на токен, а не на весь KV. "
+                        "Реальную глубину проверяют один раз отдельно: "
+                        "llamastery budget + probe --tokens 110000")
     p.add_argument("--deep", action="store_true",
                    help="Проверять контекст почти до полного c")
     p.add_argument("--apply", action="store_true",
@@ -1968,7 +1975,30 @@ def main():
         p.error("Ключ c должен быть целым числом")
 
     extra_contexts = csv_ints(args.contexts, "contexts", allow_empty=True)
-    contexts = sorted({base_ctx, *extra_contexts})
+    # По умолчанию валидация идёт на c из пресета — это и есть «часы на
+    # каждый кандидат». --search-ctx отделяет глубину ПОИСКА от глубины
+    # пресета: подбираем параметры на коротком контексте, а полный ctx
+    # проверяем один раз для победителя (probe на живом сервере).
+    if args.search_ctx and args.search_ctx < base_ctx:
+        print(f"ВНИМАНИЕ: валидация на {args.search_ctx} токенах, а в пресете "
+              f"c={base_ctx}. Поиск идёт быстро; полную глубину проверь "
+              f"отдельно: llamastery budget {args.section} и "
+              f"llamastery probe --tokens {base_ctx}.")
+    search_base = args.search_ctx or base_ctx
+    contexts = sorted({search_base, *extra_contexts})
+
+    # Запись в INI пишет c = глубина валидации, поэтому при укороченном
+    # поиске --apply затёр бы пресетный контекст (114688 -> 8192). Это
+    # ровно тот случай, где «обман» опасен: параметры подобраны на
+    # неполном KV, и применять их ко всему контексту нельзя без
+    # отдельной глубокой проверки.
+    if args.apply and search_base < base_ctx:
+        p.error(
+            f"--apply нельзя с --search-ctx {search_base} < c={base_ctx}: "
+            f"параметры подобраны на неполном KV. Сначала проверь глубину "
+            f"отдельно (probe --tokens {base_ctx}), потом запусти tune "
+            f"без --search-ctx с --deep --apply."
+        )
 
     if any(ctx < 4096 or ctx > 262144 for ctx in contexts):
         p.error("Контекст должен быть в пределах 4096..262144")

@@ -967,6 +967,42 @@ def test_axes_learn_only_isolated_pairs() -> None:
     check("fa" not in learned, "неизменённая ось не попадает в вывод")
 
 
+def test_tune_search_ctx_guard() -> None:
+    """--search-ctx укорачивает поиск, но запрещает --apply.
+
+    Побочный эффект короткой валидации: конфиг прогона пишет c = глубина
+    валидации. Если разрешить --apply, пресетный контекст 114688 был бы
+    затёрт на 8192, а параметры подобраны на неполном KV.
+    """
+    import subprocess
+    import sys as _sys
+
+    m = _tune_module()
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "tools" / "tune_models.py").read_text(encoding="utf-8")
+
+    print("tune: --search-ctx и защита --apply")
+    check("--search-ctx" in src, "флаг объявлен")
+    check("if args.apply and search_base < base_ctx:" in src,
+          "apply запрещён при укороченной валидации")
+    check("p.error(" in src.split("if args.apply and search_base < base_ctx:")[1][:600],
+          "выводится объяснение, а не просто отказ")
+
+    # реальный запуск: apply с коротким контекстом обязан упасть
+    ini = Path("/tmp/tune-guard.ini")
+    ini.write_text("[s]\nmodel = /tmp/nope.gguf\nc = 114688\n", encoding="utf-8")
+    server_bin = root.parent / "llama-faks" / "build" / "bin" / "llama-server"
+    if not server_bin.exists():
+        return
+    r = subprocess.run(
+        [_sys.executable, str(root / "tools" / "tune_models.py"), str(ini), "s",
+         "--server", str(server_bin), "--search-ctx", "8192", "--deep", "--apply"],
+        capture_output=True, text=True, timeout=300)
+    check(r.returncode != 0, "команда с --apply отклонена", r.returncode)
+    check("search-ctx" in (r.stderr + r.stdout),
+          "объяснение содержит search-ctx", (r.stderr + r.stdout)[-300:])
+
+
 def test_axes_spec_is_ab_not_grid() -> None:
     """ngram — самый большой рычаг, но в сетку осей он не годится.
 
