@@ -894,6 +894,120 @@ def test_bool_flag_ini_value_respected() -> None:
           warns)
 
 
+def _tune_module():
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "tune_models_t", root / "tools" / "tune_models.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _tune_args(**over):
+    class A:
+        pass
+    a = A()
+    a.moe_values = "16,20,24,28,32"
+    a.moe_step = 4
+    a.max_cpu_moe = 64
+    a.ubatch_values = "512,1024,2048"
+    a.try_4096 = False
+    a.threads = 12
+    a.threads_batch = 12
+    a.try_threads_16 = True
+    a.kv_cache_type = "q8_0"
+    a.try_f16 = True
+    a.flash_attn = "on"
+    a.batch_values = ""
+    a.ngl = 999
+    a.kv_unified = "on"
+    a.screen_top = 8
+    for k, v in over.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_tune_staged_order_and_saving() -> None:
+    """Staged: сначала оси с наибольшим приростом, и по одному параметру.
+
+    Полный декартов перебор на тех же значениях давал 64 прогона; staged
+    первого раунда — 10, то есть в 6 раз меньше, и порядок не случайный.
+    """
+    m = _tune_module()
+
+    print("tune: staged-порядок и экономия")
+    args = _tune_args()
+    base = m.staged_base(args, {"n-cpu-moe": "24", "ubatch-size": "1024",
+                                "t": "12", "cache-type-k": "q8_0",
+                                "fa": "true"})
+    check(base["moe"] == 24 and base["ubatch"] == 1024 and base["threads"] == 12,
+          "база берётся из пресета, а не из дефолтов", base)
+    check(base["fa"] == "on", "fa=true пресета переводится в on", base)
+
+    cands = m.axis_variants(base, args, True)
+    axes = [c["_axis"] for c in cands]
+    check(axes[0] == "moe", "первой идёт ось n-cpu-moe", axes)
+    check(axes.index("kv_cache_type") < axes.index("ubatch"),
+          "KV раньше ubatch", axes)
+    ranks = [dict((k, r) for k, r, _ in m.KNOB_AXES)[a_] for a_ in axes]
+    check(ranks == sorted(ranks, reverse=True), "оси строго по убыванию прироста",
+          list(zip(axes, ranks)))
+    def diffs(v, b):
+        """Сколько отслеживаемых параметров отличается от базы."""
+        keys = ("moe", "ubatch", "threads", "kv_cache_type", "fa")
+        n = sum(1 for k in keys if str(v.get(k)) != str(b.get(k)))
+        # threads тянет за собой threads_batch, b следует за ubatch — это
+        # один и тот же рычаг, а не два
+        if str(v.get("b")) != str(b.get("b")) and "ubatch" in keys:
+            n -= 1
+        return n
+    check(all(diffs(c, base) == 1 for c in cands),
+          "в каждом кандидате меняется ровно один параметр",
+          [(c["_axis"], diffs(c, base)) for c in cands])
+
+    # против старого полного перебора
+    full, sm = m.make_screen_candidates(args, {"n-cpu-moe": True},
+                                        {"moe": True}, False)
+    check(len(cands) < len(full) / 3,
+          f"staged экономнее полного перебора ({len(cands)} против {len(full)})")
+
+
+def test_tune_axes_skip_current_and_dedup() -> None:
+    """Текущее значение оси не гоняется, дубликаты не повторяются."""
+    m = _tune_module()
+    args = _tune_args()
+
+    print("tune: оси без лишних прогонов")
+    base = m.staged_base(args, {"n-cpu-moe": "24", "ubatch-size": "1024",
+                                "t": "12", "fa": "on"})
+    cands = m.axis_variants(base, args, True)
+    moe_axis = [c for c in cands if c["_axis"] == "moe"]
+    check(moe_axis and all(c["moe"] != base["moe"] for c in moe_axis),
+          "текущее n-cpu-moe не проверяется заново",
+          [c["moe"] for c in moe_axis])
+    fa_axis = [c for c in cands if c["_axis"] == "fa"]
+    check(fa_axis and all(c["fa"] != base["fa"] for c in fa_axis),
+          "текущее fa не проверяется заново", [c["fa"] for c in fa_axis])
+    ub_axis = [c for c in cands if c["_axis"] == "ubatch"]
+    check(ub_axis and all(c["ubatch"] != base["ubatch"] for c in ub_axis),
+          "текущее ubatch не проверяется заново", [c["ubatch"] for c in ub_axis])
+    seen = {m.variant_key(c) for c in cands}
+    check(len(seen) == len(cands), "дубликатов нет")
+
+    # exclude отсекает уже измеренное
+    again = m.axis_variants(base, args, True, exclude=seen)
+    overlap = seen & {m.variant_key(c) for c in again}
+    check(not overlap, "exclude убирает уже измеренные", len(overlap))
+
+    # ось b по умолчанию не крутится: n_batch клампится в n_ubatch
+    check(not any(c.get("_axis") == "b" for c in cands),
+          "ось b молчит без --batch-values")
+    with_b = m.axis_variants(base, _tune_args(batch_values="4096"), True)
+    check(any(c.get("_axis") == "b" for c in with_b),
+          "--batch-values включает ось b")
+
+
 def test_wizard_dispatch_signatures() -> None:
     """Каждый пункт меню вызывается с теми аргументами, что есть в сигнатуре.
 

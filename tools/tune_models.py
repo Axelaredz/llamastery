@@ -1382,6 +1382,145 @@ def ubatch_value_list(args):
     return [1024, 2048]
 
 
+# ── оси поиска: сначала то, что даёт максимальный прирост ──
+# Раньше кандидаты строились полным декартовым произведением
+# moe × ubatch × threads × KV × fa, и порядок был случайным: при обрыве
+# по лимиту половина бюджета могла уйти на заведомо проигрышные комбинации.
+# Теперь кандидат — это база с ОДНИМ изменённым параметром, а сами
+# параметры идут в порядке убывания ожидаемого прироста.
+#
+# Обоснование порядка (замеры на 12 ГБ, MoE 35B, docs/ru/tuning.md):
+#   moe   — ~260 MiB VRAM на слой: главный рычаг, решает «влезает или нет»;
+#   kv    — та же экономия памяти дешевле по скорости, часто позволяет
+#           уменьшить moе;
+#   ubatch— скорость префилла и размер compute buffer (на 12 ГБ 2048 = OOM);
+#   fa    — заметно влияет на префилл;
+#   threads — важен, когда эксперты на CPU (это наш случай);
+#   b     — влияет, только если больше ubatch; в новых сборках n_batch
+#           клампится в n_ubatch, поэтому ось последняя.
+KNOB_AXES = (
+    ("moe", 5, "n-cpu-moe: ~260 MiB VRAM на слой, главный рычаг на MoE"),
+    ("kv_cache_type", 4, "тип KV-кэша: экономит VRAM дешевле по скорости"),
+    ("ubatch", 4, "ubatch-size: префилл и размер compute buffer"),
+    ("fa", 3, "flash-attn: сильно влияет на префилл"),
+    ("threads", 3, "потоки: при экспертах на CPU важнее всего"),
+    ("b", 1, "n_batch: имеет смысл только больше ubatch"),
+)
+
+
+def axis_values(args, key, screen_moe_enabled):
+    """Допустимые значения оси; пустой список — ось нечего крутить."""
+    if key == "moe":
+        return moe_value_list(args, screen_moe_enabled)
+    if key == "ubatch":
+        return ubatch_value_list(args)
+    if key == "b":
+        # b по умолчанию = max(2048, ubatch); отдельные значения осмысленны
+        # только если пользователь их задал явно
+        raw = str(getattr(args, "batch_values", "") or "").strip()
+        return [int(x) for x in raw.split(",") if x.strip()] if raw else []
+    if key == "kv_cache_type":
+        vals = [args.kv_cache_type]
+        if args.try_f16 and "f16" not in vals:
+            vals.append("f16")
+        return vals
+    if key == "fa":
+        vals = [args.flash_attn]
+        if args.flash_attn == "on" and "off" not in vals:
+            vals.append("off")
+        return vals
+    if key == "threads":
+        vals = [args.threads]
+        if args.try_threads_16 and 16 not in vals:
+            vals.append(16)
+        return vals
+    return []
+
+
+def _axis_value(variant, key):
+    if key == "b":
+        return max(2048, int(variant.get("ubatch", 2048)))
+    return variant.get(key)
+
+
+def _with_axis(variant, key, value):
+    v = dict(variant)
+    if key == "moe":
+        v["moe"] = int(value)
+    elif key == "ubatch":
+        v["ubatch"] = int(value)
+        v["b"] = max(2048, int(value))
+    elif key == "b":
+        v["b"] = max(int(value), int(v.get("ubatch", 2048)))
+    elif key == "threads":
+        v["threads"] = int(value)
+        v["threads_batch"] = max(int(v.get("threads_batch", 0) or 0), int(value))
+    elif key == "kv_cache_type":
+        v["kv_cache_type"] = str(value)
+    elif key == "fa":
+        v["fa"] = str(value)
+    return v
+
+
+def axis_variants(base, args, screen_moe_enabled, exclude=None):
+    """Кандидаты «база + один параметр», в порядке убывания прироста.
+
+    exclude — ключи вариантов, которые уже измерены: повторно их не гоняем.
+    """
+    seen = set(exclude or ())
+    seen.add(variant_key(base))
+    out = []
+    for key, _rank, _why in sorted(KNOB_AXES, key=lambda a: -a[1]):
+        current = _axis_value(base, key)
+        for value in axis_values(args, key, screen_moe_enabled):
+            if str(value) == str(current):
+                continue
+            v = _with_axis(base, key, value)
+            # метку оси ставим ДО подсчёта ключа: иначе ключ первого вызова
+            # не совпадёт с ключом exclude из следующего, и уже измеренное
+            # будет прогоняться заново
+            v["_axis"] = key
+            k = variant_key(v)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(v)
+    return out
+
+
+def staged_base(args, opts):
+    """Стартовая точка поиска: текущие значения пресета, а не дефолты аргументов.
+
+    Иначе первый же кандидат был бы далёк от того, что человек уже измерил
+    руками, и поиск шёл бы мимо его настройки.
+    """
+    v = default_variant(args)
+    cfg = {str(k).lower(): val for k, val in (opts or {}).items()}
+    if "n-cpu-moe" in cfg:
+        v["moe"] = safe_int(cfg.get("n-cpu-moe"), v["moe"])
+    if "ubatch-size" in cfg:
+        v["ubatch"] = safe_int(cfg.get("ubatch-size"), v["ubatch"])
+        v["b"] = max(2048, v["ubatch"])
+    if "b" in cfg:
+        v["b"] = max(safe_int(cfg.get("b"), v["b"]), v["ubatch"])
+    if "cache-type-k" in cfg:
+        v["kv_cache_type"] = str(cfg.get("cache-type-k"))
+    if "fa" in cfg:
+        fa = str(cfg.get("fa")).lower()
+        if fa in ("on", "off", "auto", "true", "false", "1", "0"):
+            v["fa"] = "on" if fa in ("on", "true", "1") else (
+                "off" if fa in ("off", "false", "0") else "auto")
+    if "t" in cfg:
+        v["threads"] = safe_int(cfg.get("t"), v["threads"])
+    if "threads-batch" in cfg:
+        v["threads_batch"] = safe_int(cfg.get("threads-batch"), v["threads_batch"])
+    if "n-gpu-layers" in cfg:
+        v["ngl"] = safe_int(cfg.get("n-gpu-layers"), v["ngl"])
+    if "kv-unified" in cfg:
+        v["kv_unified"] = str(cfg.get("kv-unified"))
+    return v
+
+
 def make_screen_candidates(args, server_caps, bench_caps, allow_ot):
     screen_moe_enabled = (
         server_caps.get("n-cpu-moe")
@@ -1637,6 +1776,20 @@ def main():
                    default="auto")
     p.add_argument("--bench-bin", type=Path, default=None)
     p.add_argument("--sweep-bin", type=Path, default=None)
+    p.add_argument("--search", choices=("staged", "full"), default="staged",
+                   help="staged (по умолчанию): сначала параметры с наибольшим "
+                        "приростом, по одному за прогон, затем уточнение вокруг "
+                        "победителя; full: полный перебор как раньше")
+    p.add_argument("--refine-rounds", type=int, default=2,
+                   help="сколько раундов уточнения вокруг победителя (staged)")
+    p.add_argument("--min-gain", type=float, default=0.02,
+                   help="минимальный относительный прирост, ради которого "
+                        "делается следующий раунд (staged)")
+    p.add_argument("--max-screen", type=int, default=24,
+                   help="потолок кандидатов screening (staged)")
+    p.add_argument("--batch-values", default="",
+                   help="явные значения n_batch через запятую; по умолчанию "
+                        "ось b не крутится — она клампится в ubatch")
     p.add_argument("--screen-top", type=int, default=8)
     p.add_argument("--prefilter-ctx", type=int, default=0,
                    help="Контекст быстрого предфильтра (только короткая проба, без deep); "
@@ -1832,12 +1985,23 @@ def main():
             "selected": [],
         }
 
-        candidates, screen_moe_enabled = make_screen_candidates(
-            args,
-            server_caps,
-            detect_bench_caps(bench_tool) if bench_tool else {},
-            allow_ot,
-        )
+        bench_caps_screen = detect_bench_caps(bench_tool) if bench_tool else {}
+        if args.search == "staged":
+            screen_moe_enabled = bool(
+                server_caps.get("n-cpu-moe") and bench_caps_screen.get("moe")
+                and not allow_ot
+            )
+            _base = staged_base(args, opts)
+            print("staged-поиск: старт из текущих значений пресета "
+                  f"{json.dumps(_base, ensure_ascii=False)}")
+            print("порядок проверки (по убыванию прироста): "
+                  + ", ".join(k for k, _, _ in KNOB_AXES))
+            candidates = axis_variants(_base, args, screen_moe_enabled)
+            candidates = candidates[:args.max_screen]
+        else:
+            candidates, screen_moe_enabled = make_screen_candidates(
+                args, server_caps, bench_caps_screen, allow_ot,
+            )
 
         needed_ctx = args.screen_pp + args.screen_tg + 64
         screen_ctx = min(max(contexts), max(args.screen_ctx, needed_ctx))
@@ -1897,6 +2061,61 @@ def main():
                     screen_report["candidates"].append(entry)
 
                 scored.sort(key=lambda x: x[0], reverse=True)
+
+                # Раунды уточнения (staged): берём победителя и пробуем
+                # вокруг него по одному параметру. Ось, которая не дала
+                # прироста, второй раз не крутится — иначе бюджет уходит
+                # в повторы одного и того же.
+                if args.search == "staged" and args.refine_rounds > 0:
+                    measured = {variant_key(v) for _, v, _ in scored}
+                    tried_axes = set()
+                    best_score = scored[0][0] if scored else 0.0
+                    for rnd in range(1, args.refine_rounds + 1):
+                        if not scored:
+                            break
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        base_v = scored[0][1]
+                        fresh = []
+                        for v in axis_variants(base_v, args,
+                                               screen_moe_enabled,
+                                               exclude=measured):
+                            if v.get("_axis") in tried_axes:
+                                continue
+                            fresh.append(v)
+                        if not fresh:
+                            print(f"[refine {rnd}] новых вариантов нет — стоп")
+                            break
+                        gain = (scored[0][0] - best_score) / best_score \
+                            if best_score else 0.0
+                        if rnd > 1 and gain < args.min_gain:
+                            print(f"[refine {rnd}] прирост {gain:.1%} < "
+                                  f"{args.min_gain:.1%} — стоп")
+                            break
+                        best_score = scored[0][0]
+                        print(f"[refine {rnd}] вокруг {base_v}: "
+                              f"{len(fresh)} кандидатов")
+                        for v in fresh:
+                            tried_axes.add(v.get("_axis"))
+                            measured.add(variant_key(v))
+                            entry = {"variant": v, "ok": False, "score": 0.0,
+                                     "pp_tps": 0.0, "tg_tps": 0.0, "error": None}
+                            try:
+                                rows, _raw = run_llama_bench(
+                                    bench_tool, bench_caps, opts["model"],
+                                    screen_ctx, v, args)
+                                score, pp, tg = bench_score(rows)
+                                entry.update({"ok": score > 0,
+                                              "score": round(score, 4),
+                                              "pp_tps": round(pp, 2),
+                                              "tg_tps": round(tg, 2),
+                                              "rows": len(rows)})
+                                if score > 0:
+                                    scored.append((score, v, entry))
+                            except Exception as exc:
+                                entry["error"] = str(exc)
+                            screen_report["candidates"].append(entry)
+                        scored.sort(key=lambda x: x[0], reverse=True)
+
                 selected = [v for _, v, _ in scored[:args.screen_top]]
 
         elif sweep_tool:
