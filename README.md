@@ -24,6 +24,33 @@
 
 ## За 60 секунд
 
+Не знаешь, с чего начать? Запусти мастер — он сам покажет состояние, спросит
+что делаем, и в каждом вопросе Enter = самый эффективный вариант (★):
+
+```bash
+bin/llamastery                         # мастер настройки (или bin/llamastery wizard)
+```
+
+Мастер: состояние → «что делаем?» (роутер/свап/пресет — только то, что сейчас
+возможно) → сборка → swap → модели → пресет → контекст → зрение → ускорители →
+план. На любом экране `0` — вернуться на шаг назад.
+
+Подобрать параметры пресета автоматически (долго, грузит GPU — запускай в
+свободное время):
+
+```bash
+bin/llamastery tune ~/.config/llama/models.ini <секция> --build faks \
+    --extra search=staged search-ctx=16384 refine-rounds=2 \
+           moe-values=16,20,24,28,32,36 ubatch-values=512,1024,2048
+```
+
+`search=staged` сначала проверяет то, что даёт максимальный прирост
+(`n-cpu-moe`, `ubatch`, KV, `fa`, потоки), по одному параметру за прогон.
+`search-ctx` укорачивает валидацию: глубокий прогон делается один раз для
+победителя, а не для каждого кандидата (иначе — часы).
+
+Остальное — точечные инструменты:
+
 ```bash
 bin/llamastery doctor                  # что видно: сборки, пресет, замеры, калибровка
 bin/llamastery validate                # пресет проходит схему твоей сборки?
@@ -75,6 +102,7 @@ bin/llamastery probe --tokens 110000   # честная скорость на г
 ```bash
 git clone <репозиторий> ~/git/llamastery
 cd ~/git/llamastery
+bin/llamastery                     # мастер: всё остальное он спросит и подскажет
 bin/llamastery doctor              # проверить окружение
 bin/llamastery builds detect       # найти форки (только просмотр)
 bin/llamastery builds detect --apply   # записать в реестр
@@ -106,7 +134,9 @@ bin/llamastery runtime stop
 | Перенести чужой пресет | `llamastery presets import --source <файл|URL|git> --dry-run` |
 | Оформить комментарии | `llamastery presets annotate --apply` (сначала без `--apply`) |
 | Разобрать падение | `llamastery crashes` / `crashes --forget <пресет>` |
-| Подобрать параметры | `llamastery tune <ini> <секция> --build faks --extra ...` (грузит GPU, только с согласия) |
+| Не знаю, с чего начать | `llamastery` без команды — мастер настройки (★ = рекомендация, `0` = назад) |
+| Подобрать параметры | `llamastery tune <ini> <секция> --build faks --extra search=staged search-ctx=16384 ...` (грузит GPU, только с согласия) |
+| Порядок проверки осей и новые флаги | `llamastery axes --build faks` / `llamastery axes refresh --build faks` |
 | Выгрузить в llama-swap | `llamastery swap export --build faks -o <yaml> --dry-run` (дефолт связки — faks, см. docs/ru/swap.md) |
 | Мастер настройки | `llamastery` без команды или `llamastery wizard` (дефолты ★ = самый эффективный вариант) |
 
@@ -211,6 +241,31 @@ Python 3.11+ standard library only, no dependencies.
 
 ## In 60 seconds
 
+Not sure where to start? Run the wizard — it prints the state, asks what to do,
+and on every question Enter picks the most effective option (★):
+
+```bash
+bin/llamastery                         # setup wizard (or bin/llamastery wizard)
+```
+
+The wizard: state → "what are we doing" (router/swap/preset — only what is
+possible right now) → build → swap → models → preset → context → vision →
+accelerators → plan. `0` goes back one step on any screen.
+
+Tune a preset automatically (slow, loads the GPU — run it when idle):
+
+```bash
+bin/llamastery tune ~/.config/llama/models.ini <section> --build faks \
+    --extra search=staged search-ctx=16384 refine-rounds=2 \
+           moe-values=16,20,24,28,32,36 ubatch-values=512,1024,2048
+```
+
+`search=staged` tests the highest-gain knobs first (`n-cpu-moe`, `ubatch`, KV,
+`fa`, threads), one parameter per run. `search-ctx` shortens validation: the
+deep run happens once for the winner instead of once per candidate.
+
+The rest are point tools:
+
 ```bash
 bin/llamastery doctor                  # what is visible: builds, preset, measurements, calibration
 bin/llamastery validate                # does the preset match your build's schema?
@@ -307,6 +362,28 @@ python3 tests/run_tests.py           # no dependencies
 - [60秒速览](#60秒速览) · [快速开始](#快速开始)
 
 ## 60秒速览
+
+不知道从哪开始？运行向导：它会显示当前状态、问你要做什么，每个问题回车即选最优项（★）：
+
+```bash
+bin/llamastery                         # 设置向导（或 bin/llamastery wizard）
+```
+
+向导：状态 → 「做什么」（router/swap/preset — 只列当前可行的）→ 构建 → swap →
+模型 → preset → 上下文 → 视觉 → 加速器 → 计划。任何界面按 `0` 返回上一步。
+
+自动调优 preset（耗时、占用 GPU，请空闲时运行）：
+
+```bash
+bin/llamastery tune ~/.config/llama/models.ini <section> --build faks \
+    --extra search=staged search-ctx=16384 refine-rounds=2 \
+           moe-values=16,20,24,28,32,36 ubatch-values=512,1024,2048
+```
+
+`search=staged` 先验证收益最大的参数（`n-cpu-moe`、`ubatch`、KV、`fa`、线程），
+每次只改一个参数。`search-ctx` 缩短验证：深度测试只对胜出者跑一次，而不是每个候选都跑。
+
+其余是单点工具：
 
 ```bash
 bin/llamastery doctor                  # 可见：构建、preset、实测、校准
