@@ -87,9 +87,21 @@ AXES = [
         "flag": "--spec-type",
         "probe": "spec-type",
         "values": "enum:none,ngram-mod,ngram-simple",
-        "gain": 3,
+        # приоритет 5 — не из общих соображений, а из твоего же A/B:
+        # docs/ru/tuning.md, Qwen3.8 MiniPlus, 114688: на повторяющемся тексте
+        # 84-92 t/s против 26 (x3.2), на уникальном 30 против 28.5 (x1.05).
+        # То есть это самый большой рычаг из всех, но только на том тексте,
+        # для которого он и предназначен.
+        "gain": 5,
+        "measured": {"repetitive": 3.2, "unique": 1.05,
+                     "src": "docs/ru/tuning.md, Qwen3.8 MiniPlus, 114688"},
+        # Не ось линейного поиска: эффект знакопеременный — на повторяющемся
+        # тексте ×3-4, на уникальном около нуля. В общую сетку его соваливать
+        # бессмысленно (в твоих прогонах 0 замеров именно потому, что тюнер
+        # исключает ускоритель), поэтому он идёт отдельным A/B.
+        "mode": "ab",
         "why": "спекулятивный декодер: ×3–4 на повторяющемся тексте, "
-               "на уникальном — ноль",
+               "на уникальном около нуля — мерить A/B на обоих текстах",
     },
     {
         "key": "b",
@@ -294,6 +306,32 @@ def _axis_values(cfg: dict) -> dict:
     return out
 
 
+def spec_effect(records: list[dict] | None = None) -> dict:
+    """Прирост ускорителя раздельно по типам текста.
+
+    Один вывод «ngram бесполезен» или «ngram даёт ×4» врёт: правда в том,
+    что на повторах он даёт ×3-4, а на уникальном тексте — около нуля.
+    Поэтому храним две оценки и решение принимает вызывающий, зная про нагрузку.
+    """
+    if records is None:
+        records = _load_results()
+    out: dict[str, dict] = {}
+    for r in records:
+        ab = r.get("spec_ab")
+        if not isinstance(ab, dict):
+            continue
+        for workload, key in (("unique", "unique"), ("repetitive", "repetitive")):
+            plain = (ab.get(f"tg_{key}_plain") or 0)
+            spec = (ab.get(f"tg_{key}_spec") or 0)
+            if plain > 0 and spec > 0:
+                cur = out.setdefault(workload, {"pairs": 0, "gain": 0.0})
+                cur["pairs"] += 1
+                cur["gain"] = max(cur["gain"], spec / plain)
+    for v in out.values():
+        v["gain"] = round(v["gain"], 2)
+    return out
+
+
 def learn(min_pairs: int = 2) -> dict:
     """Наблюдаемый эффект каждой оси по твоим прогонам.
 
@@ -348,6 +386,20 @@ def learn(min_pairs: int = 2) -> dict:
         s["values"] = len(vals)
         s["tps_gain"] = round(max(tp), 2) if len(tp) >= min_pairs else None
         s["vram_gain"] = round(max(vp), 2) if len(vp) >= min_pairs else None
+
+    # spec-ось измеряется отдельно (A/B), а не в общей сетке
+    ab = spec_effect(runs)
+    if "spec" in CONFIG_KEY or True:
+        s = stats.setdefault("spec", {"pairs": 0, "tps_gain": None,
+                                      "vram_gain": None, "values": 0,
+                                      "mode": "ab"})
+        if ab:
+            s["unique"] = ab.get("unique", {}).get("gain")
+            s["repetitive"] = ab.get("repetitive", {}).get("gain")
+            s["pairs"] = sum(v["pairs"] for v in ab.values())
+            s["values"] = 2 if s["repetitive"] else 0
+            # в линейную сетку ось не идёт, но приоритет отражает повторы
+            s["tps_gain"] = s["repetitive"]
     return stats
 
 
@@ -362,6 +414,9 @@ def order(learned: dict | None = None, present: set[str] | None = None) -> list[
     scored = []
     for a in AXES:
         key = a["key"]
+        if a.get("mode") == "ab" and present is None:
+            # в сетку не идёт: эффект знакопеременный, решается A/B-прогоном
+            continue
         if present is not None:
             # именно скобки: в Python `&` приоритетнее `|`, и без них
             # объединение с непустым множеством алиасов всегда истинно —
@@ -389,16 +444,27 @@ def order(learned: dict | None = None, present: set[str] | None = None) -> list[
 
 
 def explain(learned: dict | None = None) -> list[dict]:
-    """Человекочитаемая таблица: приоритет, причина, что говорят замеры."""
+    """Человекочитаемая таблица: приоритет, причина, что говорят замеры.
+
+    В отличие от `order()`, включает оси с `mode="ab"`: они не идут в сетку,
+    но человеку их видеть надо — иначе самый большой рычаг выглядит как
+    отсутствующий.
+    """
     learned = learned if learned is not None else learn()
     rows = []
-    for key in order(learned):
+    grid = order(learned)
+    ab_keys = [a["key"] for a in sorted(
+        (a for a in AXES if a.get("mode") == "ab"),
+        key=lambda a: -a["gain"])]
+    for key in ab_keys + grid:
         a = BY_KEY[key]
         ev = learned.get(key) or {}
         rows.append({
             "key": key,
             "flag": a["flag"],
             "prior": a["gain"],
+            "mode": a.get("mode", "grid"),
+            "measured": a.get("measured"),
             "why": a["why"],
             "pairs": ev.get("pairs", 0),
             "values": ev.get("values", 0),

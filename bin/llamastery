@@ -1398,6 +1398,21 @@ def cmd_axes(args) -> int:
             if r["pairs"] and r["values"] > 1 else ""
         print(f"  {i}. {r['key']:<14} {r['flag']:<18} приоритет {r['prior']}{mark}")
         print(f"     {r['why']}")
+    spec = rows_by_key = next((r for r in rows if r["key"] == "spec"), None)
+    if spec:
+        m = spec.get("measured") or {}
+        print("\nотдельно: спекулятивный декодер (ось со знаком, не сетка)")
+        print("  измеренный эффект: повторяющийся текст x%s, уникальный x%s"
+              % (m.get("repetitive"), m.get("unique")))
+        print("  приоритет высокий, но знакопеременный: на уникальном тексте")
+        print("  он почти бесполезен, поэтому в общую сетку осей не входит.")
+        ev = learned.get("spec") or {}
+        if ev.get("repetitive"):
+            print(f"  твой свежий A/B: повторы x{ev['repetitive']}, "
+                  f"уникальный x{ev.get('unique')}")
+        else:
+            print("  свежего A/B в tune-results нет — приоритет взят из docs.")
+
     b = builds.get(args.build)
     if b is not None:
         new = axes.discover(b.server_bin)

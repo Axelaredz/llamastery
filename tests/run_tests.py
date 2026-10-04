@@ -967,6 +967,40 @@ def test_axes_learn_only_isolated_pairs() -> None:
     check("fa" not in learned, "неизменённая ось не попадает в вывод")
 
 
+def test_axes_spec_is_ab_not_grid() -> None:
+    """ngram — самый большой рычаг, но в сетку осей он не годится.
+
+    Одно число «прирост» тут обманывает: на повторяющемся тексте ×3.2, на
+    уникальном ×1.05. Поэтому ось помечена mode=ab, в сетку не попадает, но
+    в отчёте видна первой — иначе выглядит, будто её нет.
+    """
+    from lib import axes as A
+
+    print("axes: spec — отдельный A/B")
+    spec = A.BY_KEY["spec"]
+    check(spec.get("mode") == "ab", "ось помечена как A/B", spec.get("mode"))
+    check(spec["gain"] == 5, "приоритет высокий (измерен x3.2)", spec["gain"])
+    check(spec["measured"]["repetitive"] > 3.0 and
+          spec["measured"]["unique"] < 1.2,
+          "две оценки: повторы против уникального", spec["measured"])
+
+    grid = A.order(learned={})
+    check("spec" not in grid, "в линейную сетку ось не идёт", grid)
+    rows = A.explain(learned={})
+    check(rows[0]["key"] == "spec", "в отчёте ось видна первой", rows[0]["key"])
+    check(any(r["key"] == "spec" and r["mode"] == "ab" for r in rows),
+          "помечена как A/B в отчёте")
+
+    # A/B-числа читаются из результатов прогонов
+    fake = [{"ok": True, "config": {},
+             "spec_ab": {"tg_unique_plain": 30.0, "tg_unique_spec": 29.0,
+                         "tg_repetitive_plain": 26.0, "tg_repetitive_spec": 92.0}}]
+    eff = A.spec_effect(fake)
+    check(eff["repetitive"]["gain"] == 3.54, "прирост на повторах x3.54", eff)
+    check(eff["unique"]["gain"] == 0.97, "на уникальном ~x1", eff)
+    check(A.spec_effect([]) == {}, "без A/B пусто", A.spec_effect([]))
+
+
 def test_axes_order_respects_evidence() -> None:
     """Замеры переставляют порядок, но не могут выкинуть ось совсем."""
     from lib import axes as A
@@ -976,12 +1010,24 @@ def test_axes_order_respects_evidence() -> None:
     check(base[0] == "moe", "без замеров первым moe", base)
     check(base.index("moe") < base.index("fa"), "moe выше fa", base)
 
-    loud_spec = {"spec": {"pairs": 12, "values": 3, "tps_gain": 4.0,
-                          "vram_gain": 1.0}}
-    got = A.order(learned=loud_spec)
-    check(got.index("spec") < got.index("threads"),
-          "измеренный x4 поднял spec выше threads", got)
+    # измеренный эффект оси действительно переставляет порядок
+    loud = {"fa": {"pairs": 12, "values": 3, "tps_gain": 4.0,
+                   "vram_gain": 1.0}}
+    loud_order = A.order(learned=loud)
+    check(loud_order.index("fa") < base.index("fa"),
+          "измеренный x4 поднял fa вверх", (base, loud_order))
+    # moe тоже 5.0 — при равенстве порядок реестра сохраняется (сортировка
+    # стабильная), поэтому fa встаёт сразу за ним, а не вместо
+    check(loud_order[:2] == ["moe", "fa"], "fa поднялась к moe", loud_order)
+
+    # ось с реальным эффектом переставляется (в пределах линейных)
+    real = {"threads": {"pairs": 12, "values": 3, "tps_gain": 3.0,
+                        "vram_gain": 2.0}}
+    got = A.order(learned=real)
+    check(got.index("threads") < got.index("fa"),
+          "измеренный эффект поднял threads выше fa", got)
     check(len(got) == len(base), "оси не теряются", (got, base))
+    check("spec" not in got, "A/B-ось не попадает в сетку", got)
 
     # шум (одна пара) не переставляет ничего
     noise = {"fa": {"pairs": 1, "values": 2, "tps_gain": 9.0, "vram_gain": 9.0}}
