@@ -15,10 +15,12 @@
     логику команд.
 """
 
+import ast
 import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from . import builds, budget, gguf, measure, paths, presets, server, swap, vram
@@ -640,19 +642,72 @@ def _do_router(action: str, build: str | None = None) -> int:
     return 1
 
 
-def _tune_argv(build: str | None, preset: str, pairs: dict) -> list[str]:
-    """Аргументы `llamastery tune` для пресета.
+TUNE_SEARCH_CTX = 16384   # подбор на коротком KV, глубину проверяют отдельно
 
-    Отдельная функция не для красоты: команду и печатает человек, и выполняет
-    мастер, а раньше мастер только печатал её и тихо заканчивал — «да»
-    означало «ничего не произойдёт».
+
+@lru_cache(maxsize=1)
+def _tuner_options() -> frozenset[str]:
+    """Флаги, которые реально понимает tools/tune_models.py.
+
+    Читаем argparse из исходника, а не гадаем: `--extra c=131072` превращается
+    в `--c`, которого у тюнера нет, и весь прогон падает на usage. Ошибка
+    стоила 10-30 минут ожидания, поэтому сверяемся перед запуском.
+    """
+    src = (Path(__file__).resolve().parent.parent / "tools" / "tune_models.py")
+    try:
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return frozenset()
+    out = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"):
+            continue
+        for arg in node.args:
+            if (isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                    and arg.value.startswith("-")):
+                out.add(arg.value.lstrip("-").replace("-", "_"))
+    return frozenset(out)
+
+
+def _tune_argv(build: str | None, preset: str, pairs: dict) -> list[str]:
+    """Аргументы `llamastery tune` — только те, что понимает тюнер.
+
+    Контекст, n-cpu-moe и ubatch передавать не нужно: `c` тюнер берёт из
+    пресета сам, а n-cpu-moe и ubatch — это его оси поиска (`--moe-values`,
+    `--ubatch-values`), а не входные параметры. Единственный рычаг для
+    «долго, но не часы» — `--search-ctx`: подбор идёт на коротком KV, полную
+    глубину потом проверяют отдельно (budget + probe).
     """
     argv = ["tune", str(paths.default_ini()), preset]
     if build:
         argv += ["--build", build]
-    return argv + ["--extra", f"c={pairs.get('c', 32768)}",
-                   f"n-cpu-moe={pairs.get('n-cpu-moe', 0)}",
-                   "ubatch=1024", "reserve=1024", "min-tps=25"]
+    c = _int(pairs.get("c"))
+    if c > TUNE_SEARCH_CTX:
+        # иначе 10-30 мин не уложились бы: каждый кандидат проверяется на
+        # полном KV. Короткий поиск + глубокая проверка победителя отдельно —
+        # ровно то, что советует сам тюнер в README.
+        # формат именно search-ctx=NNN: cmd_tune превращает «k=v» в «--k v»,
+        # а отдельное значение без «=» стало бы флагом «--16384»
+        argv += ["--extra", f"search-ctx={TUNE_SEARCH_CTX}"]
+    return argv
+
+
+def _tune_unknown_keys(argv: list[str]) -> list[str]:
+    """Ключи из --extra, которых тюнер не знает (пусто — всё в порядке)."""
+    if "--extra" not in argv:
+        return []
+    opts = _tuner_options()
+    if not opts:
+        return []
+    tail = argv[argv.index("--extra") + 1:]
+    bad = []
+    for item in tail:
+        key = item.split("=", 1)[0].lstrip("-").replace("-", "_")
+        if key and key not in opts:
+            bad.append(key)
+    return bad
 
 
 def _fit_mib(pairs: dict, total_mib: int | None,
@@ -714,7 +769,16 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
         if ask_yn("выгрузить перед автотюном?", True,
                   sub="иначе тюнеру не хватит памяти и прогоны упадут"):
             _run_cli("runtime", "unload")
-    rc = _run_cli(*_tune_argv(build, preset, pairs))
+    argv = _tune_argv(build, preset, pairs)
+    unknown = _tune_unknown_keys(argv)
+    if unknown:
+        # не запускаем заведомо неработающую команду: тюнер молча упал бы на
+        # usage, а человек — 10-30 минут на то, чтобы увидеть ошибку argparse
+        warn("тюнер не знает флагов: " + ", ".join(unknown))
+        note("похоже, тюнер и мастер разошлись во флагах — "
+             "llamastery axes refresh")
+        return 1
+    rc = _run_cli(*argv)
     if rc:
         warn(f"тюнер вернул код {rc}")
     else:

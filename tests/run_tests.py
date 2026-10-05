@@ -1687,17 +1687,32 @@ def test_wizard_tune_actually_runs(tmp: Path) -> None:
 
     from lib import server as S
 
-    argv = wizard._tune_argv("faks", "base-mmproj",
-                             {"c": "131072", "n-cpu-moe": "16"})
+    argv = wizard._tune_argv("faks", "base-mmproj", {"c": "131072"})
     check(argv[:4] == ["tune", str(paths.default_ini()), "base-mmproj",
                        "--build"], "тюнер зовёт тот же ini и сборку", argv)
-    check("c=131072" in argv and "n-cpu-moe=16" in argv,
-          "параметры пресета уходят в --extra", argv)
-    check(argv[-5:] == ["--extra", "c=131072", "n-cpu-moe=16", "ubatch=1024",
-                        "reserve=1024"][-5:] or "min-tps=25" in argv,
-          "reserve/min-tps на месте", argv)
-    check(wizard._tune_argv(None, "p", {})[:2] == ["tune", str(paths.default_ini())],
+    # Регрессия: мастер выдумывал ключи и отдавал `--c`, `--n-cpu-moe`,
+    # `--ubatch`, которых у тюнера нет → падение на usage после 10-30 минут
+    # ожидания. Проверяем по НАСТОЯЩЕМУ argparse тюнера, а не по списку.
+    check(not wizard._tune_unknown_keys(argv), "все флаги тюнер понимает",
+          wizard._tune_unknown_keys(argv))
+    check(wizard._tune_unknown_keys(
+        ["tune", "x", "y", "--extra", "c=131072", "n-cpu-moe=0", "ubatch=1024"])
+        == ["c", "n_cpu_moe", "ubatch"],
+        "старые выдуманные ключи ловятся")
+    check("search-ctx=16384" in argv,
+          "длинный контекст → подбор на коротком KV", argv)
+    check("--extra" not in wizard._tune_argv("faks", "p", {"c": "8192"}),
+          "короткий контекст — ничего лишнего не передаём")
+    check(wizard._tune_argv(None, "p", {})[:2]
+          == ["tune", str(paths.default_ini())],
           "без сборки --build не подставляется")
+    # тюнер берёт c из пресета сам, поэтому передавать его не нужно
+    tuner = wizard._tuner_options()
+    check("contexts" in tuner and "search_ctx" in tuner,
+          "флаги тюнера читаются из его исходника", len(tuner))
+    check(not ({"c", "n_cpu_moe", "ubatch"} & tuner),
+          "таких флагов у тюнера действительно нет",
+          sorted({"c", "n_cpu_moe", "ubatch"} & tuner))
 
     saved_status = S.status
     saved_vram = wizard.vram.gpu_used_mib
