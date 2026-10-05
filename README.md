@@ -35,6 +35,10 @@ bin/llamastery                         # мастер настройки (или
 возможно) → сборка → swap → модели → пресет → контекст → зрение → ускорители →
 план. На любом экране `0` — вернуться на шаг назад.
 
+Модели, которой нет в пресете, можно указать прямо в мастере: в конце списка
+пресетов есть пункт `▸ свой .gguf — указать путь`. Он прочитает файл, спросит,
+чьи флаги копировать, и допишет новую секцию в `models.ini` (с бэкапом).
+
 Подобрать параметры пресета автоматически (долго, грузит GPU — запускай в
 свободное время):
 
@@ -252,6 +256,11 @@ The wizard: state → "what are we doing" (router/swap/preset — only what is
 possible right now) → build → swap → models → preset → context → vision →
 accelerators → plan. `0` goes back one step on any screen.
 
+A model that is not in the preset can be pointed at right in the wizard: the
+preset list ends with `▸ свой .gguf — указать путь` (your own .gguf — give a
+path). It reads the file, asks which preset's flags to copy, and appends a new
+section to `models.ini` (with a backup).
+
 Tune a preset automatically (slow, loads the GPU — run it when idle):
 
 ```bash
@@ -371,6 +380,10 @@ bin/llamastery                         # 设置向导（或 bin/llamastery wizar
 
 向导：状态 → 「做什么」（router/swap/preset — 只列当前可行的）→ 构建 → swap →
 模型 → preset → 上下文 → 视觉 → 加速器 → 计划。任何界面按 `0` 返回上一步。
+
+preset 里没有的模型可以直接在向导里指定：preset 列表末尾有
+`▸ свой .gguf — указать путь`（自己的 .gguf — 给出路径）。向导会读取文件、
+询问沿用哪个 preset 的参数，并把新段写进 `models.ini`（先备份）。
 
 自动调优 preset（耗时、占用 GPU，请空闲时运行）：
 

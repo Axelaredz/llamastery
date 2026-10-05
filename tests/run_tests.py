@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from lib import budget, gguf, inifile, measure, presets, schema, swap, validate, wizard  # noqa: E402
+from lib import budget, gguf, inifile, measure, paths, presets, schema, swap, validate, wizard  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -1356,6 +1356,421 @@ def test_wizard_defaults(tmp: Path) -> None:
     reg2 = {"ik": _mk("ik2", False), "upstream": _mk("up", True)}
     check(wizard.recommend_build(reg2) == "upstream", "без faks — роутерная")
     check(wizard.recommend_build({}) is None, "пусто — None")
+
+
+CUSTOM_INI = """; шапка с комментарием — должна выжить
+[*]
+n-gpu-layers = 99
+fa = true
+
+; база с mmproj, драфтом и завышенным контекстом
+[base-mmproj]
+model = /старый/base.gguf
+mmproj = /старый/mmproj-Q8_0.gguf
+mmproj-offload = 0
+image-min-tokens = 1024
+model-draft = /старый/draft.gguf
+spec-type = draft-mtp
+n-cpu-moe = 999
+c = 131072
+ubatch-size = 512
+"""
+
+
+def _write_fake_gguf(path: Path, ctx_trained: int = 32768, layers: int = 40,
+                     moe: bool = True, nextn: int = 0) -> Path:
+    import struct
+
+    kv = {
+        "general.architecture": "qwen35moe",
+        "qwen35moe.block_count": layers,
+        "qwen35moe.embedding_length": 2048,
+        "qwen35moe.attention.head_count": 16,
+        "qwen35moe.attention.head_count_kv": 2,
+        "qwen35moe.attention.key_length": 256,
+        "qwen35moe.context_length": ctx_trained,
+        "qwen35moe.nextn_predict_layers": nextn,
+    }
+    if moe:
+        kv["qwen35moe.expert_count"] = 256
+        kv["qwen35moe.expert_feed_forward_length"] = 512
+
+    def s(x):
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+
+    out = [b"GGUF", struct.pack("<I", 3), struct.pack("<Q", 0),
+           struct.pack("<Q", len(kv))]
+    for k, v in kv.items():
+        out.append(s(k))
+        out.append(struct.pack("<I", 8 if isinstance(v, str) else 4) +
+                   (s(v) if isinstance(v, str)
+                    else struct.pack("<i", v)))
+    path.write_bytes(b"".join(out) + b"\0" * 4096)
+    return path
+
+
+def test_wizard_custom_gguf_preset(tmp: Path) -> None:
+    """Пункт «свой .gguf»: путь → секция в models.ini → валидный пресет.
+
+    Регрессия: список пресетов показывал только то, что уже в ini, поэтому
+    файл, скачанный мимо пресета, было некуда указать — приходилось
+    редактировать models.ini руками.
+    """
+    print("wizard: свой .gguf → новая секция в ini")
+
+    # ── имя секции из имени файла ──
+    check(wizard.section_name_for("/models/Qwen3.5-9B Q4_K_M.gguf", [])
+          == "qwen3.5-9b-q4_k_m", "имя из файла, пробелы → дефисы")
+    check(wizard.section_name_for("/models/base.gguf", ["base"]) == "base-2",
+          "занятое имя не затирается")
+    check(wizard.section_name_for("/models/base.gguf", ["base", "base-2"])
+          == "base-3", "нумерация до свободного")
+    check(wizard.section_name_for("/models/???.gguf", []),
+          "имя из одних знаков префикса не пусто")
+
+    # ── пункт в списке: всегда последний, ★-дефолт не уезжает ──
+    ini = inifile.IniFile(tmp / "models.ini", CUSTOM_INI)
+    opts, sections, default_name = wizard._preset_options(ini)
+    plain = [o[0] for o in opts]
+    opts_c, sections_c, default_c = wizard._preset_options(ini, custom=True)
+    with_custom = [o[0] for o in opts_c]
+    check(with_custom[-1] == wizard.CUSTOM_MODEL,
+          "пункт «свой .gguf» последний в списке", with_custom)
+    check(with_custom[:-1] == plain, "нумерация существующих секций не сдвинулась")
+    check(sections_c == sections and default_c == default_name,
+          "★-дефолт тот же")
+    check(sections.index(default_name) + 1 == 1,
+          "дефолт указывает на первую секцию")
+
+    # ── флаги базы, но без её файлов и с зажимом по метаданным ──
+    meta = gguf.probe(_write_fake_gguf(tmp / "meta.gguf"))
+    pairs = wizard.pairs_for_custom_model(
+        ini.section("base-mmproj").pairs(), "/models/новый.gguf", meta, None)
+    check(pairs["model"] == "/models/новый.gguf", "model = свой файл")
+    check(not any(k.lower() in ("mmproj", "model-draft", "image-min-tokens",
+                                "hf-repo", "hf-file")
+                  for k in pairs),
+          "файловые ключи базы не унаследованы", sorted(pairs))
+    check(pairs["c"] == "32768", "контекст зажат по обученному окну", pairs["c"])
+    check(pairs["n-cpu-moe"] == "40", "n-cpu-moe зажат по слоям", pairs["n-cpu-moe"])
+    check(pairs["spec-type"] == "ngram-mod",
+          "драфт-головы нет — ускоритель заменён", pairs["spec-type"])
+    check(pairs["ubatch-size"] == "512",
+          "остальные флаги базы скопированы", pairs)
+    check("n-gpu-layers" not in pairs,
+          "глобали из [*] в секцию не дублируются — их и так подставит роутер",
+          sorted(pairs))
+    with_mm = wizard.pairs_for_custom_model(
+        ini.section("base-mmproj").pairs(), "/models/новый.gguf", meta,
+        "/models/mmproj-Q8_0.gguf")
+    check(with_mm["mmproj"] == "/models/mmproj-Q8_0.gguf"
+          and with_mm["mmproj-offload"] == "0",
+          "найденный рядом mmproj подхвачен с offload=0", with_mm)
+    dense = gguf.probe(_write_fake_gguf(tmp / "dense.gguf", moe=False))
+    d = wizard.pairs_for_custom_model({"n-cpu-moe": "16", "c": "8192"},
+                                      "/models/d.gguf", dense)
+    check("n-cpu-moe" not in d, "плотной модели n-cpu-moe не нужен", d)
+    check(wizard.pairs_for_custom_model({}, "/x.gguf")["model"] == "/x.gguf",
+          "без метаданных секция всё равно собирается")
+    mtp = gguf.probe(_write_fake_gguf(tmp / "mtp.gguf", nextn=1))
+    check(wizard.pairs_for_custom_model({"spec-type": "draft-mtp"}, "/x.gguf", mtp)
+          ["spec-type"] == "draft-mtp", "MTP-голова внутри модели — оставляем")
+
+    # ── весь экран: путь → чьи флаги → запись ──
+    model = _write_fake_gguf(tmp / "My Model!! Q4.gguf", ctx_trained=65536)
+    (tmp / "mmproj-Q8_0.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+    ini_path = tmp / "models.ini"
+    ini_path.write_text(CUSTOM_INI, encoding="utf-8")
+    ini = inifile.IniFile(ini_path, CUSTOM_INI)
+    answers = iter([str(model), "1", "y"])   # путь, чьи флаги, дописать
+    orig_read = wizard._read
+    wizard._read = lambda prompt: next(answers)
+    try:
+        name = wizard._custom_preset(ini)
+    finally:
+        wizard._read = orig_read
+    check(name == "my-model-q4", "имя новой секции", name)
+    new = ini.section(name)
+    check(new is not None and new.pairs().get("model") == str(model),
+          "секция появилась в ini в памяти")
+    written = ini_path.read_text(encoding="utf-8")
+    check(f"[{name}]" in written, "секция записана на диск")
+    check("создано мастером" in written, "помечено, откуда секция")
+    check("; шапка с комментарием — должна выжить" in written,
+          "комментарии файла не потеряны")
+    check(any(".bak-" in p.name for p in tmp.iterdir()), "сделана резервная копия")
+
+    # запись действительна: validate по схеме не спотыкается о мусор
+    rep = validate.Report()
+    meta2 = validate.validate_section(name, ini.section(name).pairs(),
+                                      schema.parse_help(HELP), rep,
+                                      check_paths=True)
+    check(meta2 is not None and meta2.n_ctx_trained == 65536,
+          "validate читает модель новой секции")
+    check(not any(f.level == "error" for f in rep.findings),
+          "по новой секции ошибок нет", [f.line() for f in rep.findings])
+
+    # ── отказ не оставляет мусора ──
+    ini2 = inifile.IniFile(ini_path, CUSTOM_INI)
+    answers2 = iter([str(model), "1", "n"])
+    wizard._read = lambda prompt: next(answers2)
+    try:
+        rc = wizard._custom_preset(ini2)
+    finally:
+        wizard._read = orig_read
+    check(rc is None, "отказ = None, мастер вернётся к списку", rc)
+    check(ini2.section("my-model-q4") is None and
+          "[my-model-q4]" not in ini2.dumps(), "отказ ничего не записал")
+
+    # ── поток настройки ведёт в этот пункт ──
+    src = (Path(__file__).resolve().parents[1] / "lib" / "wizard.py"
+           ).read_text(encoding="utf-8")
+    check("_preset_options(ini, custom=True)" in src,
+          "поток настройки предлагает свой .gguf")
+    check(src.count("_custom_preset(ini)") >= 1, "пункт обрабатывается потоком")
+
+
+def _wizard_env(tmp: Path, answers: list[str]):
+    """Подменяет ввод, запуск CLI и окружение мастера. Возвращает (calls, out)."""
+    import contextlib
+    import io
+    from lib import builds as B
+
+    ini_path = tmp / "models.ini"
+    ini_path.write_text(CUSTOM_INI, encoding="utf-8")
+    d = tmp / "ik"
+    (d / "build" / "bin").mkdir(parents=True, exist_ok=True)
+    (d / "build" / "bin" / "llama-server").touch()
+    fake = {"ik": B.Build(name="ik", path=str(d), router=False)}
+
+    calls: list = []
+    queue = iter(answers)
+    out = io.StringIO()
+    saved = {k: getattr(wizard, k) for k in ("_read", "_run_cli")}
+    saved_ini = wizard.paths.default_ini
+    saved_reg = wizard.builds.all_builds
+    saved_swap = wizard.swap.find_binary
+
+    def fake_read(prompt):
+        try:
+            return next(queue)
+        except StopIteration:
+            raise AssertionError(f"вопросов больше, чем ответов: {prompt!r}")
+
+    wizard._read = fake_read
+    wizard._run_cli = lambda *a, **k: (calls.append(a), 0)[1]
+    wizard.paths.default_ini = lambda: ini_path
+    wizard.builds.all_builds = lambda: fake
+    wizard.swap.find_binary = lambda: Path("/usr/bin/llama-swap")
+
+    class _Env:
+        def __enter__(self):
+            self.buf = contextlib.redirect_stdout(out)
+            self.buf.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            self.buf.__exit__(*exc)
+            for k, v in saved.items():
+                setattr(wizard, k, v)
+            wizard.paths.default_ini = saved_ini
+            wizard.builds.all_builds = saved_reg
+            wizard.swap.find_binary = saved_swap
+            return False
+
+        @property
+        def text(self):
+            return out.getvalue()
+
+    return _Env(), calls
+
+
+def test_wizard_zero_goes_back_everywhere(tmp: Path) -> None:
+    """0 = на шаг назад на КАЖДОМ экране, а не «да» и не выполнение шага.
+
+    Регрессия: ask_yn возвращал на 0 строку «◄ назад», а она непустая —
+    поэтому `if ask_yn(...)` принимал «назад» за «да»: мастер ставил
+    llama-swap, печатал команду тюна, писал секцию в models.ini и выполнял
+    validate+budget. Теперь 0 поднимает _GoBack, и его ловит Nav.walk.
+    """
+    print("wizard: 0 = назад везде")
+
+    # 0 на первом экране потока → в меню, ничего не выполнено
+    env, calls = _wizard_env(tmp, ["0"])
+    with env:
+        rc = wizard._setup_flow("http://127.0.0.1:8087")
+    check(rc == "menu", "0 на первом экране = в меню", rc)
+    check(not calls, "0 не выполнил ни одной команды", calls)
+    check("ответ: " + wizard.BACK in env.text, "ответ показан как назад")
+
+    # 0 на последнем экране (выполнить шаги) → тоже в меню, и НЕ выполняет
+    env, calls = _wizard_env(tmp, ["1", "1", "n", "", "n", "n", "0"])
+    with env:
+        rc = wizard._setup_flow("http://127.0.0.1:8087")
+    check(rc == "menu", "0 на последнем экране = в меню", rc)
+    check(not calls, "0 не выполнил validate/budget", calls)
+    check("план" in env.text, "план успели показать до отката")
+
+    # 0 на экране ускорителей → откат на «зрение», ответ перезаписан заново.
+    # Старый код клал в res строку «◄ назад», и план писал ngram=да
+    env, calls = _wizard_env(tmp, ["1", "1", "n", "", "0", "n", "y", "n"])
+    with env:
+        rc = wizard._setup_flow("http://127.0.0.1:8087")
+    check(rc == 0, "после отката поток доходит до конца", rc)
+    check("ngram=нет" in env.text and "ngram=да" not in env.text,
+          "«назад» не записался в ответ как «да»",
+          [ln for ln in env.text.splitlines() if "ngram=" in ln])
+    check(not calls, "финальный вопрос без 0 — шаги не выполнялись", calls)
+
+    # 0 внутри диалога «свой .gguf» → назад к списку пресетов, не к swap
+    model = _write_fake_gguf(tmp / "Custom.gguf")
+    env, calls = _wizard_env(tmp, ["1", "2", "0", "1", "n", "", "n", "y", "n"])
+    with env:
+        rc = wizard._setup_flow("http://127.0.0.1:8087")
+    check(rc == 0, "откат из своего .gguf вернул к списку и дошёл до плана", rc)
+    check(env.text.rindex("какой пресет берём за основу")
+          > env.text.rindex("· путь к .gguf"),
+          "после 0 в диалоге снова показан список пресетов")
+    check(not calls, "откат ничего не выполнил", calls)
+    check("[custom]" not in (tmp / "models.ini").read_text(encoding="utf-8"),
+          "откат не записал секцию")
+
+    # 0 в «Загрузить или сменить пресет» → в меню, ничего не грузим
+    env, calls = _wizard_env(tmp, ["0"])
+    with env:
+        rc = wizard._preset_flow("http://127.0.0.1:8087")
+    check(rc == "menu", "0 в потоке пресета = в меню", rc)
+    check(not calls, "0 не грузил модель", calls)
+
+    # 0 в главном меню = выход, и ask_* больше не отдают «назад» значением
+    env, _ = _wizard_env(tmp, ["0"])
+    with env:
+        rc, action = wizard._main_menu("http://127.0.0.1:8087")
+    check(rc == 0 and action is None, "0 в меню = выход", (rc, action))
+    for fn, args in ((wizard.ask_yn, ("t", True)), (wizard.ask_text, ("t", "")),
+                     (wizard.ask_pick, ("t", [("a", "")], 1))):
+        env, _ = _wizard_env(tmp, ["0"])
+        with env:
+            try:
+                fn(*args)
+                raised = False
+            except wizard._GoBack:
+                raised = True
+        check(raised, f"{fn.__name__} на 0 бросает _GoBack, а не значение")
+    check(wizard.is_back(wizard.BACK) and not wizard.is_back(False),
+          "is_back отличает «назад» от ответа")
+
+    # страховка от повторов этой ошибки: вопрос не должен отдавать «назад» значением
+    src = (Path(__file__).resolve().parents[1] / "lib" / "wizard.py"
+           ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    questions = {"ask", "ask_pick", "ask_yn", "ask_text"}
+    offenders = [f"{n.name}:{r.lineno}"
+                 for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name in questions
+                 for r in ast.walk(n)
+                 if isinstance(r, ast.Return) and isinstance(r.value, ast.Name)
+                 and r.value.id == "BACK"]
+    check(not offenders, "вопросы не отдают «назад» значением", offenders)
+    check("except _GoBack:" in src, "экраны вне Nav ловят _GoBack")
+
+
+def test_wizard_tune_actually_runs(tmp: Path) -> None:
+    """Ответ «да» на автотюн запускает тюнер, а не только печатает команду.
+
+    Регрессия: s_tune печатал `команда: llamastery tune …` и сразу переходил
+    к следующему вопросу — тюнер не запускался никогда, а человек оставался
+    с belief, что GPU сейчас занят на 100%.
+    """
+    print("wizard: автотюн запускается")
+
+    from lib import server as S
+
+    argv = wizard._tune_argv("faks", "base-mmproj",
+                             {"c": "131072", "n-cpu-moe": "16"})
+    check(argv[:4] == ["tune", str(paths.default_ini()), "base-mmproj",
+                       "--build"], "тюнер зовёт тот же ini и сборку", argv)
+    check("c=131072" in argv and "n-cpu-moe=16" in argv,
+          "параметры пресета уходят в --extra", argv)
+    check(argv[-5:] == ["--extra", "c=131072", "n-cpu-moe=16", "ubatch=1024",
+                        "reserve=1024"][-5:] or "min-tps=25" in argv,
+          "reserve/min-tps на месте", argv)
+    check(wizard._tune_argv(None, "p", {})[:2] == ["tune", str(paths.default_ini())],
+          "без сборки --build не подставляется")
+
+    saved_status = S.status
+    saved_vram = wizard.vram.gpu_used_mib
+    saved_total = wizard.vram.gpu_total_mib
+    saved_fit = wizard._fit_mib
+    S.status = lambda: {"models": [{"id": "cyber", "status": "loaded"}]}
+    wizard.vram.gpu_used_mib = lambda: 10607
+    wizard.vram.gpu_total_mib = lambda: 12288
+    wizard._fit_mib = lambda pairs, total, reserve_mib=1024: 4096.0
+    try:
+        # сборка → пресет → автотюн=да → контекст → ngram → mtp → «выполнить»
+        env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y", "y"])
+        with env:
+            rc = wizard._setup_flow("http://127.0.0.1:8087")
+        check(rc == 0, "поток дошёл до конца", rc)
+        flat = [" ".join(c) for c in calls]
+        check(any(c.startswith("tune ") for c in flat), "тюнер запущен", flat)
+        check(flat.index("validate base-mmproj --build ik")
+              < next(i for i, c in enumerate(flat) if c.startswith("tune ")),
+              "сначала быстрые проверки, потом долгий тюн", flat)
+        check(any(c == "runtime unload" for c in flat),
+              "модель выгружена перед тюном (иначе не хватит VRAM)", flat)
+        check(env.text.index("выполнить автотюн") > 0,
+              "про автотюн спросили явно")
+        check("автотюн вернул код" not in env.text,
+              "тюнер отработал без ошибки")
+
+        # без согласия на автотюн его нет и в плане, и в запуске
+        env, calls = _wizard_env(tmp, ["1", "1", "n", "", "n", "n", "y"])
+        with env:
+            rc = wizard._setup_flow("http://127.0.0.1:8087")
+        check(rc == 0 and not any(c[0] == "tune" for c in calls),
+              "без «да» тюнер не запускается", calls)
+
+        # 0 на финальном вопросе — тюнер тоже не стартует
+        env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "0"])
+        with env:
+            rc = wizard._setup_flow("http://127.0.0.1:8087")
+        check(rc == "menu" and not calls,
+              "0 на финальном вопросе отменяет и тюн", (rc, calls))
+
+        # пресет, который заведомо не влезает, тюнить бессмысленно
+        wizard._fit_mib = lambda pairs, total, reserve_mib=1024: 60.0 * 1024
+        env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y", "n"])
+        with env:
+            rc = wizard._setup_flow("http://127.0.0.1:8087")
+        check(not any(c[0] == "tune" for c in calls),
+              "не влезающий пресет тюнить не запустили", calls)
+        check("не влезает" in env.text and "не запускаю" in env.text,
+              "и сказано почему")
+        # но если человек настоял — запускаем (после выгрузки модели)
+        env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y", "y", "y"])
+        with env:
+            wizard._setup_flow("http://127.0.0.1:8087")
+        check(any(c[0] == "tune" for c in calls),
+              "настойчивый «да» перекрывает предупреждение", calls)
+    finally:
+        S.status = saved_status
+        wizard.vram.gpu_used_mib = saved_vram
+        wizard.vram.gpu_total_mib = saved_total
+        wizard._fit_mib = saved_fit
+
+    # _fit_mib: те же числа, что у budget, и None там, где считать нечем
+    fake = _write_fake_gguf(tmp / "fit.gguf")
+    pairs = {"model": str(fake), "c": "32768"}
+    need = wizard._fit_mib(pairs, 12288)
+    check(need is not None and 1000 < need < 12288 - 1024,
+          "потребление посчитано теми же числами, что budget", need)
+    check(wizard._fit_mib(pairs, None) is None, "без VRAM не считаем")
+    check(wizard._fit_mib({"model": "/нет/такого.gguf"}, 12288) is None,
+          "нечитаемая модель — None, а не выдуманный ноль")
+    check(wizard._fit_mib({"c": "32768"}, 12288) is None,
+          "пресет без model — None")
 
 
 def test_probe_retries_on_immediate_stop() -> None:

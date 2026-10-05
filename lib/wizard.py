@@ -15,11 +15,12 @@
     логику команд.
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-from . import builds, measure, paths, server, swap, vram
+from . import builds, budget, gguf, measure, paths, presets, server, swap, vram
 
 STAR = "★"
 ARROW = "│"
@@ -64,6 +65,23 @@ def warn(text: str) -> None:
 
 BACK = "◄ назад"
 MAX_STEPS = 500          # предохранитель от бесконечного «назад»
+MAX_SUBSTEP = 20         # столько же для откатов внутри одного экрана
+
+
+class _GoBack(Exception):
+    """Человек нажал 0 — вернуться на шаг назад.
+
+    Исключение, а не значение. Значение оказалось ловушкой: «◄ назад» —
+    непустая строка, поэтому `if ask_yn(...)` принимал её за «да» (ставил
+    llama-swap, печатал команду тюна, записывал секцию в models.ini).
+    Исключение невозможно принять за ответ: оно выходит из экрана наружу,
+    и его ловит Nav.walk() — тот и уводит на предыдущий экран.
+    """
+
+
+def is_back(v) -> bool:
+    """Значение — это «назад»? Для результатов ask_*, которые ещё не бросили."""
+    return v is BACK or v == BACK
 
 
 class Nav:
@@ -82,9 +100,10 @@ class Nav:
     def walk(self, steps: list[tuple]) -> dict | None:
         """steps: [(ключ, функция(answers))].
 
-        Функция возвращает значение или BACK. Возврат BACK уводит на
-        предыдущий экран; если он первый — возвращается None, и вызывающий
-        код показывает главное меню заново.
+        Функция возвращает значение или BACK, а нажатие 0 поднимает
+        _GoBack — то и другое уводит на предыдущий экран и переспрашивает
+        его. Если он первый — возвращается None, и вызывающий код показывает
+        главное меню заново.
         """
         self.i = 0
         self.stale = set()
@@ -94,8 +113,11 @@ class Nav:
             if not 0 <= self.i < len(steps):
                 return self.answers if self.i >= len(steps) else None
             key, fn = steps[self.i]
-            val = fn(self.answers)
-            if val is BACK or val == BACK:
+            try:
+                val = fn(self.answers)
+            except _GoBack:
+                val = BACK
+            if is_back(val):
                 if self.i == 0:
                     return None
                 self.i -= 1
@@ -116,11 +138,18 @@ def _read(prompt: str) -> str:
         raise SystemExit(130)
 
 
+def _go_back() -> None:
+    """Ответ «0»: печатаем, что сделали, и выходим из экрана на шаг назад."""
+    print(f"    {ARROW} ответ: {BACK}")
+    raise _GoBack
+
+
 def ask(title: str, options: list[tuple[str, str]], default: int,
         sub: str = "") -> int:
     """Вопрос с нумерованным списком. Печатает вопрос, ответ и итог.
 
     options: [(подпись, пояснение)]. Пункт с пометкой ★ — рекомендация.
+    На 0 бросает _GoBack, а не возвращает значение.
     """
     head(title, sub)
     for i, (label, desc) in enumerate(options, 1):
@@ -129,8 +158,7 @@ def ask(title: str, options: list[tuple[str, str]], default: int,
         print(f"    {i}.{mark} {label}{tail}")
     raw = _read(f"ответ (Enter = {default}, 0 = {BACK}) ▸")
     if raw == "0":
-        print(f"    {ARROW} ответ: {BACK}")
-        return BACK
+        _go_back()
     return clamp_choice(raw, len(options), default) - 1
 
 
@@ -138,8 +166,6 @@ def ask_pick(title: str, options: list[tuple[str, str]], default: int,
              sub: str = "") -> str:
     """Вопрос со списком → возвращает выбранную метку."""
     idx = ask(title, options, default, sub)
-    if idx == BACK:
-        return BACK
     label = options[idx][0]
     print(f"    {ARROW} ответ: {label}")
     return label
@@ -151,8 +177,7 @@ def ask_yn(title: str, default_yes: bool, sub: str = "") -> bool:
     raw = _read(f"{hint} {STAR} ответ (Enter = "
                 f"{'да' if default_yes else 'нет'}, 0 = {BACK}) ▸").lower()
     if raw == "0":
-        print(f"    {ARROW} ответ: {BACK}")
-        return BACK
+        _go_back()
     yes = default_yes if not raw else raw in ("y", "yes", "д", "да")
     print(f"    {ARROW} ответ: {'да' if yes else 'нет'}")
     return yes
@@ -160,10 +185,10 @@ def ask_yn(title: str, default_yes: bool, sub: str = "") -> bool:
 
 def ask_text(title: str, default: str, sub: str = "") -> str:
     head(title, sub)
-    raw = _read(f"Enter = {default}, 0 = {BACK} ▸")
+    hint = f"Enter = {default}, " if default else ""
+    raw = _read(f"{hint}0 = {BACK} ▸")
     if raw == "0":
-        print(f"    {ARROW} ответ: {BACK}")
-        return BACK
+        _go_back()
     val = raw or default
     print(f"    {ARROW} ответ: {val}")
     return val
@@ -218,6 +243,76 @@ def find_mmproj_sibling(names: list[str], current: str) -> str | None:
                 base in ln or ln.replace("-mmproj", "") == base):
             return n
     return None
+
+
+CUSTOM_MODEL = "▸ свой .gguf — указать путь"
+
+# ключи, которые указывают на ФАЙЛЫ чужой модели: переносить их в новую
+# секцию нельзя, иначе validate поймает путь, а load — несовместимость
+_PATH_KEYS = ("model", "m", "hf-repo", "hf-file", "mmproj", "model-draft",
+              "mmproj-offload", "image-min-tokens")
+
+
+def _int(val) -> int:
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def section_name_for(path: str, taken: list[str]) -> str:
+    """Имя секции для файла, которого в ini нет: из имени файла, без повторов."""
+    stem = re.sub(r"[^a-z0-9._-]+", "-", Path(path).stem.lower())
+    name = re.sub(r"-{2,}", "-", stem).strip("-.")[:48].strip("-") or "model"
+    low = {t.lower() for t in taken}
+    if name not in low:
+        return name
+    i = 2
+    while f"{name}-{i}" in low:
+        i += 1
+    return f"{name}-{i}"
+
+
+def pairs_for_custom_model(base: dict, path: str, meta=None,
+                           mmproj: str | None = None) -> dict:
+    """Пресет для чужого .gguf: флаги базового пресета, модель — эта.
+
+    Флаги, привязанные к файлам базовой модели (пути, mmproj, драфт-голова),
+    выкидываются: они указывают на другой файл и только мешают. Числовые
+    флаги, которые для новой модели бессмысленны или запрещены, зажимаются
+    по метаданным: контекст — по обученному окну, n-cpu-moe — по числу
+    слоёв и только для MoE.
+    """
+    low = {k.lower(): v for k, v in base.items()}
+    out = {"model": path}
+    if mmproj:
+        out["mmproj"] = mmproj
+        out["mmproj-offload"] = low.get("mmproj-offload", "0")
+        out["image-min-tokens"] = low.get("image-min-tokens", "1024")
+    # файлы — первыми, как их читают глазами в models.ini, потом остальные флаги
+    for k, v in base.items():
+        if k.lower() in _PATH_KEYS:
+            continue
+        out[k] = v
+    if meta is None:
+        return out
+
+    c = _int(out.get("c") or out.get("ctx-size"))
+    if c and meta.n_ctx_trained and c > meta.n_ctx_trained:
+        out["c"] = str(meta.n_ctx_trained)
+    if not meta.is_moe:
+        out.pop("n-cpu-moe", None)
+        out.pop("ncmoe", None)
+        out.pop("cpu-moe", None)
+    else:
+        ncpu = _int(out.get("n-cpu-moe"))
+        if ncpu and meta.n_layer and ncpu > meta.n_layer:
+            out["n-cpu-moe"] = str(meta.n_layer)
+    # драфт-головы из базы мы не перенесли, поэтому внешний MTP не запустится:
+    # ускоритель оставляем тот, что работает на любой модели
+    if "draft" in str(out.get("spec-type", "")) and not meta.n_layer_nextn:
+        out["spec-type"] = "ngram-mod"
+    return out
 
 
 def menu_for(router_up: bool, loaded: list[str], swap_up: bool) -> list[tuple[str, str]]:
@@ -349,7 +444,14 @@ def measurement_of(pairs: dict, records: dict) -> dict | None:
             "runs": rec.get("runs", 0)}
 
 
-def _preset_options(ini) -> tuple[list[tuple[str, str]], list[str], str | None]:
+def _preset_options(
+        ini, custom: bool = False
+) -> tuple[list[tuple[str, str]], list[str], str | None]:
+    """Секции ini как варианты ответа. custom=True — плюс пункт «свой .gguf».
+
+    Пункт всегда последний: номера существующих секций от этого не сдвигаются,
+    иначе ★-дефолт уезжал бы не туда.
+    """
     sections = [n for n in ini.names() if n != "*"]
     try:
         records = measure.load_store().get("records", {})
@@ -370,9 +472,82 @@ def _preset_options(ini) -> tuple[list[tuple[str, str]], list[str], str | None]:
         opts.append((name, " | ".join(bits)))
         if m:
             measured.append(name)
+    if custom:
+        opts.append((CUSTOM_MODEL, "файла нет в ini — укажи путь к .gguf"))
     default_name = measured[0] if measured else (sections[0] if sections else None)
     default = (sections.index(default_name) + 1) if default_name else 1
     return opts, sections, default_name
+
+
+def _custom_preset(ini) -> str | None:
+    """Пункт «свой .gguf»: путь → чьи флаги → новая секция в models.ini.
+
+    Возвращает имя записанной секции. None — человек отказался писать, и
+    вызывающий код вернёт его к списку пресетов. Нажатие 0 (и неудачный
+    путь) поднимает _GoBack: экран «свой .gguf» — часть вопроса о пресете,
+    поэтому «назад» из него ведёт на список, а не через него.
+    """
+    from .inifile import Section
+    head("свой .gguf", "секции в ini нет — сделаем её из файла")
+    raw = ask_text(f"Вопрос {qnum()} · путь к .gguf", "",
+                   sub="Enter — отмена; можно вставить путь из буфера обмена")
+    if not raw:
+        note("путь не задан — возвращаюсь к списку пресетов")
+        return None
+    path = Path(raw).expanduser()
+    if not path.exists():
+        warn(f"нет файла: {path}")
+        return None
+    try:
+        meta = gguf.probe(path)
+    except gguf.GGUFError as exc:
+        warn(str(exc))
+        return None
+    note(f"на диске: {meta.summary()}")
+
+    opts, sections, default_name = _preset_options(ini)
+    if opts:
+        base = ask_pick(f"Вопрос {qnum()} · чьи флаги берём", opts,
+                        sections.index(default_name) + 1 if default_name else 1,
+                        sub="файловые ключи (model, mmproj, драфт) не копируются — "
+                            "они указывают на чужой файл")
+        base_pairs = ini.section(base).pairs()
+    else:
+        warn("в ini нет ни одного пресета — беру только глобальные [*]")
+        base_pairs = ini.globals()
+
+    mmproj = gguf.find_mmproj_near(path)
+    if mmproj:
+        note(f"рядом нашёлся mmproj: {Path(mmproj).name}")
+    else:
+        note("mmproj рядом не найден — зрения в этой секции не будет")
+
+    pairs = pairs_for_custom_model(base_pairs, str(path), meta, mmproj)
+    name = section_name_for(str(path), [n for n in ini.names() if n != "*"])
+    note("")
+    note(f"новая секция [{name}]: {len(pairs)} ключей, c={pairs.get('c', '?')}, "
+         f"n-cpu-moe={pairs.get('n-cpu-moe', '-')}")
+
+    if not ask_yn(f"Вопрос {qnum()} · дописать [{name}] в {ini.path}?", True,
+                  sub="пишется с резервной копией; дальше validate/budget/load "
+                      "видят её как обычный пресет"):
+        warn("не записано — возвращаюсь к списку пресетов")
+        return None
+    bk = presets.backup(ini.path) if ini.path.exists() else None
+    ini.sections[name] = Section(name=name, header_raw=f"[{name}]")
+    sec = ini.sections[name]
+    for i, (k, v) in enumerate(pairs.items()):
+        # первая строка получает пояснение, откуда взялась секция
+        sec.add(k, v, comment=(f"создано мастером из {path.name}\n"
+                              + (f"флаги скопированы из [{base}]"
+                                 if opts else "флаги — из [*]")
+                              ) if i == 0 else None)
+    ini.save()
+    note(f"записано: {ini.path}"
+         + (f" (резервная копия: {bk})" if bk else ""))
+    note("роутер и llama-swap читают ini при старте: чтобы модель появилась "
+         "у живого сервера, нужен runtime restart (и swap export)")
+    return name
 
 
 def _report_files(ini) -> None:
@@ -408,40 +583,96 @@ def _do_router(action: str, build: str | None = None) -> int:
     return 1
 
 
-def _do_preset(ini, build: str, swap_url: str) -> int:
-    """Загрузить/сменить пресет. Под swap — через API, иначе через CLI."""
-    opts, sections, default_name = _preset_options(ini)
-    if not opts:
-        warn(f"в {ini.path} нет ни одного пресета")
-        return 1
-    name = ask_pick(f"Вопрос {qnum()} · какой пресет грузим", opts,
-                    sections.index(default_name) + 1 if default_name else 1,
-                    sub="★ = есть живой замер VRAM или скорости — "
-                        "ему верь, а не оценке")
-    _run_cli("validate", name, "--build", build)
-    head("что дальше с этим пресетом")
-    options = [("Загрузить сейчас", "займёт VRAM и время"),
-               ("Только проверить бюджет VRAM", "ничего не грузить"),
-               ("Загрузить и снять факт VRAM", "load + measure")]
-    choice = ask_pick(f"Вопрос {qnum()} · глубина проверки", options, 2)
-    if choice == "Загрузить сейчас":
-        return _run_cli("load", name, "--build", build)
-    if choice == "Загрузить и снять факт VRAM":
-        rc = _run_cli("load", name, "--build", build)
-        _run_cli("measure", "--swap-url", swap_url, name)
-        return rc
-    return _run_cli("budget", name, "--explain")
+def _tune_argv(build: str | None, preset: str, pairs: dict) -> list[str]:
+    """Аргументы `llamastery tune` для пресета.
+
+    Отдельная функция не для красоты: команду и печатает человек, и выполняет
+    мастер, а раньше мастер только печатал её и тихо заканчивал — «да»
+    означало «ничего не произойдёт».
+    """
+    argv = ["tune", str(paths.default_ini()), preset]
+    if build:
+        argv += ["--build", build]
+    return argv + ["--extra", f"c={pairs.get('c', 32768)}",
+                   f"n-cpu-moe={pairs.get('n-cpu-moe', 0)}",
+                   "ubatch=1024", "reserve=1024", "min-tps=25"]
 
 
-def _do_swap(action: str, swap_url: str) -> int:
+def _fit_mib(pairs: dict, total_mib: int | None,
+             reserve_mib: int = 1024) -> float | None:
+    """Сколько MiB нужно пресету — теми же числами, что и `llamastery budget`.
+
+    Живой замер важнее оценки: если пресет уже мерился, берётся он. None —
+    посчитать нечем (нет nvidia-smi или файл не прочитался).
+    """
+    if not total_mib:
+        return None
+    meta = None
+    model = pairs.get("model") or pairs.get("m") or ""
+    if not model:
+        return None
+    try:
+        meta = gguf.probe(model)
+    except (gguf.GGUFError, OSError):
+        return None
+    mm = None
+    if pairs.get("mmproj"):
+        try:
+            mm = gguf.probe(pairs["mmproj"])
+        except (gguf.GGUFError, OSError):
+            mm = None
+    meas = measure.lookup(pairs, measure.load_store())
+    if meas and meas.get("used_mib"):
+        return float(meas["used_mib"])
+    est = budget.estimate(pairs, meta, mmproj_meta=mm,
+                          _cal=budget.load_calibration())
+    return est.total_gb * 1024.0
+
+
+def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
+    """Автотюн: сначала освободить VRAM, потом сам тюнер.
+
+    Тюнер поднимает свой llama-server на каждый прогон, поэтому модель,
+    сидящая в VRAM, не оставит ему памяти — все прогоны упадут. Молча
+    пропустить это нельзя: человек ждёт 10–30 минут и получает падение.
+    """
+    head("автотюн", "10–30 мин и GPU на 100% — это надолго")
+    used, total = vram.gpu_used_mib(), vram.gpu_total_mib()
+    if total:
+        note(f"VRAM: {used} / {total} MiB "
+             f"(свободно {max(0, total - (used or 0))})")
+    need = _fit_mib(pairs, total)
+    if need and need > total - 1024:
+        warn(f"пресет не влезает: нужно {need / 1024.0:.2f} GiB, "
+             f"доступно {(total - 1024) / 1024.0:.2f} GiB")
+        if not ask_yn("всё равно запустить тюн?", False,
+                      sub="все прогоны упадут по VRAM. Сначала уменьши c "
+                          "или добавь n-cpu-moe — бюджет считает это мгновенно"):
+            note("не запускаю — команды в плане остаются ручными")
+            return 1
+    busy = [m["id"] for m in server.status().get("models", [])
+            if m.get("status") in ("loaded", "sleeping", "loading")]
+    if busy:
+        warn("в VRAM сидит: " + ", ".join(busy))
+        if ask_yn("выгрузить перед автотюном?", True,
+                  sub="иначе тюнеру не хватит памяти и прогоны упадут"):
+            _run_cli("runtime", "unload")
+    rc = _run_cli(*_tune_argv(build, preset, pairs))
+    if rc:
+        warn(f"тюнер вернул код {rc}")
+    else:
+        note("пресет не изменён: разбор — в tune-results рядом с models.ini, "
+             "запись — llamastery tune … --deep --apply")
+    return rc
+
+
+def _do_swap(action: str, swap_url: str):
     if action == "stop":
         res = swap.down()
         note(res["message"])
         return 0 if res["ok"] else 1
     if action == "start":
         build = _ask_build()
-        if build == BACK:
-            return "menu"
         _run_cli("swap", "export", "--build", build, "-o",
                  str(swap.default_output()))
         # порт не передаём: swap сам берёт свободный, если дефолтный занят
@@ -485,7 +716,13 @@ def run() -> int:
             note("ничего не менял")
             return 0
 
-        rc = _dispatch(action, swap_url)
+        try:
+            rc = _dispatch(action, swap_url)
+        except _GoBack:
+            # 0 на экране вне Nav (например «какая сборка» внутри swap):
+            # в меню — то же самое, что 0 в самом меню
+            note("назад")
+            continue
         if rc == "menu":             # 0 дошёл до начала — снова меню
             continue
         return rc
@@ -501,11 +738,12 @@ def _main_menu(swap_url: str) -> tuple[int, str | None]:
     swap_up = bool(s["swap"].get("up"))
     options = menu_for(router_up, loaded, swap_up)
     labels = [o[0] for o in options]
-    idx = ask(f"Вопрос {qnum()} · что делаем?", options,
-              menu_default(options, router_up),
-              sub="Enter — рекомендованный пункт, "
-                  "0 — выход")
-    if idx == BACK:
+    try:
+        idx = ask(f"Вопрос {qnum()} · что делаем?", options,
+                  menu_default(options, router_up),
+                  sub="Enter — рекомендованный пункт, "
+                      "0 — выход")
+    except _GoBack:
         print()
         note("вышел из мастера")
         return 0, None
@@ -515,7 +753,7 @@ def _main_menu(swap_url: str) -> tuple[int, str | None]:
 
 
 def _ask_build() -> str:
-    """Вопрос о сборке. BACK, если человек ушёл назад."""
+    """Вопрос о сборке. На 0 поднимает _GoBack — вызывающий уводит в меню."""
     reg = _pick_build_registry()
     if not reg:
         raise SystemExit(1)
@@ -540,14 +778,9 @@ def _dispatch(action: str, swap_url: str):
     if action == "Остановить llama-swap":
         return _do_swap("stop", swap_url)
     if action == "Перезапустить роутер":
-        build = _ask_build()
-        if build == BACK:
-            return "menu"
-        return _do_router("restart", build)
+        return _do_router("restart", _ask_build())
     if action.startswith("Запустить роутер"):
         build = _ask_build()
-        if build == BACK:
-            return "menu"
         _do_router("start", build)
         if action == "Запустить роутер и загрузить пресет":
             return _preset_after_router(build, swap_url)
@@ -601,9 +834,7 @@ def _preset_flow(swap_url: str, preset_build: str | None = None):
         ("preset", pick_preset),
         ("depth", pick_depth),
     ])
-    if res is None:
-        return "menu"
-    if res.get("build") == BACK:
+    if res is None or is_back(res.get("build")):
         return "menu"
     name = res.get("preset")
     if not name:
@@ -649,29 +880,39 @@ def _setup_flow(swap_url: str):
         return "проверено"
 
     def s_preset(a: dict):
-        opts, sections, default_name = _preset_options(ini)
-        if not opts:
-            return None
-        return ask_pick(f"Вопрос {qnum()} · какой пресет берём за основу", opts,
-                        sections.index(default_name) + 1 if default_name else 1)
+        # цикл: «0» внутри диалога «свой .gguf» возвращает сюда, к списку,
+        # а не через него — иначе откат уезжал бы на шаг лишний
+        for _ in range(MAX_SUBSTEP):
+            opts, sections, default_name = _preset_options(ini, custom=True)
+            choice = ask_pick(f"Вопрос {qnum()} · какой пресет берём за основу",
+                              opts,
+                              sections.index(default_name) + 1
+                              if default_name else 1)
+            if choice != CUSTOM_MODEL:
+                return choice
+            try:
+                name = _custom_preset(ini)
+            except _GoBack:
+                continue
+            if name:
+                return name
+        warn("слишком много откатов — возвращаюсь на шаг назад")
+        return BACK
 
     def s_tune(a: dict):
         preset = a.get("preset")
         if not preset:
             return None
         pairs = ini.section(preset).pairs()
-        if ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?", False,
-                  sub="долго (10–30 мин) и грузит GPU на 100% — "
-                      "запускай в свободное время"):
-            tune = (f"tune {paths.default_ini()} {preset} "
-                    f"--build {a.get('build')} "
-                    f"--extra c={pairs.get('c', 32768)} "
-                    f"n-cpu-moe={pairs.get('n-cpu-moe', 0)} "
-                    f"ubatch=1024 reserve=1024 min-tps=25")
-            print()
-            print(f"  {ARROW} команда: llamastery {tune}")
-            return "показан"
-        return "не просил"
+        if not ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?", False,
+                      sub="долго (10–30 мин) и грузит GPU на 100% — "
+                          "запускай в свободное время"):
+            return "не просил"
+        # сам запуск — после плана: там человек один раз решает, можно ли
+        # начинать, и к этому моменту известно про mmproj и ускорители
+        note(f"команда: llamastery {' '.join(_tune_argv(a.get('build'), preset, pairs))}")
+        note("запущу после плана — там же спрошу, можно ли начинать")
+        return "да"
 
     def s_ctx(a: dict):
         preset = a.get("preset")
@@ -722,7 +963,7 @@ def _setup_flow(swap_url: str):
         ("ngram", s_ngram),
         ("mtp", s_mtp),
     ])
-    if res is None or res.get("build") == BACK:
+    if res is None or is_back(res.get("build")):
         return "menu"
 
     preset = res.get("preset")
@@ -734,15 +975,20 @@ def _setup_flow(swap_url: str):
         preset = res["vision"]
     ctx = res.get("ctx")
     pairs = ini.section(preset).pairs()
+    want_tune = res.get("tune") == "да"
 
     head("план", "выполняется по порядку, каждый шаг можно пропустить")
     steps = [f"validate {preset} --build {res['build']}",
-             f"budget {preset} --explain",
-             f"load {preset} --build {res['build']}",
-             f"measure --swap-url {swap_url} {preset}",
-             f"probe --tokens 110000 --from-file <реальный-код> --record "
-             f"--preset {preset}",
-             f"swap export --build {res['build']} -o {swap.default_output()}"]
+             f"budget {preset} --explain"]
+    if want_tune:
+        # раньше тюн стоял первым, а выполнялся бы после проверок — список
+        # должен совпадать с тем, что реально происходит
+        steps.append(" ".join(_tune_argv(res["build"], preset, pairs)))
+    steps += [f"load {preset} --build {res['build']}",
+              f"measure --swap-url {swap_url} {preset}",
+              f"probe --tokens 110000 --from-file <реальный-код> --record "
+              f"--preset {preset}",
+              f"swap export --build {res['build']} -o {swap.default_output()}"]
     for i, st in enumerate(steps, 1):
         print(f"    {i}. llamastery {st}")
     if res.get("ngram") or res.get("mtp"):
@@ -753,9 +999,26 @@ def _setup_flow(swap_url: str):
     if ctx and ctx != str(pairs.get("c", "")):
         warn(f"контекст {pairs.get('c')} → {ctx}: сначала правка models.ini")
     print()
-    if ask_yn("выполнить первые два шага (validate + budget, безопасно)?", True):
-        _run_cli("validate", preset, "--build", res["build"])
-        _run_cli("budget", preset, "--explain")
+    question = ("выполнить автотюн и первые два шага (validate + budget)?"
+                if want_tune else
+                "выполнить первые два шага (validate + budget, безопасно)?")
+    try:
+        go = ask_yn(question, True,
+                    sub="автотюн — надолго, GPU на 100%" if want_tune else "")
+    except _GoBack:
+        # последний экран потока: «назад» здесь — это в меню
+        note("ничего не выполнял")
+        return "menu"
+    if go:
+        if want_tune:
+            # тюнеру память нужнее, чем проверке: сначала validate и budget
+            # (быстро), и только потом прогон на 10–30 минут
+            _run_cli("validate", preset, "--build", res["build"])
+            _run_cli("budget", preset, "--explain")
+            _run_tune(res["build"], preset, pairs)
+        else:
+            _run_cli("validate", preset, "--build", res["build"])
+            _run_cli("budget", preset, "--explain")
     print()
     note(f"готово. загрузка вручную: "
          f"llamastery load {preset} --build {res['build']}")
