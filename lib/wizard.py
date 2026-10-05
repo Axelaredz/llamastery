@@ -671,27 +671,49 @@ def _tuner_options() -> frozenset[str]:
     return frozenset(out)
 
 
-def _tune_argv(build: str | None, preset: str, pairs: dict) -> list[str]:
+def _tune_argv(build: str | None, preset: str, pairs: dict,
+               shrink=None) -> list[str]:
     """Аргументы `llamastery tune` — только те, что понимает тюнер.
 
     Контекст, n-cpu-moe и ubatch передавать не нужно: `c` тюнер берёт из
     пресета сам, а n-cpu-moe и ubatch — это его оси поиска (`--moe-values`,
-    `--ubatch-values`), а не входные параметры. Единственный рычаг для
-    «долго, но не часы» — `--search-ctx`: подбор идёт на коротком KV, полную
-    глубину потом проверяют отдельно (budget + probe).
+    `--ubatch-values`), а не входные параметры.
+
+    Если пресет не влезает, shrink задаёт, на чём идти: `search-ctx` —
+    контекст подбора, `moe-values` — с чего начинать перебор экспертов. Без
+    shrink остаётся только ограничение сверху: иначе 10-30 мин не уложились
+    бы, каждый кандидат проверялся бы на полном KV.
     """
     argv = ["tune", str(paths.default_ini()), preset]
     if build:
         argv += ["--build", build]
-    c = _int(pairs.get("c"))
-    if c > TUNE_SEARCH_CTX:
-        # иначе 10-30 мин не уложились бы: каждый кандидат проверяется на
-        # полном KV. Короткий поиск + глубокая проверка победителя отдельно —
-        # ровно то, что советует сам тюнер в README.
-        # формат именно search-ctx=NNN: cmd_tune превращает «k=v» в «--k v»,
-        # а отдельное значение без «=» стало бы флагом «--16384»
-        argv += ["--extra", f"search-ctx={TUNE_SEARCH_CTX}"]
+
+    cur = _int(pairs.get("c"))
+    if shrink is not None:
+        # формат именно k=v: cmd_tune превращает «k=v» в «--k v», а
+        # отдельное значение без «=» стало бы флагом «--16384»
+        extra = []
+        if shrink.ctx and shrink.ctx != cur:
+            extra.append(f"search-ctx={shrink.ctx}")
+        if shrink.cpu_moe:
+            top = max(shrink.cpu_moe + 1,
+                      min(shrink.n_layer - 1, cur)) if shrink.n_layer else 0
+            extra.append(f"moe-values={_moe_series(shrink.cpu_moe, top)}")
+        if not extra:
+            return argv
+        return argv + ["--extra", *extra]
+
+    if cur > TUNE_SEARCH_CTX:
+        return argv + ["--extra", f"search-ctx={TUNE_SEARCH_CTX}"]
     return argv
+
+
+def _moe_series(start: int, top: int) -> str:
+    """Значения n-cpu-moe для перебора: от подобранного вверх до top."""
+    vals = [start]
+    while vals[-1] + 4 <= top and len(vals) < 5:
+        vals.append(vals[-1] + 4)
+    return ",".join(str(v) for v in vals)
 
 
 def _tune_unknown_keys(argv: list[str]) -> list[str]:
@@ -741,27 +763,75 @@ def _fit_mib(pairs: dict, total_mib: int | None,
     return est.total_gb * 1024.0
 
 
+def _shrink_for_tune(pairs: dict, total_mib: int | None) -> budget.Shrink:
+    """Подобрать c и n-cpu-moe, при которых пресет влезает, — или None."""
+    if not total_mib:
+        return None
+    model = pairs.get("model") or pairs.get("m") or ""
+    if not model:
+        return None
+    try:
+        meta = gguf.probe(model)
+    except (gguf.GGUFError, OSError):
+        return None
+    mm = None
+    if pairs.get("mmproj"):
+        try:
+            mm = gguf.probe(pairs["mmproj"])
+        except (gguf.GGUFError, OSError):
+            mm = None
+    return budget.shrink_to_fit(pairs, meta, total_mib, mmproj_meta=mm)
+
+
+def _report_shrink(shrink: budget.Shrink) -> None:
+    """Что мастер поменял и почему столько стоит."""
+    for step in shrink.steps:
+        note(f"  {step}")
+    note(f"  бюджет после правки: {shrink.est.total_gb:.2f} GiB "
+         f"(веса {shrink.est.weights_gb:.2f} + KV {shrink.est.kv_gb:.2f}"
+         + (f" + mmproj {shrink.est.mmproj_gb:.2f}" if shrink.est.mmproj_gb
+            else "")
+         + f" + прочее {shrink.est.compute_gb:.2f})")
+    if shrink.cpu_moe and shrink.ctx:
+        note("  n-cpu-moe в RAM = каждый токен считается на CPU: скорость "
+             "упадёт, зато контекст остался прежним")
+
+
 def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
-    """Автотюн: сначала освободить VRAM, потом сам тюнер.
+    """Автотюн: подобрать укладывающиеся параметры, освободить VRAM, запустить.
 
     Тюнер поднимает свой llama-server на каждый прогон, поэтому модель,
-    сидящая в VRAM, не оставит ему памяти — все прогоны упадут. Молча
-    пропустить это нельзя: человек ждёт 10–30 минут и получает падение.
+    сидящая в VRAM, не оставит ему памяти — все прогоны упадут. А пресет,
+    который не влезает, падает на первом же кандидате. Оба случая раньше
+    стоили человеку 10–30 минут ожидания.
     """
     head("автотюн", "10–30 мин и GPU на 100% — это надолго")
     used, total = vram.gpu_used_mib(), vram.gpu_total_mib()
     if total:
         note(f"VRAM: {used} / {total} MiB "
              f"(свободно {max(0, total - (used or 0))})")
-    need = _fit_mib(pairs, total)
-    if need and need > total - 1024:
-        warn(f"пресет не влезает: нужно {need / 1024.0:.2f} GiB, "
-             f"доступно {(total - 1024) / 1024.0:.2f} GiB")
-        if not ask_yn("всё равно запустить тюн?", False,
-                      sub="все прогоны упадут по VRAM. Сначала уменьши c "
-                          "или добавь n-cpu-moe — бюджет считает это мгновенно"):
-            note("не запускаю — команды в плане остаются ручными")
-            return 1
+
+    shrink = _shrink_for_tune(pairs, total)
+    if shrink is None:
+        warn("посчитать бюджет нечем (нет nvidia-smi или модель не читается) — "
+             "запускаю как есть")
+    else:
+        usable = (total - 1024) / 1024.0
+        if shrink.fits and (shrink.ctx or shrink.cpu_moe):
+            note(f"пресет не влезает в {usable:.2f} GiB — подбираю параметры, "
+                 "при которых влезет:")
+            _report_shrink(shrink)
+        elif not shrink.fits:
+            warn(f"даже с подбором не влезает: {shrink.est.total_gb:.2f} GiB "
+                 f"против доступных {usable:.2f} GiB")
+            if shrink.steps:
+                warn(f"  {shrink.steps[-1]}")
+            if not ask_yn("всё равно запустить тюн?", False,
+                          sub="вероятно, все прогоны упадут по VRAM. Модель "
+                              "крупнее карты — поможет только меньший квант"):
+                note("не запускаю — команды в плане остаются ручными")
+                return 1
+
     busy = [m["id"] for m in server.status().get("models", [])
             if m.get("status") in ("loaded", "sleeping", "loading")]
     if busy:
@@ -769,7 +839,7 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
         if ask_yn("выгрузить перед автотюном?", True,
                   sub="иначе тюнеру не хватит памяти и прогоны упадут"):
             _run_cli("runtime", "unload")
-    argv = _tune_argv(build, preset, pairs)
+    argv = _tune_argv(build, preset, pairs, shrink)
     unknown = _tune_unknown_keys(argv)
     if unknown:
         # не запускаем заведомо неработающую команду: тюнер молча упал бы на
@@ -784,6 +854,11 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
     else:
         note("пресет не изменён: разбор — в tune-results рядом с models.ini, "
              "запись — llamastery tune … --deep --apply")
+        if shrink is not None and (shrink.ctx != _int(pairs.get("c"))
+                                   or shrink.cpu_moe):
+            note(f"подбор шёл на c={shrink.ctx}, n-cpu-moe={shrink.cpu_moe}: "
+                 "эти значения стоит записать в секцию, иначе load вернёт "
+                 "старое и упадёт по VRAM")
     return rc
 
 

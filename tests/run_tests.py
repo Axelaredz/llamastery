@@ -1717,11 +1717,26 @@ def test_wizard_tune_actually_runs(tmp: Path) -> None:
     saved_status = S.status
     saved_vram = wizard.vram.gpu_used_mib
     saved_total = wizard.vram.gpu_total_mib
-    saved_fit = wizard._fit_mib
+    saved_shrink = wizard._shrink_for_tune
+
+    def _fits(pairs, total):
+        """Заглушка подбора: shrink, который влезает и ничего не меняет."""
+        return budget.Shrink(ctx=0, cpu_moe=0,
+                             n_layer=40, fits=True,
+                             est=budget.Estimate(total_gb=9.0, weights_gb=7.0,
+                                                 kv_gb=1.0, compute_gb=1.0),
+                             steps=["пресет уже влезает"])
+
+    def _huge(pairs, total):
+        """Заглушка: даже минимальный пресет не влезает."""
+        s = budget.Shrink(ctx=4096, cpu_moe=39, n_layer=40, fits=False,
+                          est=budget.Estimate(total_gb=6.0), steps=["не лезет"])
+        return s
+
     S.status = lambda: {"models": [{"id": "cyber", "status": "loaded"}]}
     wizard.vram.gpu_used_mib = lambda: 10607
     wizard.vram.gpu_total_mib = lambda: 12288
-    wizard._fit_mib = lambda pairs, total, reserve_mib=1024: 4096.0
+    wizard._shrink_for_tune = _fits
     try:
         # сборка → пресет → автотюн=да → контекст → ngram → mtp → «выполнить»
         env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y", "y"])
@@ -1754,8 +1769,8 @@ def test_wizard_tune_actually_runs(tmp: Path) -> None:
         check(rc == "menu" and not calls,
               "0 на финальном вопросе отменяет и тюн", (rc, calls))
 
-        # пресет, который заведомо не влезает, тюнить бессмысленно
-        wizard._fit_mib = lambda pairs, total, reserve_mib=1024: 60.0 * 1024
+        # не влезает даже минимальный: без согласия не запускаем
+        wizard._shrink_for_tune = _huge
         env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y", "n"])
         with env:
             rc = wizard._setup_flow("http://127.0.0.1:8087")
@@ -1769,23 +1784,30 @@ def test_wizard_tune_actually_runs(tmp: Path) -> None:
             wizard._setup_flow("http://127.0.0.1:8087")
         check(any(c[0] == "tune" for c in calls),
               "настойчивый «да» перекрывает предупреждение", calls)
+
+        # главное: влезающий вариант подбирается и уходит в тюнер сам
+        def _needs_shrinking(pairs, total):
+            return budget.Shrink(ctx=65536, cpu_moe=12, n_layer=40, fits=True,
+                                 est=budget.Estimate(total_gb=9.5, weights_gb=7.5,
+                                                     kv_gb=1.0, compute_gb=1.0),
+                                 steps=["c 131072 → 65536", "n-cpu-moe 0 → 12"])
+
+        wizard._shrink_for_tune = _needs_shrinking
+        env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y", "y"])
+        with env:
+            wizard._setup_flow("http://127.0.0.1:8087")
+        tune = [c for c in calls if c[0] == "tune"]
+        check(tune and "search-ctx=65536" in tune[0],
+              "подобранный контекст ушёл в тюнер", tune)
+        check(tune and any("moe-values=" in str(x) for x in tune[0]),
+              "подобранный n-cpu-moe ушёл в перебор", tune)
+        check("подбираю параметры" in env.text,
+              "человеку сказали, что пресет ужат", env.text[-900:])
     finally:
         S.status = saved_status
         wizard.vram.gpu_used_mib = saved_vram
         wizard.vram.gpu_total_mib = saved_total
-        wizard._fit_mib = saved_fit
-
-    # _fit_mib: те же числа, что у budget, и None там, где считать нечем
-    fake = _write_fake_gguf(tmp / "fit.gguf")
-    pairs = {"model": str(fake), "c": "32768"}
-    need = wizard._fit_mib(pairs, 12288)
-    check(need is not None and 1000 < need < 12288 - 1024,
-          "потребление посчитано теми же числами, что budget", need)
-    check(wizard._fit_mib(pairs, None) is None, "без VRAM не считаем")
-    check(wizard._fit_mib({"model": "/нет/такого.gguf"}, 12288) is None,
-          "нечитаемая модель — None, а не выдуманный ноль")
-    check(wizard._fit_mib({"c": "32768"}, 12288) is None,
-          "пресет без model — None")
+        wizard._shrink_for_tune = saved_shrink
 
 
 def test_wizard_pasted_path_is_not_a_number(tmp: Path) -> None:
@@ -1842,6 +1864,83 @@ def test_wizard_pasted_path_is_not_a_number(tmp: Path) -> None:
     check("[pasted-model]" in (tmp / "models.ini").read_text(encoding="utf-8"),
           "секция создана по вставленному пути")
     check(not any(c[0] == "tune" for c in calls), "тюнер не трогали", calls)
+
+
+def test_budget_shrink_to_fit() -> None:
+    """Ужимание пресета до влезающего: c → n-cpu-moe, замер важнее оценки."""
+    print("бюджет: подбор укладывающихся параметров")
+
+    m = gguf.ModelMeta(path=Path("/m.gguf"), size_bytes=int(11.7 * 2 ** 30))
+    m.arch = "qwen35moe"
+    m.kv = {"qwen35moe.block_count": 40, "qwen35moe.embedding_length": 2048,
+            "qwen35moe.attention.head_count": 16,
+            "qwen35moe.attention.head_count_kv": 2,
+            "qwen35moe.attention.key_length": 256,
+            "qwen35moe.context_length": 262144,
+            "qwen35moe.expert_count": 256,
+            "qwen35moe.expert_feed_forward_length": 512,
+            "qwen35moe.full_attention_interval": 4}
+    cal = {"compute_gb": 0.95}
+    big = {"model": "/m.gguf", "c": "131072", "cache-type-k": "q8_0",
+           "cache-type-v": "q5_0", "kv-unified": "true", "parallel": "1"}
+
+    e0 = budget.estimate(big, m, _cal=cal)
+    check(e0.total_gb > 11.0, "пресет изначально не влезает", round(e0.total_gb, 2))
+
+    r = budget.shrink_to_fit(big, m, 12288, _cal=cal)
+    check(r.fits, "после подбора влезает", r.steps)
+    check(r.cpu_moe > 0 and r.ctx == 131072,
+          "контекст сохранён, резали n-cpu-moe", (r.ctx, r.cpu_moe))
+    check(r.est.total_gb <= (12288 - 1024) / 1024.0,
+          "оценка совпадает с budget", round(r.est.total_gb, 2))
+
+    # не влезает даже минимальный — честно говорим об этом
+    r2 = budget.shrink_to_fit({**big, "n-gpu-layers": "99", "c": "262144"},
+                              m, 4096, _cal=cal)
+    check(not r2.fits and r2.steps, "не влезает — сказано почему", r2.steps)
+
+    # контекст режется, когда сжимать нечем (плотная модель без MoE)
+    dense = gguf.ModelMeta(path=Path("/d.gguf"), size_bytes=int(4.0 * 2 ** 30))
+    dense.arch = "llama"
+    dense.kv = {"llama.block_count": 32, "llama.embedding_length": 4096,
+                "llama.attention.head_count": 32,
+                "llama.attention.head_count_kv": 8,
+                "llama.attention.key_length": 128,
+                "llama.context_length": 131072}
+    r3 = budget.shrink_to_fit({"model": "/d.gguf", "c": "131072"}, dense,
+                              12288, _cal=cal)
+    check(r3.fits and r3.cpu_moe == 0 and r3.ctx < 131072,
+          "плотная модель: режется только контекст",
+          (r3.ctx, r3.cpu_moe, r3.fits))
+
+    # живой замер важнее оценки: рабочий пресет не трогаем
+    saved_load = measure.load_store
+    try:
+        e_now = budget.estimate(big, m, _cal=cal)
+        check(e_now.total_gb > 11.0, "оценка врёт в сторону нехватки",
+              round(e_now.total_gb, 2))
+        measure.load_store = lambda: {"records": {
+            measure.signature(big): {"used_mib": 10800, "runs": 1,
+                                     "min_free_mib": 1488}}}
+        r4 = budget.shrink_to_fit(big, m, 12288, _cal=cal)
+        check(r4.fits and r4.cpu_moe == 0 and r4.ctx == 131072,
+              "по замеру пресет влезает — не урезаем", (r4.ctx, r4.cpu_moe))
+        check("замер" in (r4.steps or [""])[0], "и сказано, что решил замер",
+              r4.steps)
+        # а если замер говорит, что НЕ влезает — подбор всё равно идёт
+        measure.load_store = lambda: {"records": {
+            measure.signature(big): {"used_mib": 12000, "runs": 1}}}
+        r5 = budget.shrink_to_fit(big, m, 12288, _cal=cal)
+        check(r5.fits and r5.cpu_moe > 0,
+              "замер «не влезает» → подбираем дальше", (r5.ctx, r5.cpu_moe))
+    finally:
+        measure.load_store = saved_load
+
+    # подпорки не выдумываются
+    check(not budget.shrink_to_fit(big, None, 12288).fits,
+          "без метаданных — не влезает (а не «наверное, ок»)")
+    check(budget.shrink_to_fit(big, m, None).steps == [],
+          "без VRAM — пустой список правок")
 
 
 def test_probe_retries_on_immediate_stop() -> None:

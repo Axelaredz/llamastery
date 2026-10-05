@@ -22,6 +22,15 @@ from functools import lru_cache
 from . import paths
 from .gguf import ModelMeta
 
+
+def measure_lookup(pairs: dict[str, str]) -> dict | None:
+    """Живой замер по конфигурации пресета (ленивый импорт: measure → budget)."""
+    from . import measure
+    try:
+        return measure.lookup(pairs)
+    except Exception:  # noqa: BLE001 — замеры опциональны
+        return None
+
 GIB = 2 ** 30
 MIB = 2 ** 20
 
@@ -352,6 +361,139 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
         f"compute buffer {compute_gb:.2f} GiB — подогнанная константа, "
         f"а не расчёт (см. llamastery budget calibrate)")
     return est
+
+
+# ── впихнуть пресет в VRAM ──
+MIN_CTX = 4096                    # ниже тюнер всё равно не работает
+CTX_STEPS = (262144, 131072, 114688, 98304, 65536, 49152, 32768, 16384,
+             8192, MIN_CTX)
+
+
+@dataclass
+class Shrink:
+    """Чем пресет пришлось урезать, чтобы он влез в VRAM."""
+
+    ctx: int = 0
+    cpu_moe: int = 0
+    n_layer: int = 0
+    fits: bool = False
+    est: Estimate = field(default_factory=Estimate)
+    steps: list[str] = field(default_factory=list)
+
+
+def _with(pairs: dict[str, str], ctx: int | None = None,
+          moe: int | None = None) -> dict[str, str]:
+    """Копия пресета с подменёнными c и n-cpu-moe (по именам, что в нём есть)."""
+    p = dict(pairs)
+    if ctx is not None:
+        low = _norm(p)
+        for k in ("c", "ctx-size"):
+            if k in low:
+                p[k] = str(ctx)
+                break
+        else:
+            p["c"] = str(ctx)
+    if moe is not None:
+        low = _norm(p)
+        key = next((k for k in ("n-cpu-moe", "ncmoe", "cmoe") if k in low), None)
+        if key is not None:
+            p[key] = str(moe)
+        elif moe:
+            p["n-cpu-moe"] = str(moe)
+    return p
+
+
+def shrink_to_fit(pairs: dict[str, str], meta: ModelMeta | None,
+                  total_mib: int | None, reserve_mib: int = 1024,
+                  mmproj_meta: ModelMeta | None = None,
+                  _cal: dict | None = None, min_ctx: int = MIN_CTX) -> Shrink:
+    """Подобрать c и n-cpu-moe так, чтобы пресет влез в VRAM.
+
+    Порядок жертв: сперва контекст (до min_ctx), потом n-cpu-moe. Сознательно
+    именно так: слои экспертов в RAM бьют по скорости КАЖДОГО токена, а
+    короткий контекст — это просто короткий контекст, и полную глубину потом
+    проверяют отдельно (`budget` + `probe --tokens <c>`).
+
+    Числа берутся из estimate, поэтому результат совпадает с выводом
+    `llamastery budget`: не может выйти «влезло по тут, а по там нет».
+    Считается от estimate, а не по линейной формуле: скилл знает про
+    override-tensor, n-gpu-layers и прочие сюрпризы, которые ломают арифметику.
+
+    Живой замер важнее оценки: если пресет уже мерился и влезает по факту,
+    он возвращается нетронутым — иначе прогноз, ошибающийся на 5 GiB,
+    заставил бы мастер урезать рабочий пресет.
+    """
+    cal = _cal if _cal is not None else load_calibration()
+    cur_ctx = _flag_int(pairs, "c", "ctx-size", default=0) or 0
+    cur_moe = _flag_int(pairs, "n-cpu-moe", "ncmoe", "cmoe", default=0) or 0
+    if meta is None or not total_mib:
+        return Shrink(ctx=cur_ctx, cpu_moe=cur_moe)
+    usable_mib = total_mib - reserve_mib
+    max_moe = max(0, meta.n_layer - 1) if meta.is_moe else 0
+
+    meas = measure_lookup(pairs)
+    if meas and meas.get("used_mib"):
+        # факт: 10800 MiB против оценки 16.06 GiB на том же пресете
+        if float(meas["used_mib"]) <= usable_mib:
+            return Shrink(ctx=cur_ctx, cpu_moe=cur_moe,
+                          n_layer=meta.n_layer, fits=True,
+                          steps=["пресет уже влезает (живой замер "
+                                 f"{meas['used_mib']} MiB)"])
+    elif meas and meas.get("min_free_mib") is not None:
+        if float(meas["min_free_mib"]) >= reserve_mib:
+            return Shrink(ctx=cur_ctx, cpu_moe=cur_moe,
+                          n_layer=meta.n_layer, fits=True,
+                          steps=["пресет уже влезает (живой замер: свободно "
+                                 f"{meas['min_free_mib']} MiB)"])
+
+    def need(ctx: int, moe: int) -> float:
+        est = estimate(_with(pairs, ctx=ctx, moe=moe), meta,
+                       mmproj_meta=mmproj_meta, _cal=cal)
+        return est.total_gb * 1024.0
+
+    def moe_for(ctx: int) -> int | None:
+        """Минимальный n-cpu-moe, при котором ctx влезает (None — не влезает).
+
+        Потребление монотонно падает с ростом moe, поэтому делим отрезок.
+        """
+        lo, hi, found = 0, max_moe, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if need(ctx, mid) <= usable_mib:
+                found = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        return found
+
+    # контекст важнее скорости: сначала ищем максимальный, который влезает
+    best: tuple[int, int] | None = None
+    for ctx in CTX_STEPS:
+        if cur_ctx and ctx > cur_ctx:
+            continue
+        if ctx < min_ctx:
+            break
+        moe = moe_for(ctx)
+        if moe is not None:
+            best = (ctx, moe)
+            break
+    ctx, moe = best if best is not None else (min_ctx, max_moe)
+
+    est = estimate(_with(pairs, ctx=ctx, moe=moe), meta,
+                   mmproj_meta=mmproj_meta, _cal=cal)
+    out = Shrink(ctx=ctx, cpu_moe=moe, n_layer=meta.n_layer,
+                 fits=est.total_gb * 1024.0 <= usable_mib, est=est)
+    if ctx != cur_ctx:
+        out.steps.append(f"c {cur_ctx} → {ctx}")
+    if moe != cur_moe:
+        out.steps.append(f"n-cpu-moe {cur_moe} → {moe}")
+    if not out.steps:
+        out.steps.append("пресет уже влезает")
+    if not out.fits:
+        out.steps.append(
+            f"даже c={ctx} и n-cpu-moe={moe} не хватает: "
+            f"{est.total_gb:.2f} GiB против доступных {usable_mib / 1024.0:.2f} GiB")
+    return out
 
 
 # ── калибровка ──
