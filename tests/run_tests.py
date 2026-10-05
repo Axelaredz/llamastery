@@ -1943,6 +1943,59 @@ def test_budget_shrink_to_fit() -> None:
           "без VRAM — пустой список правок")
 
 
+def test_wizard_yn_has_no_default() -> None:
+    """У вопросов да/нет нет дефолта: Enter = «нет», согласие — явным y/д.
+
+    Регрессия: подпись «Y/n ★ ответ (Enter = да)» соглашалась на 10–30 минут
+    GPU на 100% одним Enter — при том, что человек просто пролистывал шаги.
+    """
+    print("wizard: у да/нет нет дефолта")
+
+    def ask(raw: str, default_yes: bool = False):
+        """Спрашивает и возвращает (ответ, подпись). Вывод гасим."""
+        box = []
+        saved = wizard._read
+        wizard._read = lambda p: (box.append(p), raw)[1]
+        import contextlib
+        import io
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = wizard.ask_yn("вопрос", default_yes)
+            return got, box[0]
+        finally:
+            wizard._read = saved
+
+    for raw, want in (("", False), ("y", True), ("Y", True), ("д", True),
+                      ("да", True), ("yes", True), ("n", False), ("нет", False),
+                      ("N", False), ("хз", False)):
+        got, _prompt = ask(raw)
+        check(got is want, f"ввод {raw!r} → {'да' if want else 'нет'}")
+
+    _, p_yes = ask("", True)
+    _, p_no = ask("", False)
+    check("Enter = нет" in p_yes and "Enter = нет" in p_no,
+          "Enter нигде не значит «да»", (p_yes, p_no))
+    check("Y/n" not in p_yes and "y/N" not in p_no,
+          "старой двусмысленной подписи нет", (p_yes, p_no))
+    check("рекомендовано" in p_yes and "рекомендовано" not in p_no,
+          "★ остался подсказкой, а не дефолтом")
+
+    # 0 по-прежнему назад, а не «нет»
+    import contextlib
+    import io
+    saved = wizard._read
+    wizard._read = lambda p: "0"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            wizard.ask_yn("вопрос", False)
+        raised = False
+    except wizard._GoBack:
+        raised = True
+    finally:
+        wizard._read = saved
+    check(raised, "0 = назад, а не «нет»")
+
+
 def test_probe_retries_on_immediate_stop() -> None:
     """Модель, замолчавшая на первом токене, не выпадает из замера.
 

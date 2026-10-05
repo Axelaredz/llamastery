@@ -222,14 +222,22 @@ def ask_pick(title: str, options: list[tuple[str, str]], default: int,
     return label
 
 
-def ask_yn(title: str, default_yes: bool, sub: str = "") -> bool:
+def ask_yn(title: str, default_yes: bool = False, sub: str = "") -> bool:
+    """Да/нет. Дефолта нет: пустой ввод = «нет», согласие — только явным y/д.
+
+    Раньше здесь стояло `Y/n ★ ответ (Enter = да)`, и один Enter соглашался на
+    10–30 минут GPU на 100% — слишком дорого, чтобы соглашаться «не думая».
+    default_yes остался параметром только ради подписи в тексте вопроса
+    (что рекомендовано) и больше ничего не меняет.
+    """
     head(title, sub)
-    hint = "Y/n" if default_yes else "y/N"
-    raw = _read(f"{hint} {STAR} ответ (Enter = "
-                f"{'да' if default_yes else 'нет'}, 0 = {BACK}) ▸").lower()
+    hint = "y/д/n/нет"
+    if default_yes:
+        hint = f"{hint}   ★ рекомендовано: да"
+    raw = _read(f"{hint} ответ (Enter = нет, 0 = {BACK}) ▸").lower()
     if raw == "0":
         _go_back()
-    yes = default_yes if not raw else raw in ("y", "yes", "д", "да")
+    yes = raw in ("y", "yes", "д", "да")
     print(f"    {ARROW} ответ: {'да' if yes else 'нет'}")
     return yes
 
@@ -468,7 +476,7 @@ def _pick_build_registry() -> dict:
     if reg:
         return reg
     warn("реестр сборок пуст — ищем форки автоматически")
-    if ask_yn(f"Вопрос {qnum()} · найти сборки (builds detect --apply)?", True,
+    if ask_yn(f"Вопрос {qnum()} · найти сборки (builds detect --apply)?",
               sub="обычные каталоги: ~/git/llama-*, ~/llama-*"):
         _run_cli("builds", "detect", "--apply")
         reg = builds.all_builds()
@@ -587,7 +595,7 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
     note(f"новая секция [{name}]: {len(pairs)} ключей, c={pairs.get('c', '?')}, "
          f"n-cpu-moe={pairs.get('n-cpu-moe', '-')}")
 
-    if not ask_yn(f"Вопрос {qnum()} · дописать [{name}] в {ini.path}?", True,
+    if not ask_yn(f"Вопрос {qnum()} · дописать [{name}] в {ini.path}?",
                   sub="пишется с резервной копией; дальше validate/budget/load "
                       "видят её как обычный пресет"):
         warn("не записано — возвращаюсь к списку пресетов")
@@ -826,7 +834,7 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
                  f"против доступных {usable:.2f} GiB")
             if shrink.steps:
                 warn(f"  {shrink.steps[-1]}")
-            if not ask_yn("всё равно запустить тюн?", False,
+            if not ask_yn("всё равно запустить тюн?",
                           sub="вероятно, все прогоны упадут по VRAM. Модель "
                               "крупнее карты — поможет только меньший квант"):
                 note("не запускаю — команды в плане остаются ручными")
@@ -836,7 +844,7 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
             if m.get("status") in ("loaded", "sleeping", "loading")]
     if busy:
         warn("в VRAM сидит: " + ", ".join(busy))
-        if ask_yn("выгрузить перед автотюном?", True,
+        if ask_yn("выгрузить перед автотюном?",
                   sub="иначе тюнеру не хватит памяти и прогоны упадут"):
             _run_cli("runtime", "unload")
     argv = _tune_argv(build, preset, pairs, shrink)
@@ -1065,7 +1073,7 @@ def _setup_flow(swap_url: str):
         if swap.find_binary():
             note("llama-swap уже установлен")
             return "установлен"
-        if ask_yn(f"Вопрос {qnum()} · установить llama-swap?", True,
+        if ask_yn(f"Вопрос {qnum()} · установить llama-swap?",
                   sub="прокси для хот-свапа: один порт, модели меняются полем model"):
             _run_cli("swap", "install")
             return "установлен"
@@ -1106,9 +1114,9 @@ def _setup_flow(swap_url: str):
         if not preset:
             return None
         pairs = ini.section(preset).pairs()
-        if not ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?", False,
+        if not ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?",
                       sub="долго (10–30 мин) и грузит GPU на 100% — "
-                          "запускай в свободное время"):
+                          "только явным «д», Enter ничего не запустит"):
             return "не просил"
         # сам запуск — после плана: там человек один раз решает, можно ли
         # начинать, и к этому моменту известно про mmproj и ускорители
@@ -1134,10 +1142,10 @@ def _setup_flow(swap_url: str):
             return "включено"
         if sibling:
             if ask_yn(f"Вопрос {qnum()} · взять близнец с mmproj ({sibling})?",
-                      False, sub="в нём включено зрение; текстовый быстрее"):
+                      sub="в нём включено зрение; текстовый быстрее"):
                 return sibling
             return "текстовый"
-        ask_yn(f"Вопрос {qnum()} · нужен анализ картинок?", False,
+        ask_yn(f"Вопрос {qnum()} · нужен анализ картинок?",
                sub="понадобится mmproj-файл модели")
         return "текстовый"
 
@@ -1205,7 +1213,7 @@ def _setup_flow(swap_url: str):
                 if want_tune else
                 "выполнить первые два шага (validate + budget, безопасно)?")
     try:
-        go = ask_yn(question, True,
+        go = ask_yn(question,
                     sub="автотюн — надолго, GPU на 100%" if want_tune else "")
     except _GoBack:
         # последний экран потока: «назад» здесь — это в меню
