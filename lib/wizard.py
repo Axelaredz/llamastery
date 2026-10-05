@@ -470,7 +470,7 @@ def run() -> int:
     print("║  llamastery · мастер".ljust(63) + "║")
     print("╚" + "═" * 62 + "╝")
     print("Проверка пресетов, честный прогноз VRAM, замер факта.")
-    print("Замер важнее расчёта. Ничего не гружу и не правлю без твоего «да».")
+    print("Замер важнее расчёта.")
 
     swap_url = swap.load_state().get("url") or f"http://{swap.SWAP_LISTEN}"
     # состояние печатает _main_menu: раньше run() рисовал его сам, а меню
@@ -503,7 +503,7 @@ def _main_menu(swap_url: str) -> tuple[int, str | None]:
     labels = [o[0] for o in options]
     idx = ask(f"Вопрос {qnum()} · что делаем?", options,
               menu_default(options, router_up),
-              sub="меню построено по состоянию выше; Enter — рекомендованный пункт, "
+              sub="Enter — рекомендованный пункт, "
                   "0 — выход")
     if idx == BACK:
         print()
