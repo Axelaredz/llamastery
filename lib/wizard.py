@@ -18,6 +18,7 @@
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import builds, budget, gguf, measure, paths, presets, server, swap, vram
@@ -144,28 +145,76 @@ def _go_back() -> None:
     raise _GoBack
 
 
+@dataclass(frozen=True)
+class PastedPath:
+    """Вставленный вместо номера путь к .gguf — человек хотел не пункт."""
+
+    path: str
+
+
+def _as_model_path(raw: str) -> str | None:
+    """Ввод похож на путь к .gguf? Возвращаем его или None.
+
+    Существование файла не проверяем: «нет файла» в диалоге своёй модели
+    полезнее, чем тихо выбранный ★-дефолт.
+    """
+    s = raw.strip().strip("'\"")
+    if not s or Path(s).suffix.lower() != ".gguf":
+        return None
+    return str(Path(s).expanduser())
+
+
+def _is_int(raw: str) -> bool:
+    try:
+        int(raw)
+        return True
+    except ValueError:
+        return False
+
+
 def ask(title: str, options: list[tuple[str, str]], default: int,
-        sub: str = "") -> int:
+        sub: str = "", paste_model: bool = False) -> int | PastedPath:
     """Вопрос с нумерованным списком. Печатает вопрос, ответ и итог.
 
     options: [(подпись, пояснение)]. Пункт с пометкой ★ — рекомендация.
     На 0 бросает _GoBack, а не возвращает значение.
+
+    Мусорный ввод не проходит молча: если это не номер, показываем, что
+    взяли дефолт. Иначе «вставил путь, нажал Enter» выглядит как «выбрал
+    пресет №3» — ровно то, что человек не хотел.
+    При paste_model=True вставленный путь к .gguf возвращается как
+    PastedPath, и вызывающий сам решает, что с ним делать.
     """
     head(title, sub)
     for i, (label, desc) in enumerate(options, 1):
         mark = f" {STAR}" if i == default else "  "
         tail = f"  {desc}" if desc else ""
         print(f"    {i}.{mark} {label}{tail}")
-    raw = _read(f"ответ (Enter = {default}, 0 = {BACK}) ▸")
+    hint = f"Enter = {default}"
+    if paste_model:
+        hint += ", или вставь путь к .gguf"
+    raw = _read(f"ответ ({hint}, 0 = {BACK}) ▸")
     if raw == "0":
         _go_back()
-    return clamp_choice(raw, len(options), default) - 1
+    if raw and not _is_int(raw):
+        pasted = _as_model_path(raw) if paste_model else None
+        if pasted:
+            print(f"    {ARROW} ответ: {pasted}")
+            return PastedPath(pasted)
+        warn(f"не номер пункта: {raw[:60]!r} — беру {default} (Enter)")
+        return default - 1
+    idx = clamp_choice(raw, len(options), default) - 1
+    if raw and idx + 1 != int(raw):
+        warn(f"в списке нет пункта {raw} — беру {default} (Enter)")
+    return idx
 
 
 def ask_pick(title: str, options: list[tuple[str, str]], default: int,
-             sub: str = "") -> str:
-    """Вопрос со списком → возвращает выбранную метку."""
-    idx = ask(title, options, default, sub)
+             sub: str = "", paste_model: bool = False) -> str | PastedPath:
+    """Вопрос со списком → возвращает выбранную метку (или вставленный путь)."""
+    idx = ask(title, options, default, sub, paste_model=paste_model)
+    if isinstance(idx, PastedPath):
+        return idx
     label = options[idx][0]
     print(f"    {ARROW} ответ: {label}")
     return label
@@ -479,8 +528,11 @@ def _preset_options(
     return opts, sections, default_name
 
 
-def _custom_preset(ini) -> str | None:
+def _custom_preset(ini, prefilled: str | None = None) -> str | None:
     """Пункт «свой .gguf»: путь → чьи флаги → новая секция в models.ini.
+
+    prefilled — путь, вставленный прямо в вопрос со списком пресетов: тогда
+    вопрос про путь не задаётся, человек его уже дал.
 
     Возвращает имя записанной секции. None — человек отказался писать, и
     вызывающий код вернёт его к списку пресетов. Нажатие 0 (и неудачный
@@ -489,11 +541,16 @@ def _custom_preset(ini) -> str | None:
     """
     from .inifile import Section
     head("свой .gguf", "секции в ini нет — сделаем её из файла")
-    raw = ask_text(f"Вопрос {qnum()} · путь к .gguf", "",
-                   sub="Enter — отмена; можно вставить путь из буфера обмена")
-    if not raw:
-        note("путь не задан — возвращаюсь к списку пресетов")
-        return None
+    if prefilled:
+        raw = prefilled
+        note(f"путь из вставки: {raw}")
+    else:
+        raw = ask_text(f"Вопрос {qnum()} · путь к .gguf", "",
+                       sub="Enter — отмена; можно вставить путь из буфера "
+                           "обмена")
+        if not raw:
+            note("путь не задан — возвращаюсь к списку пресетов")
+            return None
     path = Path(raw).expanduser()
     if not path.exists():
         warn(f"нет файла: {path}")
@@ -887,11 +944,17 @@ def _setup_flow(swap_url: str):
             choice = ask_pick(f"Вопрос {qnum()} · какой пресет берём за основу",
                               opts,
                               sections.index(default_name) + 1
-                              if default_name else 1)
+                              if default_name else 1,
+                              paste_model=True)
+            # вставленный путь — это тоже выбор «свой .gguf», только путь
+            # человек уже дал
+            pasted = choice.path if isinstance(choice, PastedPath) else None
+            if isinstance(choice, PastedPath):
+                choice = CUSTOM_MODEL
             if choice != CUSTOM_MODEL:
                 return choice
             try:
-                name = _custom_preset(ini)
+                name = _custom_preset(ini, pasted)
             except _GoBack:
                 continue
             if name:

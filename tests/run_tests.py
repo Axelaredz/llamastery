@@ -1528,7 +1528,7 @@ def test_wizard_custom_gguf_preset(tmp: Path) -> None:
            ).read_text(encoding="utf-8")
     check("_preset_options(ini, custom=True)" in src,
           "поток настройки предлагает свой .gguf")
-    check(src.count("_custom_preset(ini)") >= 1, "пункт обрабатывается потоком")
+    check(src.count("_custom_preset(ini") >= 1, "пункт обрабатывается потоком")
 
 
 def _wizard_env(tmp: Path, answers: list[str]):
@@ -1771,6 +1771,62 @@ def test_wizard_tune_actually_runs(tmp: Path) -> None:
           "нечитаемая модель — None, а не выдуманный ноль")
     check(wizard._fit_mib({"c": "32768"}, 12288) is None,
           "пресет без model — None")
+
+
+def test_wizard_pasted_path_is_not_a_number(tmp: Path) -> None:
+    """Вставленный путь в списке пресетов ведёт в «свой .gguf», а не в ★.
+
+    Регрессия: не-номер уходил в clamp_choice и молча превращался в ★-дефолт
+    — «вставил путь, нажал Enter» выглядело как «выбрал пресет №3».
+    """
+    print("wizard: вставка пути вместо номера")
+
+    check(wizard._as_model_path("/m/Model.gguf") == "/m/Model.gguf",
+          "путь к .gguf распознан")
+    check(wizard._as_model_path("'/m/My Model.GGUF'")
+          == "/m/My Model.GGUF", "кавычки и регистр не мешают")
+    check(wizard._as_model_path("да") is None and wizard._as_model_path("") is None,
+          "не путь — не путь")
+    check(wizard._as_model_path("/нет/такого.gguf") == "/нет/такого.gguf",
+          "несуществующий файл всё равно путь: ошибку даст диалог")
+
+    saved = wizard._read
+    wizard._read = lambda p: "/m/Model.gguf"
+    try:
+        got = wizard.ask_pick("вопрос", [("один", ""), ("два", "")], 2,
+                              paste_model=True)
+        check(isinstance(got, wizard.PastedPath) and got.path == "/m/Model.gguf",
+              "путь вернулся как PastedPath, а не как номер", got)
+        # без флага вставка не принимается — но и не проходит молча
+        got2 = wizard.ask_pick("вопрос", [("один", ""), ("два", "")], 2)
+        check(got2 == "два", "без paste_model берётся ★-дефолт", got2)
+    finally:
+        wizard._read = saved
+
+    # мусор и несуществующий пункт объясняются, а не молчатся
+    for raw, want in (("автотюн", "два"), ("9", "два")):
+        wizard._read = lambda p, r=raw: r
+        try:
+            got = wizard.ask_pick("вопрос", [("один", ""), ("два", "")], 2)
+        finally:
+            wizard._read = saved
+        check(got == want, f"{raw!r} → дефолт", got)
+
+    # полный путь: вставка в список → диалог без вопроса про путь → секция.
+# Ответы: сборка, вставленный путь, чьи флаги, дописать, тюн, контекст,
+# ngram, mtp, финал
+    model = _write_fake_gguf(tmp / "Pasted Model.gguf")
+    env, calls = _wizard_env(tmp, ["1", str(model), "1", "y", "n", "", "n",
+                                   "n", "n"])
+    with env:
+        rc = wizard._setup_flow("http://127.0.0.1:8087")
+    check(rc == 0, "поток дошёл до конца", rc)
+    check("· путь к .gguf" not in env.text,
+          "путь из вставки повторно не спрашивается")
+    check("путь из вставки" in env.text, "путь из вставки показан")
+    check("[pasted-model]" in (tmp / "models.ini").read_text(encoding="utf-8"),
+          "секция создана по вставленному пути")
+    check(not any(c[0] == "tune" for c in calls), "тюнер не трогали", calls)
 
 
 def test_probe_retries_on_immediate_stop() -> None:
