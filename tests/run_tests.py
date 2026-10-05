@@ -1996,6 +1996,77 @@ def test_wizard_yn_has_no_default() -> None:
     check(raised, "0 = назад, а не «нет»")
 
 
+def test_tune_needle_retry_on_truncation() -> None:
+    """Обрыв по finish_reason=length — это добор бюджета, а не провал.
+
+    Регрессия (прогон cyber 2026-10-06): needle_ok был один булев, поэтому
+    модель, вшедшая в цикл повторов и упёршаяся в n_predict, считалась
+    «не извлекла факт». На NanoPlus так кончились 10 проб из 18 при 8 needle=True
+    — конфигурации летели в мусор, а тюнер потом выбросил и ranking.json.
+    """
+    print("тюнер: обрыв ответа ≠ провал извлечения")
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tune_models_under_test",
+        ROOT / "tools" / "tune_models.py")
+    T = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(T)
+
+    saved_prompt = T.make_prompt
+    T.make_prompt = lambda target, nonce, port, tt=240: ("P", "SECRET", target)
+
+    def fake(trunc_first: bool, ok_on_retry: bool):
+        """trunc_first: первая проба обрывается (length). ok_on_retry: добор спасает."""
+        calls = []
+
+        def completion(port, prompt, secret, estimated, timeout, n_predict,
+                       warm=False):
+            calls.append(n_predict)
+            trunc = trunc_first or not ok_on_retry
+            got = (secret == "SECRET") and (not trunc_first or ok_on_retry)
+            return {"estimated_tokens": estimated, "prompt_n": estimated,
+                    "predicted_n": n_predict, "prefill_tps": 700.0,
+                    "gen_tps": 50.0, "wall_s": 1.0,
+                    "needle_ok": got, "needle_truncated": trunc,
+                    "answer": "SECRET" if got else "KF58",
+                    "reasoning": "", "low_decode_sample": False,
+                    "finish_reason": "length" if trunc else "stop"}
+        return completion, calls
+
+    try:
+        # первая проба обрывается, добор достаёт секрет
+        T.completion, calls = fake(True, True)
+        r = T.probe_series(1, 8192, "deep", 60, 64, 10, 2)
+        check(r["needle_ok"] and r["needle_retries"] == 2,
+              "обрыв добирается до успеха",
+              (r["needle_ok"], r["needle_retries"]))
+        check(calls == [64, 256, 64, 256],
+              "бюджет добирается ×4, скорость меряется по первой пробе", calls)
+
+        # обрыв есть, добор не помогает — провал настоящий
+        T.completion, calls = fake(True, False)
+        r2 = T.probe_series(1, 8192, "deep", 60, 64, 10, 2)
+        check(not r2["needle_ok"], "если и добор не помог — провал настоящий")
+        check(r2["needle_retries"] == 2, "пробовали обе", r2["needle_retries"])
+
+        # ответа без обрыва — добор не делаем вовсе
+        T.completion, calls = fake(False, True)
+        r3 = T.probe_series(1, 8192, "deep", 60, 64, 10, 2)
+        check(calls == [64, 64], "при finish_reason=stop добора нет", calls)
+        check(r3["needle_retries"] == 0, "лишних проб не делаем")
+    finally:
+        T.make_prompt = saved_prompt
+
+    # все провалились — данные не выбрасываем
+    src = (ROOT / "tools" / "tune_models.py").read_text(encoding="utf-8")
+    check("_report_without_winner(results, args)" in src,
+          "при провале всех ranking.json всё равно пишется")
+    body = src.split("if not good:", 1)[1][:600]
+    check("raise SystemExit" in body and "_report_without_winner" in body,
+          "сначала отчёт, потом выход")
+
+
 def test_probe_retries_on_immediate_stop() -> None:
     """Модель, замолчавшая на первом токене, не выпадает из замера.
 

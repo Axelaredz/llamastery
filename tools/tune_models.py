@@ -623,6 +623,34 @@ def completion(port, prompt, secret, estimated, timeout, n_predict, warm=False):
             f"prompt_n={prompt_n}, ожидалось около {estimated}"
         )
 
+    # BUGFIX (прогон cyber 2026-10-06): needle_ok был один булев, поэтому
+    # finish_reason=length (модель вошла в цикл повторов и упёрлась в
+    # n_predict) неотличим от «секрет не извлечён». А провалы needle гоняли
+    # ВСЮ конфигурацию в мусор: на Cyber-Tiel-NanoPlus 10 из 18 проб кончились
+    # именно так, при этом 8 были needle=True. Теперь при length ответ
+    # переспрашивается с большим бюджетом — и только если и там секрета нет,
+    # провал настоящий.
+    finish = choice.get("finish_reason")
+    needle_ok = secret in content
+    needle_truncated = (not needle_ok) and finish == "length"
+    if needle_truncated:
+        return {
+            "estimated_tokens": estimated,
+            "prompt_n": prompt_n,
+            "predicted_n": predicted_n,
+            "prefill_tps": (
+                round(prompt_n * 1000 / prompt_ms, 2) if prompt_ms > 0 else None
+            ),
+            "gen_tps": round(predicted_n * 1000 / predicted_ms, 2),
+            "wall_s": round(elapsed, 2),
+            "needle_ok": False,
+            "needle_truncated": True,
+            "answer": content[:160],
+            "reasoning": reasoning[:120],
+            "finish_reason": finish,
+            "low_decode_sample": predicted_n < 32,
+        }
+
     return {
         "estimated_tokens": estimated,
         "prompt_n": prompt_n,
@@ -632,10 +660,11 @@ def completion(port, prompt, secret, estimated, timeout, n_predict, warm=False):
         ),
         "gen_tps": round(predicted_n * 1000 / predicted_ms, 2),
         "wall_s": round(elapsed, 2),
-        "needle_ok": secret in content,
+        "needle_ok": needle_ok,
+        "needle_truncated": False,
         "answer": content[:160],
         "reasoning": reasoning[:120],
-        "finish_reason": choice.get("finish_reason"),
+        "finish_reason": finish,
         "low_decode_sample": predicted_n < 32,
     }
 
@@ -701,6 +730,34 @@ def probe_series(
             n_predict,
             warm=False,
         )
+        # Добиваем ответ: модель на NanoPlus часто входит в цикл повторов и
+        # обрывается на n_predict, не успев дописать секрет. Это не провал
+        # извлечения, а нехватка бюджета — даём больше и спрашиваем заново.
+        if res.get("needle_truncated"):
+            retry = completion(
+                port,
+                prompt,
+                secret,
+                estimated,
+                timeout,
+                max(n_predict * 4, 256),
+                warm=False,
+            )
+            res["needle_retried"] = True
+            if retry.get("needle_ok"):
+                # скорость меряем по первой пробе: переспрос не должен
+                # попадать в gen_tps, он дольше по построению
+                retry["gen_tps"] = res["gen_tps"]
+                retry["prefill_tps"] = res["prefill_tps"]
+                # флаг переносим на retry: ниже res = retry, и без этого
+                # счётчик доборов показывал бы ноль при успешном добире
+                retry["needle_retried"] = True
+                retry["retry_note"] = (
+                    f"секрет извлечён со второй попытки "
+                    f"(n_predict {n_predict} → "
+                    f"{max(n_predict * 4, 256)})"
+                )
+                res = retry
         samples.append(res)
 
     gen_values = [float(s["gen_tps"]) for s in samples]
@@ -725,6 +782,7 @@ def probe_series(
         "prompt_n_median": round(statistics.median(prompt_values), 1),
         "estimated_median": round(statistics.median(estimated_values), 1),
         "needle_ok": all(bool(s["needle_ok"]) for s in samples),
+        "needle_retries": sum(1 for s in samples if s.get("needle_retried")),
         "answer": samples[0]["answer"],
         "warmup": warmup_info,
         "samples": samples,
@@ -1741,6 +1799,68 @@ def csv_ints(value, name, allow_empty=False):
         raise SystemExit(f"--{name}: ожидались целые числа через запятую")
 
 
+def _rank_all(results, weights):
+    """Ранжирует любые результаты — прошедшие и нет.
+
+    Тот же rank_score, что у победителя, но без фильтра по ok: когда
+    не прошёл никто, сравнивать всё равно нужно, иначе человек не видит,
+    что именно помешало.
+    """
+    if not results:
+        return []
+    fastest_gen = max(
+        float(r["deep"]["gen_tps"]) for r in results
+        if r.get("deep") and r["deep"].get("gen_tps")
+    )
+    close = [
+        r for r in results
+        if r.get("deep") and r["deep"].get("gen_tps")
+        and float(r["deep"]["gen_tps"]) >= fastest_gen * 0.90
+    ] or [r for r in results if r.get("deep")]
+    for r in close:
+        r["_rank"] = rank_score(r, weights)
+    return sorted(close, key=lambda r: r["_rank"], reverse=True)
+
+
+def _report_without_winner(results, args):
+    """Все прогоны провалились: показываем, что измерено, и почему не вышло."""
+    weights = {
+        "balanced": (0.55, 0.30, 0.15),
+        "gen": (0.80, 0.10, 0.10),
+        "prefill": (0.20, 0.65, 0.15),
+        "vram": (0.35, 0.20, 0.45),
+    }.get(args.optimize_for, (0.55, 0.30, 0.15))
+    ranked = _rank_all(results, weights)
+
+    print(f"\nНИ ОДНА КОНФИГУРАЦИЯ НЕ ПРОШЛА (проб: {len(results)})")
+    print("Ранжирование всё же измеренного — по скорости и запасу VRAM.\n")
+    for i, r in enumerate(ranked, 1):
+        d = r.get("deep") or {}
+        cfg = r.get("config", {})
+        print(f"  {i}. gen={d.get('gen_tps')} "
+              f"prefill={d.get('prefill_tps')} "
+              f"free={r.get('min_observed_free_mib')} MiB "
+              f"c={cfg.get('c')} moe={cfg.get('n-cpu-moe')} "
+              f"ubatch={cfg.get('ubatch-size')}")
+        print(f"     провал: {r.get('error')}")
+    best = ranked[0] if ranked else None
+    if best is not None:
+        d = best.get("deep") or {}
+        print(f"\nБЛИЖАЙШИЙ К ПРОХОДУ (gen={d.get('gen_tps')} t/s, "
+              f"VRAM свободно {best.get('min_observed_free_mib')} MiB):")
+        print(json.dumps(best["config"], indent=2, ensure_ascii=False))
+        print(f"\nПроблема не в скорости, а в проверке: {best.get('error')}")
+        print("Если это сбой самой модели (например, извлечение факта), "
+              "параметры можно записать вручную — но сначала убедись, что "
+              "модель в порядке: llmustery probe --preset <секция>")
+    print("\nINI НЕ ИЗМЕНЁН. Ручная запись — "
+          "llamastery presets annotate --apply, либо отредактируй секцию.")
+    (args.out / "ranking.json").write_text(
+        json.dumps(ranked[:10], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def main():
     p = argparse.ArgumentParser(
         description=(
@@ -2384,7 +2504,17 @@ def main():
 
     good = [r for r in results if r.get("ok")]
     if not good:
-        raise SystemExit("Нет прошедших конфигураций. Проверьте логи: " + str(args.out))
+        # BUGFIX (прогон cyber 2026-10-06): ни одна конфигурация не прошла,
+        # тюнер падал в SystemExit и ВЫБРАСЫВАЛ 30 минут работы — ни ranking.json,
+        # ни разбора, ни единого числа. Человек оставался с пустым каталогом и
+        # выводом «Нет прошедших конфигураций». Теперь ранжируем всё, что
+        # измерили, показываем лучшее с причиной провала и НЕ применяем: выбор
+        # за человеком, но данные на руках.
+        _report_without_winner(results, args)
+        raise SystemExit(
+            "Ни одна конфигурация не прошла проверки — выбор за тобой, "
+            f"разбор: {args.out}"
+        )
 
     largest_ctx = max(int(r["config"]["c"]) for r in good)
     comparable = [r for r in good if int(r["config"]["c"]) == largest_ctx]
