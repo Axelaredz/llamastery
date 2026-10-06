@@ -305,20 +305,32 @@ def tail_file(path, chars=5000):
 
 
 def stop_process(process):
+    """Убить процесс и его группу. Повторный Ctrl+C не должен прервать
+    очистку: llama-server, оставшийся в своей сессии, держит VRAM до
+    ручного kill, и следующий прогон падает по памяти."""
     if process.poll() is not None:
         return
+    # SIGINT блокируется на время зачистки: обычный Ctrl+C уже получен,
+    # второй не должен оставить недоубитый процесс
+    old_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass
-        process.wait()
+            return
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+    finally:
+        if old_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 # Ключи, которые тюнер не подбирает сам, но обязан передать дословно.
@@ -882,7 +894,11 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
         "cache-reuse": str(variant.get("reuse", args.cache_reuse)),
     })
 
-    if not args.keep_mmproj:
+    # mmproj выбрасывается только если зрение не нужно ни для сохранения
+    # (--keep-mmproj), ни для замера (--allow-vision): иначе вторая ветка
+    # добавления --mmproj в build_server_command была недостижима, и
+    # --allow-vision молча мерял текстовый прогон
+    if not (args.keep_mmproj or args.allow_vision):
         for key in ("mmproj", "image-min-tokens", "mmproj-offload"):
             cfg.pop(key, None)
 
@@ -906,11 +922,14 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
         "kv-unified",
         "jinja",
         "cache-reuse",
+        "model",   # замер не должен выдаваться за замер другой модели
     )
 
     eff_lm = args.load_mode if args.load_mode != "default" else str(cfg.get("load-mode", "default"))
     result = {
-        "config": {key: cfg[key] for key in selected_config_keys},
+        # ключа может не быть (пресет задаёт модель через "m" или CLI):
+        # absent-ключи не пишутся, а не роняют прогон
+        "config": {key: cfg[key] for key in selected_config_keys if key in cfg},
         "config_extra": {
             "load-mode": eff_lm if caps.get("load-mode") else "default",
         },
@@ -1376,26 +1395,6 @@ def variant_key(variant):
     return json.dumps(variant, sort_keys=True, ensure_ascii=False)
 
 
-def config_to_variant(cfg):
-    """Собрать variant-словарь из config прошлого результата (для --reuse-results)."""
-    return {
-        "moe": safe_int(cfg.get("n-cpu-moe", 0), 0),
-        "ubatch": safe_int(cfg.get("ubatch-size", 2048), 2048),
-        "threads": safe_int(cfg.get("t", 8), 8),
-        "threads_batch": safe_int(cfg.get("threads-batch", 16), 16),
-        "kv_cache_type": str(cfg.get("cache-type-k", "q8_0")),
-        "fa": str(cfg.get("fa", "on")),
-        "reuse": safe_int(cfg.get("cache-reuse", 0), 0),
-        "ngl": safe_int(cfg.get("n-gpu-layers", 999), 999),
-        "kv_unified": str(cfg.get("kv-unified", "on")),
-    }
-
-
-def log_progress(path, message):
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(message + "\n")
-
-
 def default_variant(args):
     return {
         "moe": 0,
@@ -1679,7 +1678,6 @@ def expand_server_candidates(
     selected,
     args,
     server_caps,
-    bench_caps,
     allow_ot,
     screen_moe_enabled,
     limit,
@@ -1809,14 +1807,17 @@ def _rank_all(results, weights):
     if not results:
         return []
     fastest_gen = max(
-        float(r["deep"]["gen_tps"]) for r in results
-        if r.get("deep") and r["deep"].get("gen_tps")
+        (float(r["deep"]["gen_tps"]) for r in results
+         if r.get("deep") and r["deep"].get("gen_tps")),
+        default=0.0,
     )
     close = [
         r for r in results
         if r.get("deep") and r["deep"].get("gen_tps")
         and float(r["deep"]["gen_tps"]) >= fastest_gen * 0.90
-    ] or [r for r in results if r.get("deep")]
+    ] or [r for r in results if r.get("deep") is not None]
+    # `is not None`, а не truthiness: у провального прогона deep бывает
+    # пустым словарём, и именно его замеры VRAM должен показать отчёт
     for r in close:
         r["_rank"] = rank_score(r, weights)
     return sorted(close, key=lambda r: r["_rank"], reverse=True)
@@ -1994,18 +1995,10 @@ def main():
     if args.moe_step < 1:
         p.error("--moe-step должен быть >= 1")
     if str(args.ubatch_values or "").strip():
-        try:
-            _ub = [int(x.strip()) for x in args.ubatch_values.split(",") if x.strip()]
-        except ValueError:
-            p.error("--ubatch-values: ожидались целые числа через запятую")
-        if not _ub or any(v < 128 for v in _ub):
+        if any(v < 128 for v in csv_ints(args.ubatch_values, "ubatch-values")):
             p.error("--ubatch-values: нужен непустой список значений >= 128")
     if str(args.moe_values or "").strip():
-        try:
-            _moe = [int(x.strip()) for x in args.moe_values.split(",") if x.strip()]
-        except ValueError:
-            p.error("--moe-values: ожидались целые числа через запятую")
-        if not _moe or any(v < 0 for v in _moe):
+        if any(v < 0 for v in csv_ints(args.moe_values, "moe-values")):
             p.error("--moe-values: нужен непустой список неотрицательных целых чисел")
     if args.max_cpu_moe < 0:
         p.error("--max-cpu-moe должен быть >= 0")
@@ -2094,8 +2087,9 @@ def main():
             print("ВНИМАНИЕ: ot игнорируется; добавьте --allow-ot для явного теста.")
         opts.pop("ot", None)
 
-    if not args.keep_mmproj and opts.get("mmproj"):
-        print("ВНИМАНИЕ: mmproj исключён из текстового бенча; используйте --keep-mmproj для VLM.")
+    if not (args.keep_mmproj or args.allow_vision) and opts.get("mmproj"):
+        print("ВНИМАНИЕ: mmproj исключён из текстового бенча; используйте "
+              "--keep-mmproj для постоянного зрения или --allow-vision для разового.")
 
     if not server_caps.get("n-cpu-moe"):
         print("ВНИМАНИЕ: сборка не поддерживает --n-cpu-moe; MoE offload sweep выключен.")
@@ -2212,7 +2206,7 @@ def main():
         scored = []
 
         if bench_tool:
-            bench_caps = detect_bench_caps(bench_tool)
+            bench_caps = bench_caps_screen
             if not bench_caps:
                 print("ВНИМАНИЕ: не удалось определить флаги llama-bench; screening пропущен.")
             else:
@@ -2264,25 +2258,23 @@ def main():
                 scored.sort(key=lambda x: x[0], reverse=True)
 
                 # Раунды уточнения (staged): берём победителя и пробуем
-                # вокруг него по одному параметру. Ось, которая не дала
-                # прироста, второй раз не крутится — иначе бюджет уходит
-                # в повторы одного и того же.
+                # вокруг него по одному параметру. Уже измеренное (включая
+                # проваленных в screening!) повторно не гоняется — каждый
+                # лишний прогон это минуты GPU. Отдельный список «осей, где
+                # уже пробовали» не нужен: он гарантированно опустошал
+                # `fresh` во втором раунде, и --refine-rounds не делал ничего.
                 if args.search == "staged" and args.refine_rounds > 0:
-                    measured = {variant_key(v) for _, v, _ in scored}
-                    tried_axes = set()
+                    measured = {variant_key(e["variant"])
+                                for e in screen_report["candidates"]}
                     best_score = scored[0][0] if scored else 0.0
                     for rnd in range(1, args.refine_rounds + 1):
                         if not scored:
                             break
                         scored.sort(key=lambda x: x[0], reverse=True)
                         base_v = scored[0][1]
-                        fresh = []
-                        for v in axis_variants(base_v, args,
-                                               screen_moe_enabled,
-                                               exclude=measured):
-                            if v.get("_axis") in tried_axes:
-                                continue
-                            fresh.append(v)
+                        fresh = axis_variants(base_v, args,
+                                              screen_moe_enabled,
+                                              exclude=measured)
                         if not fresh:
                             print(f"[refine {rnd}] новых вариантов нет — стоп")
                             break
@@ -2296,7 +2288,6 @@ def main():
                         print(f"[refine {rnd}] вокруг {base_v}: "
                               f"{len(fresh)} кандидатов")
                         for v in fresh:
-                            tried_axes.add(v.get("_axis"))
                             measured.add(variant_key(v))
                             entry = {"variant": v, "ok": False, "score": 0.0,
                                      "pp_tps": 0.0, "tg_tps": 0.0, "error": None}
@@ -2388,7 +2379,6 @@ def main():
         selected,
         args,
         server_caps,
-        bench_caps,
         allow_ot,
         screen_moe_enabled,
         candidate_limit,

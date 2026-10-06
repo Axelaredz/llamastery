@@ -115,7 +115,9 @@ def state_dir() -> Path:
 
 
 def _state() -> Path:
-    d = paths.home() / ".local" / "state" / "llamastery"
+    # paths.state_dir() уважает LLAMASTERY_STATE_DIR: без этого калибровки и
+    # журнал падений уходили в один каталог, а pid/лог — в другой
+    d = paths.state_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -194,18 +196,6 @@ def api_load(model_id: str) -> dict:
 
 def api_unload(model_id: str) -> dict:
     return http("POST", f"{server_url()}/models/unload", {"model": model_id})
-
-
-def is_router() -> bool:
-    """Роутер ли это. У одиночного сервера эндпоинта /models нет."""
-    if http("GET", f"{server_url()}/models", timeout=3.0):
-        return True
-    owner = identify(pid_on_port())
-    if owner:
-        b = builds.get(owner)
-        if b is not None:
-            return bool(b.router)
-    return False
 
 
 def loaded_models() -> list[dict]:
@@ -373,7 +363,10 @@ def build_env(build: builds.Build) -> dict[str, str]:
     if var == "PATH":  # Windows ищет .dll по PATH — добавляем bindir в начало
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     else:
-        env.setdefault(var, bindir)
+        # prepend, а не setdefault: при уже заданной переменной (типично для
+        # машин с CUDA-стеком) bindir форка иначе не попадает в путь вовсе
+        existing = env.get(var)
+        env[var] = f"{bindir}{os.pathsep}{existing}" if existing else bindir
     for k, v in (build.env or {}).items():
         env.setdefault(k, str(v))
     return env
@@ -545,7 +538,7 @@ def start(build_name: str | None = None, ini: str | None = None,
             return StartResult(True, pid=owner_pid,
                                message=f"уже работает: {build.name} "
                                        f"(pid {owner_pid})")
-        _terminate(owner_pid)
+        _terminate(owner_pid, graceful=True)
 
     env = build_env(build)
     if build.router:
@@ -596,33 +589,37 @@ def _spawn(build: builds.Build, env: dict, argv: list[str], timeout: int,
     log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
               f"{build.name}: {' '.join(argv)}\n")
     log.flush()
-    try:
-        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, env=env,
-                                start_new_session=True)
-    except OSError as exc:
-        res.ok = False
-        res.message = f"не запустился: {exc}"
-        return res
-    pid_file().write_text(str(proc.pid), encoding="utf-8")
-    res.pid = proc.pid
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
+    # with закрывает дескриптор в родителе на всех путях выхода: у ребёнка
+    # остаётся собственная копия fd, а вот незакрытый fd при ошибке Popen
+    # висел бы до конца процесса CLI
+    with log:
+        try:
+            proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, env=env,
+                                    start_new_session=True)
+        except OSError as exc:
             res.ok = False
-            res.message = (f"процесс умер с кодом {proc.returncode}. "
-                           f"лог: {log_file()}")
+            res.message = f"не запустился: {exc}"
             return res
-        if healthy():
-            res.ok = True
-            res.message = (f"роутер готов: {server_url(build.name)} "
-                       f"({build.name}, pid {proc.pid})")
-            return res
-        time.sleep(0.5)
-    res.ok = False
-    res.message = (f"сервер не ответил за {timeout} с. лог: {log_file()}")
-    return res
+        pid_file().write_text(str(proc.pid), encoding="utf-8")
+        res.pid = proc.pid
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                res.ok = False
+                res.message = (f"процесс умер с кодом {proc.returncode}. "
+                               f"лог: {log_file()}")
+                return res
+            if healthy():
+                res.ok = True
+                res.message = (f"роутер готов: {server_url(build.name)} "
+                               f"({build.name}, pid {proc.pid})")
+                return res
+            time.sleep(0.5)
+        res.ok = False
+        res.message = (f"сервер не ответил за {timeout} с. лог: {log_file()}")
+        return res
 
 
 def stop(timeout: int = 30) -> tuple[bool, str]:
@@ -644,11 +641,21 @@ def stop(timeout: int = 30) -> tuple[bool, str]:
     if not pids:
         return True, "сервер не запущен"
     msgs = []
+    ok_all = True
     for pid in pids:
-        who = identify(pid) or "процесс"
+        who = identify(pid)
+        if who is None and os.name != "nt":
+            # /proc есть, а сборку по exe определить нельзя: на порту чужой
+            # сервис или pid переиспользован. Завершать чужой процесс нельзя —
+            # пропускаем и честно говорим об этом.
+            ok_all = False
+            msgs.append(f"pid {pid}: не наша сборка — пропущен")
+            continue
+        who = who or "процесс"
         try:
             _terminate(pid, graceful=True)
         except OSError as exc:
+            ok_all = False
             msgs.append(f"{who} (pid {pid}): не удалось завершить — {exc}")
             continue
         deadline = time.monotonic() + timeout
@@ -660,13 +667,16 @@ def stop(timeout: int = 30) -> tuple[bool, str]:
                 time.sleep(0.5)
             except OSError:
                 pass
-        msgs.append(f"{who} (pid {pid}): остановлен"
-                    + ("" if not alive(pid) else " — не уходит даже по SIGKILL"))
+        if alive(pid):
+            ok_all = False
+            msgs.append(f"{who} (pid {pid}): не уходит даже по SIGKILL")
+        else:
+            msgs.append(f"{who} (pid {pid}): остановлен")
     try:
         pid_file().unlink()
     except OSError:
         pass
-    return all("остановлен" in m or "не запущен" in m for m in msgs), "; ".join(msgs)
+    return ok_all, "; ".join(msgs)
 
 
 def status() -> dict:

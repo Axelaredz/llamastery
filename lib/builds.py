@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -226,7 +227,20 @@ def _load() -> dict:
     p = paths.builds_file()
     if not p.exists():
         return {"version": 1, "builds": {}}
-    return json.loads(p.read_text(encoding="utf-8"))
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        # один раз повреждённый файл не должен делать мёртвой всю команду:
+        # сохраняем копию и начинаем с пустого реестра, как это делает crashes
+        bak = p.with_suffix(p.suffix + ".broken")
+        try:
+            bak.write_text(p.read_text(encoding="utf-8", errors="replace"),
+                           encoding="utf-8")
+        except OSError:
+            bak = None
+        print(f"реестр сборок повреждён ({exc}); копия: {bak or 'не создана'}",
+              file=sys.stderr)
+        return {"version": 1, "builds": {}}
 
 
 def _save(data: dict) -> Path:

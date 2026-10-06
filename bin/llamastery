@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -236,7 +237,9 @@ def cmd_presets(args) -> int:
     if args.action == "annotate":
         from lib import annotate as _a
         ini = _load_ini(args.ini)
-        rep = _a.annotate(ini, apply_changes=args.apply)
+        # dry-run сильнее --apply: главный инвариант инструмента —
+        # «ничего не пишем без явного разрешения», и здесь он обязан работать
+        rep = _a.annotate(ini, apply_changes=args.apply and not args.dry_run)
         if args.dry_run or not args.apply:
             import difflib
             d = difflib.unified_diff(ini.text.splitlines(),
@@ -270,7 +273,11 @@ def cmd_presets(args) -> int:
         return 0
 
     if args.action == "import":
-        text, origin = presets.fetch_source(args.source)
+        try:
+            text, origin = presets.fetch_source(args.source)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         tmp = Path(paths.cache_dir()) / "import-source.ini"
         tmp.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(text, encoding="utf-8")
@@ -284,10 +291,12 @@ def cmd_presets(args) -> int:
             tgt = IniFile(str(target_path), "")
             print(f"цель не существует, будет создана: {target_path}")
 
+        # --conflicts — явное разрешение перезаписать конфликтующие ключи
+        on_conflict = "overwrite" if args.conflicts else args.on_conflict
         res = presets.merge_into(tgt, src_ini, only=args.only,
                                  rename=dict(p.split("=", 1) for p in (args.rename or [])
                                              if "=" in p),
-                                 on_conflict=args.on_conflict)
+                                 on_conflict=on_conflict)
         print(f"источник: {origin}")
         print(f"цель:     {target_path}")
         print(f"добавлено: {len(res.added)}  обновлено: {len(res.updated)}  "
@@ -308,8 +317,9 @@ def cmd_presets(args) -> int:
         if args.dry_run:
             print("\n(dry-run: файл не тронут)")
             return 0
-        if args.conflicts and args.on_conflict == "skip":
-            print("\nесть конфликты — нужен --on-conflict overwrite или --conflicts")
+        if res.conflicts and on_conflict == "skip":
+            print("\nесть конфликты — перезапись не разрешена: "
+                  "добавь --conflicts или --on-conflict overwrite")
             return 3
         bk = (presets.backup(target_path) if target_path.exists()
               else None)
@@ -618,10 +628,14 @@ def cmd_runtime(args) -> int:
         if not server.healthy():
             print("сервер не запущен — выгружать нечего, VRAM свободна")
             return 0
+        # позиционный аргумент (`runtime unload имя`) — то же, что --model:
+        # без этого лишний аргумент молча игнорировался, и вместо одной
+        # модели выгружались ВСЕ загруженные
+        model = args.model or (args.args[0] if getattr(args, "args", None) else None)
         listed = server.models()
-        want = [args.model] if args.model else [m["id"] for m in listed
-                                                if m["status"] in
-                                                ("loaded", "sleeping", "loading")]
+        want = [model] if model else [m["id"] for m in listed
+                                      if m["status"] in
+                                      ("loaded", "sleeping", "loading")]
         if not want:
             print("загруженных моделей нет")
             return 0
@@ -903,11 +917,22 @@ def calibrate_from_tune() -> int:
     import math
     cal = budget.load_calibration()
     real = cal.get("offload_realization", 0.89)
+    total_mib = budget.gpu_total_mib()
+    if not total_mib:
+        print("нужен nvidia-smi")
+        return 1
+    # переопределение калибровки на время расчёта структуры: раньше оно
+    # писалось на диск и восстанавливалось после каждого прогона, и любая
+    # ошибка между записью и восстановлением оставляла калибровку обнулённой
+    cal_override = {**cal, "offload_realization": real,
+                    "compute_gb": 0.0, "compute_ref_ubatch": 0}
+    meta_cache: dict[str, object] = {}
     residuals, ubs = [], []
     for f in sorted(glob.glob(str(paths.home() / ".config" / "llama" /
                                   "tune-results" / "*" / "*" / "results.json"))):
         try:
-            runs = _json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8") as fh:
+                runs = _json.load(fh)
         except (OSError, _json.JSONDecodeError):
             continue
         for r in runs if isinstance(runs, list) else []:
@@ -928,27 +953,26 @@ def calibrate_from_tune() -> int:
             model = _val("--model")
             if not model or not gguf.is_gguf(model):
                 continue
-            try:
-                meta = gguf.probe(model)
-            except gguf.GGUFError:
+            if model not in meta_cache:
+                try:
+                    meta_cache[model] = gguf.probe(model)
+                except gguf.GGUFError:
+                    meta_cache[model] = None
+            meta = meta_cache[model]
+            if meta is None:
                 continue
-            total_mib = budget.gpu_total_mib()
-            if not total_mib:
-                print("нужен nvidia-smi")
-                return 1
             used = (total_mib - int(free)) / 1024.0
             mm = None
             mp = _val("--mmproj")
             if mp and gguf.is_gguf(mp):
-                try:
-                    mm = gguf.probe(mp)
-                except gguf.GGUFError:
-                    mm = None
-            tmp = budget.load_calibration()
-            budget.save_calibration({**tmp, "offload_realization": real,
-                                     "compute_gb": 0.0, "compute_ref_ubatch": 0})
-            struct = budget.estimate(cfg, meta, compute_gb=0.0, mmproj_meta=mm)
-            budget.save_calibration(tmp)
+                if mp not in meta_cache:
+                    try:
+                        meta_cache[mp] = gguf.probe(mp)
+                    except gguf.GGUFError:
+                        meta_cache[mp] = None
+                mm = meta_cache[mp]
+            struct = budget.estimate(cfg, meta, compute_gb=0.0,
+                                     mmproj_meta=mm, _cal=cal_override)
             s = struct.weights_gb + struct.kv_gb + struct.mmproj_gb
             if used > s:
                 residuals.append(used - s)
@@ -1125,7 +1149,12 @@ def cmd_measure(args) -> int:
             if not (model and gguf.is_gguf(model)):
                 print("  перекалибровка пропущена: нет файла модели")
                 continue
-            meta = gguf.probe(model)
+            try:
+                meta = gguf.probe(model)
+            except gguf.GGUFError as exc:
+                # недокачанный/битый GGUF не должен ронять остаток прохода
+                print(f"  перекалибровка пропущена: {exc}", file=sys.stderr)
+                continue
             mm = None
             if pairs.get("mmproj") and gguf.is_gguf(pairs["mmproj"]):
                 try:

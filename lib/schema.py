@@ -298,10 +298,3 @@ def resolve(flags: dict[str, Flag], key: str) -> Flag | None:
             if x.lower() == low:
                 return f
     return None
-
-
-# ── флаги, которыми роутер управляет сам: пресет не может их переопределить ──
-CONTROL_ARGS = {
-    "port", "host", "alias", "model", "m", "mmproj", "hf-repo", "hf-repo",
-    "models-dir", "models-max", "models-preset", "api-key",
-}

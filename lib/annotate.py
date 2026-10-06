@@ -52,9 +52,13 @@ RULE_RE = re.compile(r"^;\s*[-]{10,}\s*$")
 RULE_GROUP_RE = re.compile(r"^;\s*={10,}\s*$")
 
 TG_RE = re.compile(r"tg[^0-9]{0,12}(\d+[.,]?\d*)\s*t/s", re.I)
-VRAM_RE = re.compile(r"(\d+[.,]?\d*)\s*(?:ГБ|GiB|GB|MiB|МБ)", re.I)
-MINFREE_RE = re.compile(r"min free\s+(\d{3,5})\s*MiB", re.I)
+VRAM_RE = re.compile(r"(\d+[.,]?\d*)\s*(ГБ|GiB|GB|MiB|МБ)", re.I)
+MINFREE_RE = re.compile(r"min free\s+(\d{2,6})\s*MiB", re.I)
 NEEDLE_RE = re.compile(r"needle\s*(OK|ок|\d/\d)", re.I)
+
+_PROBE_CACHE: dict[str, "gguf.ModelMeta | None"] = {}
+
+
 STAGE_RE = re.compile(r"(tiel[\w-]*|stage[\w-]*)\s*(\d{4}-\d{2}-\d{2})?", re.I)
 
 
@@ -196,8 +200,22 @@ def _vram_from_prose(lines: list[str]) -> tuple[float, str] | None:
     m = VRAM_RE.search(text)
     if m:
         v = float(m.group(1).replace(",", "."))
+        if m.group(2).lower() in ("mib", "мб"):
+            v /= 1024.0
         return v, text[:120]
     return None
+
+
+def _probe_cached(path: str):
+    """gguf.probe с кэшем на процесс: в annotate() одна и та же модель
+    (файл бывает по 40+ ГБ) парсится на каждой секции заново."""
+    key = str(path)
+    if key not in _PROBE_CACHE:
+        try:
+            _PROBE_CACHE[key] = gguf.probe(path)
+        except gguf.GGUFError:
+            _PROBE_CACHE[key] = None
+    return _PROBE_CACHE[key]
 
 
 def build_metrics(name: str, pairs: dict, store: dict, cal: dict,
@@ -269,19 +287,14 @@ def build_metrics(name: str, pairs: dict, store: dict, cal: dict,
     meta = None
     mp = pairs.get("model") or pairs.get("m") or ""
     if mp and gguf.is_gguf(mp):
-        try:
-            meta = gguf.probe(mp)
-        except gguf.GGUFError:
-            meta = None
+        meta = _probe_cached(mp)
     mm = None
     mpp = pairs.get("mmproj")
     if mpp and gguf.is_gguf(mpp):
-        try:
-            mm = gguf.probe(mpp)
-        except gguf.GGUFError:
-            mm = None
+        mm = _probe_cached(mpp)
     if meta is not None:
-        est = budget.estimate(pairs, meta, mmproj_meta=mm)
+        # cal уже загружена вызывающим: без _cal каждый пресет перечитывал бы JSON
+        est = budget.estimate(pairs, meta, mmproj_meta=mm, _cal=cal)
 
     vram_mib, vram_done = None, False
     meas_free = meas.get("min_free_mib") if meas else None

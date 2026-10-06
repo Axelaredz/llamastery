@@ -63,16 +63,31 @@ def fetch_source(src: str, timeout: int = 60) -> tuple[str, str]:
     if kind == "url":
         req = urllib.request.Request(payload["url"],
                                      headers={"User-Agent": "llamastery/1"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", errors="replace"), payload["url"]
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8", errors="replace"), payload["url"]
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"источник ответил ошибкой "
+                               f"HTTP {exc.code}: {payload['url']}") from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise RuntimeError(f"источник недоступен: {exc} "
+                               f"({payload['url']})") from exc
     # git
     with tempfile.TemporaryDirectory() as td:
         cmd = ["git", "clone", "--depth", "1", "--quiet"]
         if payload["ref"] not in ("", "HEAD"):
             cmd += ["--branch", payload["ref"]]
         cmd += [payload["repo"], td]
-        subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
-        root = Path(td) / Path(payload["repo"]).name
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"git clone не уложился в {timeout} с") from exc
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or b"").decode("utf-8", "replace").strip()
+            tail = err.splitlines()[-1] if err else f"код {exc.returncode}"
+            raise RuntimeError(f"git clone не удался: {tail}") from exc
+        # git кладёт clone в каталог по имени без .git, ищем так же
+        root = Path(td) / Path(payload["repo"]).name.removesuffix(".git")
         if payload["inner"]:
             p = root / payload["inner"]
             if not p.exists():

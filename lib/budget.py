@@ -39,9 +39,10 @@ MIB = 2 ** 20
 # должна молча отключать предупреждение о подтверждённом падении.
 SPEC_UBATCH_LIMIT = 1024
 
-# размер элемента KV-кэша в байтах по имени типа
+# размер элемента KV-кэша в байтах по имени типа (байты на элемент блока:
+# q4_0 = 18/32, q4_1 = 20/32 — у «_1» есть поле min, q5_0 = 22/32, q5_1 = 24/32)
 KV_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 1.0625, "q8_1": 1.125,
-            "q6_0": 0.8125, "q5_1": 0.6875, "q5_0": 0.6875, "q4_1": 0.5625,
+            "q6_0": 0.8125, "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625,
             "q4_0": 0.5625, "iq4_nl": 0.5625, "iq4_xs": 0.5625}
 
 
@@ -274,6 +275,12 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
             f"минус {meta.n_layer_nextn} MTP-слоёв без KV: "
             f"слоёв внимания {est.n_attn_layer}")
     est.ctx = _get_int(low, "c", "ctx-size", default=meta.n_ctx_trained) or 0
+    if est.ctx <= 0:
+        # `-c 0` в llama.cpp означает «взять обученный контекст», а не «KV нет»
+        est.ctx = meta.n_ctx_trained
+        if est.ctx:
+            est.notes.append("c=0 → берётся обученный контекст "
+                             f"({meta.n_ctx_trained})")
     est.cpu_moe = _get_int(low, "n-cpu-moe", "ncmoe", "cmoe", default=0) or 0
 
     # ── веса ──
@@ -519,21 +526,9 @@ def save_calibration(data: dict):
 
 
 def gpu_total_mib() -> int | None:
-    """Сколько VRAM на карте (nvidia-smi)."""
-    import shutil
-    import subprocess
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None
-    try:
-        r = subprocess.run([exe, "--query-gpu=memory.total",
-                            "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and r.stdout.strip():
-            return int(r.stdout.strip().splitlines()[0])
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return None
+    """Сколько VRAM на карте (nvidia-smi, с кэшем — см. vram.gpu_total_mib)."""
+    from . import vram
+    return vram.gpu_total_mib()
 
 
 def fit(pairs_of: list[tuple[str, dict]], measured: list[float],

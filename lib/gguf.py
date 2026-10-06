@@ -95,11 +95,11 @@ class ModelMeta:
 
     @property
     def n_expert_used(self) -> int:
-        return int(self.kv.get("llama.expert_used", 0) or 0)
+        return int(self.kv.get(f"{self.arch}.expert_used_count", 0) or 0)
 
     @property
     def n_expert_shared(self) -> int:
-        return int(self.kv.get("llama.expert_shared_count", 0) or 0)
+        return int(self.kv.get(f"{self.arch}.expert_shared_count", 0) or 0)
 
     @property
     def is_moe(self) -> bool:
@@ -233,8 +233,10 @@ def read_meta(path: str | Path) -> ModelMeta:
         if r.read(4) != b"GGUF":
             raise GGUFError("нет магии GGUF — это не GGUF-файл")
         version = r.uint("<I", 4)
-        if version not in (1, 2, 3):
-            raise GGUFError(f"версия GGUF v{version} не поддерживается")
+        if version not in (2, 3):
+            # v1 (u32-счётчики и длины) читается другим layout'ом; принимать
+            # его этим парсером значило бы выдать мусор за метаданные
+            raise GGUFError(f"версия GGUF v{version} не поддерживается (нужна v2/v3)")
         n_tensors = r.uint("<Q", 8)
         n_kv = r.uint("<Q", 8)
         if n_kv > 1 << 20:

@@ -450,18 +450,34 @@ def test_budget_measured_beats_estimate() -> None:
 
     Регрессия: tiel-coder-nanoplus-128ctx-mmproj-moe16 объявлялся невмещающимся
     при оценке 11.54 GiB, хотя замер давал 10.42 GiB и пресет рабочий.
+    Проверяется реальный shrink_to_fit: с живым замером пресет не урезается,
+    без замера — честно урезается (оценка заведомо больше доступного).
     """
     from lib import budget
+    from lib.gguf import ModelMeta
 
-    est = budget.Estimate(model="m")
-    est.total_gb = 11.54
-    meas = {"used_mib": 10672}
+    meta = ModelMeta(path=Path("fake.gguf"), size_bytes=12 * 2 ** 30,
+                     arch="llama",
+                     kv={"llama.block_count": 4,
+                         "llama.embedding_length": 8,
+                         "llama.attention.head_count": 2,
+                         "llama.attention.head_count_kv": 2})
+    pairs = {"model": "fake.gguf", "c": "8192", "n-cpu-moe": "0"}
+    total_mib = 12 * 1024          # usable 11264 MiB — меньше 12 GiB весов
 
-    def need(e, m):
-        return float(m["used_mib"]) if (m and m.get("used_mib")) else e.total_gb * 1024.0
+    saved = budget.measure_lookup
+    try:
+        budget.measure_lookup = lambda p: {"used_mib": 10672}
+        s = budget.shrink_to_fit(pairs, meta, total_mib)
+        check(s.fits and s.ctx == 8192 and s.cpu_moe == 0,
+              "живой замер влезает — пресет не урезан", s.steps)
 
-    assert need(est, meas) == 10672, "замер должен побеждать прогноз"
-    assert need(est, None) == 11.54 * 1024.0, "без замера остаётся прогноз"
+        budget.measure_lookup = lambda p: None
+        s2 = budget.shrink_to_fit(pairs, meta, total_mib)
+        check(not s2.fits,
+              "без замера оценка честно признаёт невмещаемость", s2.steps)
+    finally:
+        budget.measure_lookup = saved
 
 
 def test_budget_spec_ubatch_warning() -> None:
@@ -1189,7 +1205,6 @@ def test_tune_staged_order_and_saving() -> None:
     ranks = [dict((k, r) for k, r, _ in m.KNOB_AXES)[a_] for a_ in axes]
     check(ranks == sorted(ranks, reverse=True), "оси строго по убыванию прироста",
           list(zip(axes, ranks)))
-    ranks = [dict((k, r) for k, r, _ in m.KNOB_AXES)[a_] for a_ in axes]
     def diffs(v, b):
         """Сколько отслеживаемых параметров отличается от базы."""
         keys = ("moe", "ubatch", "threads", "kv_cache_type", "fa")
@@ -2476,6 +2491,115 @@ def test_xing4_in_candidates():
     x = [c for c in builds.CANDIDATES if c[0] == "xing4"][0]
     check("jmarceno" in x[2] and x[3] is True,
           "remote jmarceno, роутер есть", x[2])
+
+
+def test_measure_ingest_short_fields(tmp: Path):
+    """prefill и needle из short-прогона не теряются.
+
+    Регрессия: блоки разбора prefill/needle стояли вне цикла по short/deep
+    и видели только протёкшую переменную последней итерации (deep) —
+    факты из short молча пропадали из measurements.json.
+    """
+    print("measure: prefill/needle из short-прогона")
+    d = tmp / "run-001"
+    d.mkdir(parents=True)
+    run = {"ok": True,
+           "config": {"c": "8192", "model": "m.gguf"},
+           "short": {"gen_tps": 100.0, "prefill_tps": 900.0, "needle_ok": False},
+           "deep": {"gen_tps": 50.0}}
+    (d / "results.json").write_text(json.dumps([run]), encoding="utf-8")
+    recs = measure.ingest_tune_results([d])
+    rec = recs[measure.signature(run["config"])]
+    check(rec["prefill_tps"] == 900.0, "prefill из short сохранён",
+          rec["prefill_tps"])
+    check(rec["needle_ok"] is False, "needle_ok из short сохранён",
+          rec["needle_ok"])
+    check(rec["short_tps"] == 100.0 and rec["deep_tps"] == 50.0,
+          "tg по стадиям на месте", (rec["short_tps"], rec["deep_tps"]))
+
+
+def test_measure_signature_model():
+    """Замеры разных моделей не склеиваются в одну запись."""
+    print("measure: model в подписи замера")
+    a = measure.signature({"c": "8192", "model": "heavy.gguf"})
+    b = measure.signature({"c": "8192", "model": "light.gguf"})
+    check(a != b, "разные модели — разные подписи", (a, b))
+    check(measure.signature({"c": "8192", "m": "heavy.gguf"}) == a,
+          "«m» — алиас «model»")
+    check(measure.signature({"c": "8192"}) not in (a, b),
+          "без модели — своя подпись")
+
+
+def test_kv_bytes_q4_1_q5_1():
+    """Байты на элемент для квантов с полем min (block_q4_1 = 20/32, q5_1 = 24/32).
+
+    Регрессия: q4_1 и q5_1 считались по размеру q4_0/q5_0, KV-кэш с
+    --cache-type-k q5_1 занижался на ~9%.
+    """
+    print("budget: KV_BYTES q4_1/q5_1")
+    check(budget.kv_bytes_for("q4_1") == 0.625, "q4_1 = 20/32",
+          budget.kv_bytes_for("q4_1"))
+    check(budget.kv_bytes_for("q5_1") == 0.75, "q5_1 = 24/32",
+          budget.kv_bytes_for("q5_1"))
+    check(budget.kv_bytes_for("q4_0") == 0.5625
+          and budget.kv_bytes_for("q5_0") == 0.6875,
+          "q4_0/q5_0 не тронуты")
+
+
+def test_budget_c_zero_uses_trained_ctx():
+    """`-c 0` в llama.cpp значит «обученный контекст», а не «KV нет»."""
+    print("budget: c=0 → обученный контекст")
+    meta = gguf.ModelMeta(path=Path("fake.gguf"), arch="llama",
+                          kv={"llama.block_count": 2,
+                              "llama.embedding_length": 8,
+                              "llama.attention.head_count": 2,
+                              "llama.attention.head_count_kv": 2,
+                              "llama.context_length": 65536})
+    e = budget.estimate({"c": "0"}, meta, compute_gb=0.0)
+    check(e.ctx == 65536 and e.kv_gb > 0, "c=0 берёт n_ctx_trained",
+          (e.ctx, e.kv_gb))
+    e2 = budget.estimate({}, meta, compute_gb=0.0)
+    check(e2.ctx == 65536, "без флага — тоже обученный контекст", e2.ctx)
+
+
+def test_inifile_duplicate_sections(tmp: Path):
+    """Дубликат имени секции не затирает первый блок.
+
+    Регрессия: при повторном [a] старый Section заменялся, и его строки
+    (включая комментарии с замерами) молча удалялись при следующем save().
+    """
+    print("ini: дубликат секции")
+    text = ("[*]\ng = 1\n\n[a]\nk = 1\n; Замер: tg 27.1 t/s\n\n"
+            "[a]\nk2 = 2\n")
+    p = tmp / "dup.ini"
+    p.write_text(text, encoding="utf-8")
+    ini = inifile.IniFile.load(p)
+    check(ini.section("a").pairs() == {"k": "1", "k2": "2"},
+          "ключи обеих секций слились", ini.section("a").pairs())
+    ini.save()
+    check(inifile.IniFile.load(p).text == text,
+          "файл воспроизводится дословно")
+
+
+def test_tuner_rank_all_when_nobody_measured():
+    """_rank_all не падает, когда ни один прогон не дошёл до замера скорости.
+
+    Регрессия: max() без default ронял отчёт «НИ ОДНА КОНФИГУРАЦИЯ НЕ
+    ПРОШЛА» — тот самый случай OOM у всех кандидатов, ради которого отчёт
+    и существует, а с ним терялся и ranking.json.
+    """
+    print("tuner: _rank_all на полном провале")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tune_models_rank", ROOT / "tools" / "tune_models.py")
+    T = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(T)
+    results = [{"ok": False, "error": "OOM", "config": {},
+                "min_observed_free_mib": 12},
+               {"ok": False, "config": {}, "deep": {}}]
+    ranked = T._rank_all(results, (0.55, 0.30, 0.15))
+    check(isinstance(ranked, list) and len(ranked) == 1,
+          "отчёт построен, прогон с deep отсортирован", ranked)
 
 
 if __name__ == "__main__":

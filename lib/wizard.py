@@ -704,8 +704,12 @@ def _tune_argv(build: str | None, preset: str, pairs: dict,
         if shrink.ctx and shrink.ctx != cur:
             extra.append(f"search-ctx={shrink.ctx}")
         if shrink.cpu_moe:
-            top = max(shrink.cpu_moe + 1,
-                      min(shrink.n_layer - 1, cur)) if shrink.n_layer else 0
+            # верх серии — максимум между подобранным и ТЕКУЩИМ n-cpu-moe
+            # пресета (заведомо рабочая точка), а не контекстом: `c` к числу
+            # слоёв отношения не имеет
+            cur_moe = _int(pairs.get("n-cpu-moe")) or 0
+            top = (max(shrink.cpu_moe + 1, min(shrink.n_layer - 1, cur_moe))
+                   if shrink.n_layer else 0)
             extra.append(f"moe-values={_moe_series(shrink.cpu_moe, top)}")
         if not extra:
             return argv

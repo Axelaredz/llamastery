@@ -355,27 +355,29 @@ def up(config: str | None = None, listen: str | None = None,
     log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} llama-swap "
               f"--config {cfg} --listen {listen}\n")
     log.flush()
-    argv = [str(binary), "--config", str(cfg), "--listen", listen]
-    try:
-        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        return {"ok": False, "message": f"не запустился: {exc}"}
-    pid_file().write_text(str(proc.pid), encoding="utf-8")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return {"ok": False, "pid": proc.pid,
-                    "message": f"процесс умер (код {proc.returncode}). "
-                               f"лог: {log_file()}"}
-        if status(f"http://{host}:{port}", timeout=2.0)["up"]:
-            save_state(listen, str(cfg), proc.pid)
-            return {"ok": True, "pid": proc.pid, "url": f"http://{listen}",
-                    "message": (f"swap поднят на {listen} (pid {proc.pid})"
-                                + (f"\n  {why}" if why else ""))}
-        time.sleep(0.5)
-    return {"ok": False, "pid": proc.pid,
-            "message": f"не ответил за {timeout} с. лог: {log_file()}"}
+    # with закрывает fd в родителе на всех путях выхода (у ребёнка своя копия)
+    with log:
+        argv = [str(binary), "--config", str(cfg), "--listen", listen]
+        try:
+            proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            return {"ok": False, "message": f"не запустился: {exc}"}
+        pid_file().write_text(str(proc.pid), encoding="utf-8")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return {"ok": False, "pid": proc.pid,
+                        "message": f"процесс умер (код {proc.returncode}). "
+                                   f"лог: {log_file()}"}
+            if status(f"http://{host}:{port}", timeout=2.0)["up"]:
+                save_state(listen, str(cfg), proc.pid)
+                return {"ok": True, "pid": proc.pid, "url": f"http://{listen}",
+                        "message": (f"swap поднят на {listen} (pid {proc.pid})"
+                                    + (f"\n  {why}" if why else ""))}
+            time.sleep(0.5)
+        return {"ok": False, "pid": proc.pid,
+                "message": f"не ответил за {timeout} с. лог: {log_file()}"}
 
 
 def next_steps(url: str) -> list[str]:

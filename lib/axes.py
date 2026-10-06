@@ -389,17 +389,16 @@ def learn(min_pairs: int = 2) -> dict:
 
     # spec-ось измеряется отдельно (A/B), а не в общей сетке
     ab = spec_effect(runs)
-    if "spec" in CONFIG_KEY or True:
-        s = stats.setdefault("spec", {"pairs": 0, "tps_gain": None,
-                                      "vram_gain": None, "values": 0,
-                                      "mode": "ab"})
-        if ab:
-            s["unique"] = ab.get("unique", {}).get("gain")
-            s["repetitive"] = ab.get("repetitive", {}).get("gain")
-            s["pairs"] = sum(v["pairs"] for v in ab.values())
-            s["values"] = 2 if s["repetitive"] else 0
-            # в линейную сетку ось не идёт, но приоритет отражает повторы
-            s["tps_gain"] = s["repetitive"]
+    s = stats.setdefault("spec", {"pairs": 0, "tps_gain": None,
+                                  "vram_gain": None, "values": 0,
+                                  "mode": "ab"})
+    if ab:
+        s["unique"] = ab.get("unique", {}).get("gain")
+        s["repetitive"] = ab.get("repetitive", {}).get("gain")
+        s["pairs"] = sum(v["pairs"] for v in ab.values())
+        s["values"] = 2 if s["repetitive"] else 0
+        # в линейную сетку ось не идёт, но приоритет отражает повторы
+        s["tps_gain"] = s["repetitive"]
     return stats
 
 

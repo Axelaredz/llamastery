@@ -21,15 +21,22 @@ SIGNIFICANT = ("c", "n-cpu-moe", "n-gpu-layers", "ngl", "b", "batch-size",
                "cache-type-v", "ctv", "kv-unified", "kvu", "spec-type",
                "model-draft", "mmproj", "load-mode", "image-min-tokens",
                "ctx-checkpoints", "checkpoint-min-step", "cache-reuse",
-               "fit", "n-predict")
+               "fit", "n-predict", "model", "m")
 
 
 def signature(config: dict[str, str]) -> str:
-    """Стабильный ключ конфигурации: нечувствителен к порядку и регистру."""
+    """Стабильный ключ конфигурации: нечувствителен к порядку и регистру.
+
+    «model» входит в подпись: замер тяжёлой модели не должен выдаваться
+    за замер лёгкой с теми же флагами. «m» — алиас того же ключа.
+    """
     norm = {}
     for k, v in config.items():
-        if k.lower() in SIGNIFICANT:
-            norm[k.lower()] = str(v).strip()
+        key = k.lower()
+        if key == "m":
+            key = "model"
+        if key in SIGNIFICANT:
+            norm[key] = str(v).strip()
     blob = json.dumps(norm, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -79,14 +86,14 @@ def ingest_tune_results(dirs: list[Path] | None = None) -> dict:
                     val = float(src["gen_tps"])
                     # берём худший замер: он честнее для планирования
                     rec[key] = val if prev is None else min(prev, val)
-            if src.get("prefill_tps") is not None:
-                prev = rec["prefill_tps"]
-                rec["prefill_tps"] = (float(src["prefill_tps"]) if prev is None
-                                      else min(prev, float(src["prefill_tps"])))
-            if src.get("needle_ok") is False:
-                rec["needle_ok"] = False
-            elif src.get("needle_ok") is True and rec["needle_ok"] is None:
-                rec["needle_ok"] = True
+                if src.get("prefill_tps") is not None:
+                    prev = rec["prefill_tps"]
+                    rec["prefill_tps"] = (float(src["prefill_tps"]) if prev is None
+                                          else min(prev, float(src["prefill_tps"])))
+                if src.get("needle_ok") is False:
+                    rec["needle_ok"] = False
+                elif src.get("needle_ok") is True and rec["needle_ok"] is None:
+                    rec["needle_ok"] = True
             if r.get("min_observed_free_mib") is not None:
                 v = int(r["min_observed_free_mib"])
                 rec["min_free_mib"] = v if rec["min_free_mib"] is None \

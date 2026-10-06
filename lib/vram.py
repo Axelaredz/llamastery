@@ -35,12 +35,22 @@ def _query_nvidia_smi(field: str, index: int = 0) -> int | None:
     return None
 
 
+# total у карты постоянен в рамках процесса: кэш избавляет от повторных
+# nvidia-smi в циклах по пресетам (каждый вызов — subprocess ~0.3 с)
+_TOTAL_CACHE: dict[int, int] = {}
+
+
 def gpu_used_mib(index: int = 0) -> int | None:
     return _query_nvidia_smi("memory.used", index)
 
 
 def gpu_total_mib(index: int = 0) -> int | None:
-    return _query_nvidia_smi("memory.total", index)
+    if index in _TOTAL_CACHE:
+        return _TOTAL_CACHE[index]
+    v = _query_nvidia_smi("memory.total", index)
+    if v is not None:
+        _TOTAL_CACHE[index] = v
+    return v
 
 
 def capture_preset(index: int = 0, allow_single: bool = False,
@@ -110,7 +120,12 @@ def record(name: str, pairs: dict, cap: dict, index: int = 0) -> dict:
     rec = store["records"].setdefault(sig, {"signature": sig,
                                             "config": pairs, "runs": 0,
                                             "sources": []})
-    rec["min_free_mib"] = cap["free_mib"]
+    # минимум наблюдаемой свободы: поздний «более свободный» замер не должен
+    # стирать факт близкого OOM — потребители трактуют поле как наблюдаемый минимум
+    prev_free = rec.get("min_free_mib")
+    if cap["free_mib"] is not None:
+        rec["min_free_mib"] = (cap["free_mib"] if prev_free is None
+                               else min(prev_free, cap["free_mib"]))
     rec["used_mib"] = cap["used_mib"]
     # «занято» = всего минус свободно — та же величина, что в annotate и в
     # сообщениях сервера, чтобы цифры в разных местах не расходились

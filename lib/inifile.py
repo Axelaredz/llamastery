@@ -115,8 +115,19 @@ class IniFile:
             m = _SECTION_RE.match(line)
             if m:
                 name = m.group("name").strip()
-                cur = Section(name=name, header_raw=line, line_no=i)
-                self.sections[name] = cur
+                prev = self.sections.get(name)
+                if prev is None:
+                    cur = Section(name=name, header_raw=line, line_no=i)
+                    self.sections[name] = cur
+                else:
+                    # повторное имя секции: вливаем в существующую. Затирать
+                    # первый блок нельзя — при следующем save() его строки
+                    # (включая комментарии с замерами) молча удалились бы.
+                    # Сырой заголовок сохраняем как комментарий-строку, чтобы
+                    # dumps() воспроизводил файл дословно.
+                    cur = prev
+                    cur.entries.append(Entry(raw=line, key=None, value=None,
+                                             line_no=i, is_global=False))
                 continue
             stripped = line.strip()
             if not stripped or stripped[0] in ";#":
