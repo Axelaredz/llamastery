@@ -7,6 +7,7 @@
 """
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -38,11 +39,21 @@ class Build:
     # ── производные пути ──
     @property
     def server_bin(self) -> Path:
-        return Path(self.path).expanduser() / "build" / "bin" / "llama-server"
+        # на Windows cmake складывает exe в build/bin/Release (или Debug)
+        name = "llama-server.exe" if os.name == "nt" else "llama-server"
+        bindir = Path(self.path).expanduser() / "build" / "bin"
+        p = bindir / name
+        if not p.exists() and os.name == "nt":
+            for cfg in ("Release", "Debug"):
+                cand = bindir / cfg / name
+                if cand.exists():
+                    return cand
+        return p
 
     @property
     def bench_bin(self) -> Path:
-        return Path(self.path).expanduser() / "build" / "bin" / "llama-bench"
+        name = "llama-bench.exe" if os.name == "nt" else "llama-bench"
+        return Path(self.path).expanduser() / "build" / "bin" / name
 
     def status(self) -> dict:
         d = asdict(self)

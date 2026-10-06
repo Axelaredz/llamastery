@@ -361,7 +361,7 @@ def up(config: str | None = None, listen: str | None = None,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:
         return {"ok": False, "message": f"не запустился: {exc}"}
-    pid_file().write_text(str(proc.pid))
+    pid_file().write_text(str(proc.pid), encoding="utf-8")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -396,15 +396,15 @@ def down(timeout: int = 20) -> dict:
     if not pid:
         return {"ok": True, "message": "swap не запущен (или не нашим pid-файлом)"}
     try:
-        os.kill(pid, signal.SIGTERM)
+        server._terminate(pid, graceful=True)
     except OSError as exc:
-        return {"ok": False, "message": f"не удалось SIGTERM: {exc}"}
+        return {"ok": False, "message": f"не удалось завершить: {exc}"}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and daemon_pid():
         time.sleep(0.3)
     if daemon_pid():
         try:
-            os.kill(pid, signal.SIGKILL)
+            server._terminate(pid, graceful=False)
         except OSError:
             pass
         time.sleep(0.5)
@@ -432,7 +432,7 @@ def _tcp_listen_inodes(port: int) -> set[str]:
     inodes: set[str] = set()
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
-            lines = Path(path).read_text().splitlines()[1:]
+            lines = Path(path).read_text(encoding="ascii", errors="replace").splitlines()[1:]
         except OSError:
             continue
         for ln in lines:

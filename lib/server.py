@@ -20,6 +20,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -27,6 +28,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import builds, paths
+
+# POSIX-сигналов на Windows нет; там terminate_process — единственный способ
+# завершить процесс по pid (аналог SIGKILL; graceful-аналога SIGTERM нет).
+if os.name == "nt":
+    import ctypes  # только на Windows: alive/_terminate через kernel32
+
+
+def _terminate(pid: int, graceful: bool) -> None:
+    """Завершить процесс: POSIX — сигналом, Windows — TerminateProcess."""
+    if os.name != "nt":
+        os.kill(pid, signal.SIGTERM if graceful else signal.SIGKILL)
+        return
+    kernel32 = ctypes.windll.kernel32
+    SYNCHRONIZE = 0x00100000
+    PROCESS_TERMINATE = 0x0001
+    # см. _win_process_exists: без argtypes pid обрезается до WORD
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.TerminateProcess.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
+    if not h:
+        raise OSError(kernel32.GetLastError())
+    try:
+        kernel32.TerminateProcess(h, 0)
+    finally:
+        kernel32.CloseHandle(h)
 
 STATUS_LABEL = {
     "loaded": "загружена (VRAM)",
@@ -294,11 +323,37 @@ def read_pid() -> int | None:
 def alive(pid: int | None) -> bool:
     if not pid:
         return False
+    if os.name == "nt":
+        # signal 0 на Windows не поддерживается (os.kill кидает ValueError)
+        return _win_process_exists(pid)
     try:
         os.kill(pid, 0)
         return True
     except (ProcessLookupError, PermissionError) as exc:
         return isinstance(exc, PermissionError)
+
+
+def _win_process_exists(pid: int) -> bool:
+    """Есть ли живой процесс с таким pid (Windows, без psutil)."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87
+    # argtypes нужны обязательно: без них pid (>0x7FFF) уезжает в OpenProcess
+    # как WORD и поиск процесса врёт на машине с большим числом процессов
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        # доступ запрещён — процесс чужой, но он существует
+        return kernel32.GetLastError() != ERROR_INVALID_PARAMETER
+    exit_code = ctypes.c_ulong()
+    ok = kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+    kernel32.CloseHandle(h)
+    return bool(ok) and exit_code.value == STILL_ACTIVE
 
 
 # ── окружение сборки ──
@@ -310,7 +365,15 @@ def build_env(build: builds.Build) -> dict[str, str]:
     """
     env = dict(os.environ)
     bindir = str(build.server_bin.parent)
-    env.setdefault("LD_LIBRARY_PATH", bindir)
+    # имя переменной пути к динамическим библиотекам — платформенная:
+    # LD_LIBRARY_PATH (Linux), DYLD_LIBRARY_PATH (macOS), PATH (Windows, .dll)
+    var = ("PATH" if os.name == "nt"
+           else "DYLD_LIBRARY_PATH" if sys.platform == "darwin"
+           else "LD_LIBRARY_PATH")
+    if var == "PATH":  # Windows ищет .dll по PATH — добавляем bindir в начало
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    else:
+        env.setdefault(var, bindir)
     for k, v in (build.env or {}).items():
         env.setdefault(k, str(v))
     return env
@@ -541,7 +604,7 @@ def _spawn(build: builds.Build, env: dict, argv: list[str], timeout: int,
         res.ok = False
         res.message = f"не запустился: {exc}"
         return res
-    pid_file().write_text(str(proc.pid))
+    pid_file().write_text(str(proc.pid), encoding="utf-8")
     res.pid = proc.pid
 
     deadline = time.monotonic() + timeout
@@ -584,16 +647,16 @@ def stop(timeout: int = 30) -> tuple[bool, str]:
     for pid in pids:
         who = identify(pid) or "процесс"
         try:
-            os.kill(pid, signal.SIGTERM)
+            _terminate(pid, graceful=True)
         except OSError as exc:
-            msgs.append(f"{who} (pid {pid}): не удалось SIGTERM — {exc}")
+            msgs.append(f"{who} (pid {pid}): не удалось завершить — {exc}")
             continue
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and alive(pid):
             time.sleep(0.3)
         if alive(pid):
             try:
-                os.kill(pid, signal.SIGKILL)
+                _terminate(pid, graceful=False)
                 time.sleep(0.5)
             except OSError:
                 pass

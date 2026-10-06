@@ -231,7 +231,7 @@ def load(binary: str | Path | None, use_cache: bool = True,
     if binary is None:
         cached = paths.schema_cache()
         if cached.exists() and not refresh:
-            blob = json.loads(cached.read_text())
+            blob = json.loads(cached.read_text(encoding="utf-8"))
             return {k: Flag(**v) for k, v in blob["flags"].items()}, blob["meta"]
         return {}, {"error": "не указан бинарь и нет кэша схемы"}
 
@@ -246,7 +246,7 @@ def load(binary: str | Path | None, use_cache: bool = True,
     cached = paths.schema_cache(binary)
     if use_cache and cached.exists() and not refresh:
         try:
-            blob = json.loads(cached.read_text())
+            blob = json.loads(cached.read_text(encoding="utf-8"))
             if blob.get("meta", {}).get("mtime") == mtime:
                 return ({k: Flag(**v) for k, v in blob["flags"].items()},
                         blob["meta"])
@@ -265,7 +265,7 @@ def load(binary: str | Path | None, use_cache: bool = True,
     unique = {f.canonical: asdict(f) for f in
               {id(v): v for v in flags.values()}.values()}
     cached.write_text(json.dumps({"meta": meta, "flags": unique},
-                                 ensure_ascii=False, indent=1))
+                                 ensure_ascii=False, indent=1), encoding="utf-8")
     return flags, meta
 
 
