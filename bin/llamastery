@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -1300,14 +1301,22 @@ def cmd_swap(args) -> int:
         return 0 if st["up"] else 1
     if args.action == "install":
         ver = args.version or "v261"
-        arch = "linux_amd64" if sys.platform.startswith("linux") else None
-        if not arch:
-            print("install пока только для Linux x64", file=sys.stderr)
+        # имена артефактов релизов llama-swap: {os}_{arch} — покрываем все три ОС
+        machine = (platform.machine() or "").lower()
+        cpu = {"x86_64": "amd64", "amd64": "amd64",
+               "arm64": "arm64", "aarch64": "arm64"}.get(machine)
+        osname = {"linux": "linux", "darwin": "darwin",
+                  "nt": "windows"}.get(sys.platform)
+        ext = "zip" if osname == "windows" else "tar.gz"
+        if not (cpu and osname):
+            print(f"install: неподдерживаемая платформа {sys.platform}/{machine}",
+                  file=sys.stderr)
             return 1
         num = ver[1:] if ver.startswith("v") else ver
         url = (f"https://github.com/mostlygeek/llama-swap/releases/download/"
-               f"{ver}/llama-swap_{num}_{arch}.tar.gz")
-        dest = Path("~/.local/bin").expanduser()
+               f"{ver}/llama-swap_{num}_{osname}_{cpu}.{ext}")
+        dest = (Path(os.environ.get("LOCALAPPDATA", "~")).expanduser() / "bin"
+                if os.name == "nt" else Path("~/.local/bin").expanduser())
         dest.mkdir(parents=True, exist_ok=True)
         print(f"качаю {url}")
         print(f"цель: {dest}/llama-swap")
@@ -1315,11 +1324,18 @@ def cmd_swap(args) -> int:
         if args.dry_run:
             return 0
         try:
-            tmp = Path("/tmp") / f"llama-swap-{ver}.tar.gz"
+            tmp = Path.home() / f"llama-swap-{ver}.{ext}"
             subprocess.run(["curl", "-fL", url, "-o", str(tmp)], check=True)
-            subprocess.run(["tar", "-xzf", str(tmp), "-C", str(dest)], check=True)
+            if ext == "zip":
+                import zipfile
+                with zipfile.ZipFile(tmp) as zf:
+                    zf.extractall(dest)
+            else:
+                subprocess.run(["tar", "-xzf", str(tmp), "-C", str(dest)],
+                               check=True)
+            tmp.unlink(missing_ok=True)
             print(f"готово: {dest}/llama-swap --version")
-            print("проверь PATH: ~/.local/bin должен быть в $PATH")
+            print("проверь PATH: каталог установки должен быть в $PATH")
             return 0
         except subprocess.CalledProcessError as exc:
             print(f"не скачалось: {exc}", file=sys.stderr)

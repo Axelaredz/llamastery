@@ -18,21 +18,43 @@ def _x(name: str, default: Path) -> Path:
 
 
 def home() -> Path:
-    return Path(os.environ.get("HOME", "~")).expanduser()
+    # Windows: HOME есть не всегда (в PowerShell его historically нет),
+    # USERPROFILE — канонический путь профиля.
+    return Path(os.environ.get("USERPROFILE")
+                or os.environ.get("HOME", "~")).expanduser()
 
 
 def config_dir() -> Path:
-    """Каталог конфигурации инструмента (реестр сборок, кэш схемы)."""
-    return _x("LLAMASTERY_CONFIG_DIR", home() / ".config" / "llamastery")
+    """Каталог конфигурации инструмента (реестр сборок, кэш схемы).
+
+    XDG на Unix, %APPDATA% на Windows — как принято у CLI-инструментов.
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(home() / "AppData" / "Roaming")
+        default = Path(base) / "llamastery"
+    else:
+        default = home() / ".config" / "llamastery"
+    return _x("LLAMASTERY_CONFIG_DIR", default)
 
 
 def state_dir() -> Path:
     """Состояние: кэш схемы флагов, калибровки, история прогонов."""
-    return _x("LLAMASTERY_STATE_DIR", home() / ".local" / "state" / "llamastery")
+    if os.name == "nt":
+        # LOCALAPPDATA — для данных, которые не должны ездить между машинами
+        base = os.environ.get("LOCALAPPDATA") or str(home() / "AppData" / "Local")
+        default = Path(base) / "llamastery"
+    else:
+        default = home() / ".local" / "state" / "llamastery"
+    return _x("LLAMASTERY_STATE_DIR", default)
 
 
 def cache_dir() -> Path:
-    return _x("LLAMASTERY_CACHE_DIR", home() / ".cache" / "llamastery")
+    if os.name == "nt":
+        # на Windows отдельного кэша нет — всё в LOCALAPPDATA рядом с состоянием
+        default = state_dir() / "cache"
+    else:
+        default = home() / ".cache" / "llamastery"
+    return _x("LLAMASTERY_CACHE_DIR", default)
 
 
 def builds_file() -> Path:
