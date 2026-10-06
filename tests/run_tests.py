@@ -392,6 +392,30 @@ def main() -> int:
     а не повод пропустить тест.
     """
     import inspect
+
+    # Глобальная герметизация: весь прогон живёт во временном STATE_DIR,
+    # чтобы тесты не читали и не писали реальную калибровку пользователя
+    # (calibration.json) и не создали каталоги в домашнем каталоге через
+    # paths.ensure_dirs(). Тестам, которым нужен свой каталог, они задают
+    # LLAMASTERY_STATE_DIR сами; этот — страховка для всех остальных.
+    # Внешний LLAMASTERY_STATE_DIR тоже подменяется: он указывает на живое
+    # состояние разработчика, а тестовый прогон не должен его читать.
+    _saved_state = os.environ.get("LLAMASTERY_STATE_DIR")
+    _tmp_state = tempfile.mkdtemp(prefix="llamastery-test-state-")
+    os.environ["LLAMASTERY_STATE_DIR"] = _tmp_state
+    try:
+        return _run_all()
+    finally:
+        if _saved_state is None:
+            os.environ.pop("LLAMASTERY_STATE_DIR", None)
+        else:
+            os.environ["LLAMASTERY_STATE_DIR"] = _saved_state
+        import shutil
+        shutil.rmtree(_tmp_state, ignore_errors=True)
+
+
+def _run_all() -> int:
+    import inspect
     module = sys.modules[__name__]
     tests = sorted((n, f) for n, f in vars(module).items()
                    if n.startswith("test_") and inspect.isfunction(f))
@@ -466,17 +490,30 @@ def test_budget_compute_growth_damped() -> None:
     Проверено вживую: сервер сообщает 978 MiB при ubatch=1024, тогда как
     прежняя формула (0.4 + 0.6*ub/ref) давала 1.58 GiB, а на ubatch=2048 —
     2.76 GiB, и рабочий пресет объявлялся невмещающимся.
+
+    Тест герметичен: калибровка передаётся явно через _cal. Без этого он
+    зависел от ~/.local/state/llamastery/calibration.json на машине
+    запускающего — а при её отсутствии compute_gb=0 и обе проверки
+    становились ложными (сравнивали нули).
     """
     from lib import budget
+
+    cal = {"compute_gb": 0.99, "compute_ref_ubatch": 512}
 
     def total_for(ub):
         pairs = {"model": "m.gguf", "ubatch-size": str(ub), "c": "114688",
                  "n-gpu-layers": "99", "b": "2048"}
-        return budget.estimate(pairs, None).total_gb
+        return budget.estimate(pairs, None, _cal=cal).total_gb
 
     base, at_1024, at_2048 = total_for(512), total_for(1024), total_for(2048)
+    assert at_1024 > base, "на большем ubatch рост всё же есть"
     assert at_1024 < base * 1.15, "рост с 512 до 1024 должен быть небольшим"
-    assert at_2048 < at_1024 * 1.15, "рост с 1024 до 2048 тоже затухает"
+    # прежнее завышение: 0.4+0.6*ub/ref давало 1.58 GiB на 1024 и 2.76 GiB на
+    # 2048; рабочая граница 1024 объявлялась невмещающейся. Проверяем итог
+    # напрямую по константе, а не отношением: при тотальных весах (meta=None)
+    # множитель 1.15 пропускал бы даже линейную формулу (x1.46).
+    assert at_1024 < 1.58, "на ub=1024 оценка не должна доходить до прежних 1.58 GiB"
+    assert at_2048 < 0.99 * 1.35, "рост к 2048 затухает, а не линеен (было 2.76 GiB)"
 
 
 def test_tuner_with_spec_keeps_accelerator() -> None:
@@ -522,7 +559,11 @@ def test_env_prefix_is_lamastery_only() -> None:
     try:
         for k in stale:
             os.environ[k] = "/tmp/opencode/t-stale"
-        os.environ.pop("LLAMASTERY_STATE_DIR", None)
+        # НЕ удаляем LLAMASTERY_STATE_DIR: без него state_dir() уходит в
+        # домашний каталог запускающего, а reload(paths) триггерит
+        # ensure_dirs() — тест тогда пишет в ~/.config/~/.cache/~/.local.
+        # Сам механизм «нет переменной → дефолтный путь» уже покрыт: в начале этого теста saved читает реальное окружение, а finally его восстанавливает и делает reload.
+        os.environ["LLAMASTERY_STATE_DIR"] = "/tmp/opencode/t-hermetic"
         importlib.reload(P)
         for k in stale:
             check("/tmp/opencode/t-stale" not in str(P.state_dir()),
@@ -834,6 +875,14 @@ def test_capture_preset_falls_back_to_swap() -> None:
     from lib import vram as V
 
     print("замер: fallback на llama-swap")
+    # nvidia-smi в CI отсутствует — capture_preset вернёт {"ok": False} ещё до
+    # разбора источников. Подменяем только системный запрос, оставляя живыми
+    # gpu_used_mib/gpu_total_mib (иначе total=None и проверка
+    # «свободно = полное − занятое» повиснет в воздухе).
+    orig_query = V._query_nvidia_smi
+    V._query_nvidia_smi = lambda field, index=0: (
+        9728 if field == "memory.used" else
+        12288 if field == "memory.total" else None)
     orig_models, orig_single = Srv.models, Srv.loaded_models
     orig_run, orig_pf = S.running_models, Srv.read_pid
     Srv.models = lambda *a, **k: []
@@ -845,9 +894,11 @@ def test_capture_preset_falls_back_to_swap() -> None:
     try:
         cap = V.capture_preset(allow_single=True, swap_url="http://127.0.0.1:8087")
     finally:
+        V._query_nvidia_smi = orig_query
         Srv.models, Srv.loaded_models = orig_models, orig_single
         Srv.read_pid = orig_pf
         S.running_models = orig_run
+    check(cap.get("ok"), f"замер удался, а не {cap.get('error')}", cap)
     check(cap["loaded"] == ["qwen-128ctx"], "модель видна", cap["loaded"])
     check(cap["source"] == "swap", "источник — swap", cap["source"])
     # занятое берётся из nvidia-smi, поэтому сверяем только согласованность:
