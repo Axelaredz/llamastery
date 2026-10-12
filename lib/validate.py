@@ -275,3 +275,142 @@ def check_crash_history(name: str, rep: Report) -> None:
             f"{howmany} раз, последний — {when}",
             f"проверенные условия: глубина {e.get('depth', '?')} токенов. "
             f"исправь или убери; после успешного замера запись снимется сама")
+
+
+# ── reasoning / DRY / сэмплинг: проверка актуальных флагов ──
+# Источник правды — схема ЭТОЙ сборки (schema.resolve по --help бинаря),
+# а не захардкоженный список: форки добавляют флаги неравномерно
+# (проверено живьём: --reasoning-effort есть в upstream/xing4, но нет
+# в faks/ik; --reasoning-budget-conclusion нет нигде).
+REASONING_FORMAT_VALUES = ("auto", "none", "deepseek", "deepseek-legacy")
+REASONING_EFFORT_VALUES = ("default", "minimal", "low", "medium",
+                           "high", "xhigh", "max")
+# Подстроки имени/пути модели, намекающие на reasoning-модель.
+REASONING_NAME_HINTS = ("qwen3", "qwen", "deepseek", "gpt-oss", "gpt_oss",
+                        "think", "reasoning", "r1", "reasoner")
+
+
+def _fnum(val) -> float | None:
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def check_reasoning_quality(name: str, pairs: dict[str, str], flags: dict,
+                            rep: Report, meta=None) -> None:
+    """Связность reasoning/DRY/сэмплинга против схемы ЭТОЙ сборки.
+
+    Ловит то, что общая проверка «флаг существует» не ловит:
+      * флаг из чужой сборки/документации (effort на faks, несуществующий
+        budget-conclusion) — будет молча проигнорирован как неизвестный;
+      * бюджет без сообщения (резкий обрыв мыслей) и сообщение без бюджета
+        (инертный ключ);
+      * DRY-ключи при выключенном мультипликаторе и нулевое окно штрафа;
+      * невалидные значения reasoning-format / reasoning-effort;
+      * reasoning-модель без антизацикливающей связки (info, не warn).
+
+    Всё, что касается поддержки, сверяется через schema.resolve: если флаг
+    переименуют в следующем релизе, предупреждение последует за схемой.
+    """
+    low = {k.lower(): (v if v is not None else "") for k, v in pairs.items()}
+
+    def supported(key: str) -> bool:
+        try:
+            return schema.resolve(flags, key) is not None
+        except Exception:
+            return False
+
+    def raw(*names: str) -> str:
+        for n in names:
+            if n in low:
+                return str(low[n])
+        return ""
+
+    # ── несуществующие / неподдержанные флаги ──
+    if "reasoning-budget-conclusion" in low:
+        rep.add("warn", name, "reasoning-budget-conclusion",
+                "такого флага нет ни в одной из проверенных сборок "
+                "(faks/upstream/ik/xing4)",
+                "вероятно, выдуман или из чужой документации; убери — "
+                "иначе ключ молча игнорируется. Проверь "
+                "`llamastery schema --build <сборка> --grep reasoning`")
+    if "reasoning-effort" in low and not supported("reasoning-effort"):
+        rep.add("warn", name, "reasoning-effort",
+                "эта сборка не знает --reasoning-effort "
+                "(есть в upstream/xing4, нет в faks/ik)",
+                "ключ будет проигнорирован; либо убери, либо переезжай "
+                "на сборку с поддержкой, либо держи уровень через чат-шаблон")
+
+    # ── значения enum ──
+    fmt = raw("reasoning-format").strip().lower()
+    if fmt and fmt not in REASONING_FORMAT_VALUES:
+        rep.add("warn", name, "reasoning-format",
+                f"значение {raw('reasoning-format')!r} не из списка "
+                f"{list(REASONING_FORMAT_VALUES)}",
+                "для отделения мыслей от ответа нужен deepseek "
+                "(мысли — в message.reasoning_content)")
+    eff = raw("reasoning-effort").strip().lower()
+    if eff and eff not in REASONING_EFFORT_VALUES:
+        rep.add("warn", name, "reasoning-effort",
+                f"значение {raw('reasoning-effort')!r} не из списка "
+                f"{list(REASONING_EFFORT_VALUES)}",
+                "проверь `llama-server --help | grep reasoning-effort`")
+
+    # ── бюджет + сообщение ──
+    b_raw = raw("reasoning-budget").strip()
+    b_num = _fnum(b_raw) if b_raw else None
+    has_msg = bool(raw("reasoning-budget-message").strip())
+    if b_raw and b_num is not None and b_num > 0 and not has_msg:
+        rep.add("warn", name, "reasoning-budget",
+                f"бюджет {b_raw} без reasoning-budget-message — мысли "
+                "обрубаются резко, без красивого завершения",
+                'добавь reasoning-budget-message = "Wrap up and give '
+                'the final answer."')
+    if has_msg and (not b_raw or (b_num is not None and b_num < 0)):
+        rep.add("warn", name, "reasoning-budget-message",
+                "сообщение о завершении инертно без reasoning-budget > 0",
+                "либо задай бюджет (например 2048), либо убери сообщение")
+    if b_raw and b_num is None:
+        rep.add("error", name, "reasoning-budget",
+                f"ожидалось число, а стоит {b_raw!r}")
+
+    # ── DRY ──
+    m_raw = raw("dry-multiplier").strip()
+    m_num = _fnum(m_raw) if m_raw else 0.0
+    dry_extra = {k: low[k] for k in
+                 ("dry-allowed-length", "dry-base", "dry-penalty-last-n",
+                  "dry-sequence-breaker") if k in low}
+    if m_num is not None and m_num > 0:
+        w_raw = raw("dry-penalty-last-n").strip()
+        w_num = _fnum(w_raw) if w_raw else None
+        if w_num == 0:
+            rep.add("warn", name, "dry-penalty-last-n",
+                    "окно штрафа 0 при включённом DRY — сэмплер не видит "
+                    "повторы и не работает",
+                    "поставь окно под контекст (например 4096) или убери ключ")
+    elif dry_extra:
+        rep.add("info", name, "dry",
+                "DRY-ключи заданы, но dry-multiplier выключен (0/нет) — "
+                "они инертны",
+                "для борьбы с зацикливанием: dry-multiplier = 0.5, "
+                "dry-allowed-length = 6, dry-penalty-last-n = 4096")
+
+    # ── reasoning-модель без антизацикливающей связки ──
+    model_id = " ".join([
+        raw("model", "m"),
+        getattr(meta, "name", "") or "",
+        getattr(meta, "arch", "") or "",
+    ]).lower()
+    looks_reasoning = any(h in model_id for h in REASONING_NAME_HINTS)
+    has_any_reasoning = any(k in low for k in
+                            ("reasoning", "reasoning-format", "reasoning-budget",
+                             "reasoning-effort", "reasoning-budget-message"))
+    if (looks_reasoning or has_any_reasoning) and not has_any_reasoning:
+        rep.add("info", name, "reasoning",
+                "похоже на reasoning-модель, но reasoning-флагов нет — "
+                "на низких квантах (IQ4/IQ3/Q3) возможны зацикливания в мыслях",
+                "проверь поддержку (`schema --grep reasoning`) и добавь связку: "
+                "reasoning-format = deepseek, reasoning-budget = 2048 + "
+                "reasoning-budget-message, DRY 0.5/6/4096, "
+                "temp 0.6 / top-p 0.95 / top-k 20")

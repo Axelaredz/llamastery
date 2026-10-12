@@ -689,10 +689,12 @@ def cmd_validate(args) -> int:
         if not sec:
             continue
         pairs = sec.pairs()
-        validate.validate_section(name, pairs, flags, rep,
-                                  check_paths=not args.no_paths, model_cache=cache)
+        meta_hit = validate.validate_section(name, pairs, flags, rep,
+                                             check_paths=not args.no_paths,
+                                             model_cache=cache)
         meas = measure.lookup(pairs, store)
         validate.check_traps(name, pairs, rep, meas)
+        validate.check_reasoning_quality(name, pairs, flags, rep, meta_hit)
         validate.check_crash_history(name, rep)
         checked_models += 1
 

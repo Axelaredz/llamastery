@@ -52,6 +52,8 @@ REQUEST_KEYS = {
     "n-predict",
     "repeat-last-n",
     "repeat-penalty",
+    "presence-penalty",
+    "frequency-penalty",
 }
 
 # Ключи, которыми роутер управляет сам: их в пресете быть не должно
@@ -116,6 +118,22 @@ ALLOWED_KEYS = REQUEST_KEYS | {
     "kv-unified",
     "jinja",
     "cache-reuse",
+    # reasoning / DRY / порядок сэмплеров — не оси тюнинга, но часть
+    # конфигурации: без них в базовом списке автономный режим (без схемы)
+    # отвергал бы пресет с антизацикливающей связкой как «неизвестные ключи».
+    # Со схемой список всё равно расширяется флагами ЭТОЙ сборки.
+    "reasoning",
+    "reasoning-format",
+    "reasoning-effort",
+    "reasoning-budget",
+    "reasoning-budget-message",
+    "reasoning-preserve",
+    "dry-multiplier",
+    "dry-base",
+    "dry-allowed-length",
+    "dry-penalty-last-n",
+    "dry-sequence-breaker",
+    "samplers",
 }
 
 WRITABLE_KEYS = {
@@ -337,11 +355,23 @@ def stop_process(process):
 # Без этого тюнер меряет НЕ ту конфигурацию, которую потом разворачивают:
 # пресет с spec-type = ngram-mod и mmproj тюнился как чисто текстовый без
 # ускорителя, а результаты потом выдавались за «замеренные».
+# Вторая половина списка — антизацикливающая связка reasoning-моделей
+# (budget/format + DRY + сэмплинг): reasoning-budget меняет динамику
+# генерации (сколько токенов уходит в мысли), DRY — штраф повторов,
+# поэтому замер без них не отражает реальную скорость/стабильность.
 PASSTHROUGH_KEYS = (
     "spec-type", "model-draft",
     "spec-ngram-mod-n-max", "spec-ngram-mod-n-min", "spec-ngram-mod-n-match",
     "spec-draft-n-max", "spec-draft-n-min", "spec-draft-p-min",
     "fit",
+    "reasoning", "reasoning-format", "reasoning-effort",
+    "reasoning-budget", "reasoning-budget-message", "reasoning-preserve",
+    "dry-multiplier", "dry-base", "dry-allowed-length",
+    "dry-penalty-last-n", "dry-sequence-breaker",
+    "samplers",
+    "temp", "top-p", "top-k", "min-p",
+    "repeat-penalty", "repeat-last-n",
+    "presence-penalty", "frequency-penalty",
 )
 
 _KIND_CACHE = {}
@@ -459,19 +489,23 @@ def build_server_command(binary, opts, port, caps, args):
     if caps.get("checkpoint-min-step") and opts.get("checkpoint-min-step") is not None:
         cmd += ["--checkpoint-min-step", str(opts["checkpoint-min-step"])]
 
-    # ускорители и прочее, что тюнер не варьирует, — переносим из секции
+    # ускорители и прочее, что тюнер не варьирует, — переносим из секции.
+    # Сверка со схемой ЭТОЙ сборки: флаг, которого нет в бинаре (например
+    # reasoning-effort на faks), пропускаем, а не роняем весь прогон
+    # неизвестным аргументом. Пустой kinds = схема недоступна, тогда
+    # предполагаем, что значение нужно (как раньше).
     kinds = _flag_kinds(binary)
+    schema_known = bool(kinds)
     for key in PASSTHROUGH_KEYS:
         if key not in opts:
             continue
         val = str(opts[key]).strip()
         canon = "--" + key
         kind = kinds.get(canon)
+        if kind is None and schema_known:
+            continue
         if kind == "flag" or val == "":
             cmd.append(canon)
-        elif kind is None:
-            # схема недоступна — предполагаем, что значение нужно
-            cmd += [canon, val]
         else:
             cmd += [canon, val]
 

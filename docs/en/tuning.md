@@ -161,6 +161,53 @@ about 13%, hence the `offload_realization = 0.89` coefficient that
 against looping. On broken JSON or tool calls, lower it to 1.05; below that is
 useless.
 
+### Reasoning models on low quants: thinking loops
+
+Reasoning models (including Qwen-like ones) on low quants (IQ4, IQ3, Q3)
+often loop inside their reasoning: the whole budget goes to `<think>`, the
+answer stays empty, `finish_reason: length`. A working combo (verified
+against build schemas):
+
+```ini
+temp = 0.6
+top-p = 0.95
+top-k = 20
+reasoning-format = deepseek
+reasoning-budget = 2048
+reasoning-budget-message = Wrap up and give the final answer.
+dry-multiplier = 0.5
+dry-allowed-length = 6
+dry-penalty-last-n = 4096
+```
+
+Why it works: `reasoning-budget` hard-caps the thinking length, and
+`reasoning-budget-message` makes the model wrap up and move to the answer;
+`reasoning-format = deepseek` separates reasoning from the final text
+(thoughts go to `message.reasoning_content`); DRY penalises repeated
+sequences. The `0.6 / 0.95 / 20` sampling is close to Qwen's official
+recommendations.
+
+**Check the actual flags first.** The reasoning flag set differs per build
+(verified live): `--reasoning-effort` exists in upstream/xing4 but **not** in
+faks/ik; `--reasoning-budget-conclusion` **does not exist anywhere** — a
+preset carrying it silently ignores the key. So before tuning parameters:
+
+```bash
+llamastery schema --build <build> --grep reasoning   # what really exists
+llamastery validate <section> --build <build>         # combo coherence:
+  # budget without message, message without budget, DRY without multiplier,
+  # effort on an unsupported build, invalid format — all caught
+```
+
+`validate` checks against **this** build's schema, not a hardcoded list: after
+a fork update the check follows `--help` automatically. The tuner carries the
+combo into the measurement verbatim (passthrough): reasoning-budget changes
+generation dynamics, and a measurement without it would benchmark a different
+configuration than the deployed one. The measurement signature also covers
+reasoning/DRY/sampling — runs with different combos are never glued together.
+
+Also worth trying: `min-p = 0.0`, repeat/presence penalty.
+
 ## The speed degradation law
 
 An earlier `models.ini` header had `tg(D) = 1000 / (16.1 + 0.0025·D)`. The

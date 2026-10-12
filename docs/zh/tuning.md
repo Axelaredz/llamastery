@@ -156,6 +156,48 @@ moe24 → 2963 MiB，moe32 → 5028，moe40 → 7129。
 `repeat-last-n = 256` 搭配 `repeat-penalty = 1.02` 是对抗复读的有效组合。
 遇到 JSON 损坏或工具调用问题时可以降到 1.05，再低就没有意义了。
 
+### 低量化推理模型：思维循环
+
+推理模型（包括 Qwen 系）在低量化（IQ4、IQ3、Q3）下经常陷入思维循环：
+全部预算耗在 `<think>` 里，答案为空，`finish_reason: length`。一组有效
+组合（已对照构建 schema 验证）：
+
+```ini
+temp = 0.6
+top-p = 0.95
+top-k = 20
+reasoning-format = deepseek
+reasoning-budget = 2048
+reasoning-budget-message = Wrap up and give the final answer.
+dry-multiplier = 0.5
+dry-allowed-length = 6
+dry-penalty-last-n = 4096
+```
+
+原理：`reasoning-budget` 硬性限制思考长度，`reasoning-budget-message`
+迫使模型收尾并给出答案；`reasoning-format = deepseek` 把思考与正文分离
+（思考进入 `message.reasoning_content`）；DRY 惩罚重复序列。`0.6 / 0.95 / 20`
+采样接近 Qwen 官方推荐。
+
+**先查实际支持的 flag。** 各构建的 reasoning flag 集合不同（实测）：
+`--reasoning-effort` 只在 upstream/xing4 有，faks/ik **没有**；
+`--reasoning-budget-conclusion` **哪里都不存在**——带它的 preset 会静默忽略。
+调参之前：
+
+```bash
+llamastery schema --build <构建> --grep reasoning   # 实际有什么
+llamastery validate <节> --build <构建>              # 组合一致性：
+  # 有预算无消息、有消息无预算、无 multiplier 的 DRY、不支持的 effort、
+  # 非法 format —— 都会被抓住
+```
+
+`validate` 对照的是**当前**构建的 schema，而非硬编码列表：fork 更新后检查
+自动跟随 `--help`。调优器把该组合原样带入实测（passthrough）：
+reasoning-budget 改变生成动态，没有它测到的就不是线上跑的配置。实测签名
+同样覆盖 reasoning/DRY/采样——不同组合的实测不会混在一起。
+
+还可以尝试：`min-p = 0.0`、repeat/presence penalty。
+
 ## 速度衰减规律
 
 早先 `models.ini` 表头写的是 `tg(D) = 1000 / (16.1 + 0.0025·D)`。

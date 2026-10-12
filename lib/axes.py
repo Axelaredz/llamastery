@@ -183,6 +183,20 @@ KNOWN_NOT_AXES = {
     "--cpu-mask", "--cpu-mask-batch", "--cpu-range", "--cpu-range-batch",
     "--cpu-strict", "--cpu-strict-batch", "--lora-init-without-apply",
     "--override-kv", "--override-tensor-draft",
+    # качество генерации, а не скорость: антизацикливающая связка
+    # reasoning-моделей (budget/format/effort + DRY + сэмплинг). Не оси
+    # линейного поиска — их эффект не в t/s, а в «доходит ли до ответа»,
+    # проверяются через validate.check_reasoning_quality, а не перебором.
+    "--reasoning", "--reasoning-format", "--reasoning-effort",
+    "--reasoning-budget", "--reasoning-budget-message", "--reasoning-preserve",
+    "--dry-multiplier", "--dry-base", "--dry-allowed-length",
+    "--dry-penalty-last-n", "--dry-sequence-breaker",
+    "--samplers", "--sampler-seq",
+    "--temp", "--top-k", "--top-p", "--min-p", "--top-nsigma",
+    "--typical", "--xtc-probability", "--xtc-threshold",
+    "--repeat-penalty", "--repeat-last-n",
+    "--presence-penalty", "--frequency-penalty",
+    "--mirostat", "--mirostat-lr", "--mirostat-ent",
 }
 
 

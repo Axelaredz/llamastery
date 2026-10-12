@@ -14,14 +14,26 @@ from pathlib import Path
 
 from . import paths
 
-# какие поля конфигурации реально влияют на скорость/память
+# какие поля конфигурации реально влияют на скорость/память.
+# Вторая строка — антизацикливающая связка reasoning-моделей: budget меняет
+# динамику генерации (доля токенов в мыслях), DRY — штраф повторов, сэмплинг —
+# форму распределения. Без них в подписи замеры двух пресетов, отличающихся
+# только reasoning-budget, склеивались бы в один.
 SIGNIFICANT = ("c", "n-cpu-moe", "n-gpu-layers", "ngl", "b", "batch-size",
                "ubatch-size", "ub", "t", "threads", "threads-batch", "tb",
                "parallel", "np", "fa", "flash-attn", "cache-type-k", "ctk",
                "cache-type-v", "ctv", "kv-unified", "kvu", "spec-type",
                "model-draft", "mmproj", "load-mode", "image-min-tokens",
                "ctx-checkpoints", "checkpoint-min-step", "cache-reuse",
-               "fit", "n-predict", "model", "m")
+               "fit", "n-predict", "model", "m",
+               "reasoning", "reasoning-format", "reasoning-effort",
+               "reasoning-budget", "reasoning-budget-message",
+               "reasoning-preserve",
+               "dry-multiplier", "dry-base", "dry-allowed-length",
+               "dry-penalty-last-n", "dry-sequence-breaker",
+               "samplers", "temp", "top-p", "top-k", "min-p",
+               "repeat-penalty", "repeat-last-n",
+               "presence-penalty", "frequency-penalty")
 
 
 def signature(config: dict[str, str]) -> str:

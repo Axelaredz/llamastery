@@ -273,6 +273,143 @@ def test_validate():
           "замер НЕ глушит предсказание падения")
 
 
+REASONING_HELP = """header
+--reasoning [on|off|auto]                Use reasoning
+--reasoning-format FORMAT                controls thought tags
+--reasoning-effort LEVEL                 effort level
+--reasoning-budget N                     token budget for thinking
+--reasoning-budget-message MESSAGE       message injected
+--reasoning-preserve                     preserve trace
+--dry-multiplier N                       DRY multiplier
+--dry-base N                             DRY base
+--dry-allowed-length N                   DRY allowed length
+--dry-penalty-last-n N                   DRY penalty window
+--dry-sequence-breaker STRING            DRY breaker
+--temp N                                 temperature
+--top-k N                                top-k
+--top-p N                                top-p
+--min-p N                                min-p
+--repeat-penalty N                       repeat penalty
+--repeat-last-n N                        repeat window
+--presence-penalty N                     presence penalty
+"""
+
+REASONING_HELP_NO_EFFORT = """header
+--reasoning [on|off|auto]                Use reasoning
+--reasoning-format FORMAT                controls thought tags
+--reasoning-budget N                     token budget for thinking
+--reasoning-budget-message MESSAGE       message injected
+--dry-multiplier N                       DRY multiplier
+--dry-penalty-last-n N                   DRY penalty window
+"""
+
+
+def test_reasoning_quality():
+    print("reasoning/DRY: проверка актуальных флагов")
+    full = schema.parse_help(REASONING_HELP)
+    noeff = schema.parse_help(REASONING_HELP_NO_EFFORT)
+
+    # бюджет без сообщения — warn
+    r = validate.Report()
+    validate.check_reasoning_quality("s", {"reasoning-budget": "2048"},
+                                     full, r)
+    check(any("без reasoning-budget-message" in f.message for f in r.findings),
+          "бюджет без сообщения предупреждает")
+    # связка целиком — тихо
+    r = validate.Report()
+    validate.check_reasoning_quality("s", {
+        "reasoning-format": "deepseek",
+        "reasoning-budget": "2048",
+        "reasoning-budget-message": "Wrap up and give the final answer.",
+        "dry-multiplier": "0.5", "dry-allowed-length": "6",
+        "dry-penalty-last-n": "4096",
+        "temp": "0.6", "top-p": "0.95", "top-k": "20",
+    }, full, r)
+    check(r.count("warn") == 0 and r.count("error") == 0,
+          "полная связка без предупреждений",
+          str([f.line() for f in r.findings]))
+    # сообщение без бюджета — warn (инертно)
+    r = validate.Report()
+    validate.check_reasoning_quality(
+        "s", {"reasoning-budget-message": "Wrap up"}, full, r)
+    check(any("инертно" in f.message for f in r.findings),
+          "сообщение без бюджета предупреждает")
+    # effort на сборке без поддержки (faks/ik) — warn
+    r = validate.Report()
+    validate.check_reasoning_quality("s", {"reasoning-effort": "medium"},
+                                     noeff, r)
+    check(any("не знает --reasoning-effort" in f.message for f in r.findings),
+          "effort на faks-подобной схеме предупреждает")
+    # effort на поддерживающей сборке — тихо
+    r = validate.Report()
+    validate.check_reasoning_quality("s", {"reasoning-effort": "medium"},
+                                     full, r)
+    check(r.count("warn") == 0, "effort на upstream-подобной схеме молчит")
+    # несуществующий флаг — warn
+    r = validate.Report()
+    validate.check_reasoning_quality(
+        "s", {"reasoning-budget-conclusion": "x"}, full, r)
+    check(any("budget-conclusion" in f.key for f in r.findings),
+          "несуществующий budget-conclusion ловится")
+    # невалидный format — warn
+    r = validate.Report()
+    validate.check_reasoning_quality("s", {"reasoning-format": "qwen"},
+                                     full, r)
+    check(any("reasoning-format" in f.key and f.level == "warn"
+              for f in r.findings),
+          "невалидный reasoning-format ловится")
+    # DRY-ключи при выключенном мультипликаторе — info, не warn
+    r = validate.Report()
+    validate.check_reasoning_quality("s", {"dry-penalty-last-n": "4096"},
+                                     full, r)
+    check(any(f.level == "info" for f in r.findings)
+          and not any(f.level in ("warn", "error") for f in r.findings),
+          "DRY без мультипликатора — только info")
+    # DRY с нулевым окном — warn
+    r = validate.Report()
+    validate.check_reasoning_quality(
+        "s", {"dry-multiplier": "0.5", "dry-penalty-last-n": "0"}, full, r)
+    check(any("dry-penalty-last-n" in f.key for f in r.findings),
+          "DRY с нулевым окном предупреждает")
+    # reasoning-модель без флагов — info с подсказкой связки
+    r = validate.Report()
+    validate.check_reasoning_quality(
+        "s", {"model": "/models/qwen3-32b-iq4_xs.gguf"}, full, r)
+    check(any("зацикливани" in f.message for f in r.findings),
+          "reasoning-модель без флагов подсказывает связку")
+    # подпись замера различает reasoning-конфигурации
+    s1 = measure.signature({"model": "/m.gguf", "c": "8192"})
+    s2 = measure.signature({"model": "/m.gguf", "c": "8192",
+                            "reasoning-budget": "2048",
+                            "dry-multiplier": "0.5"})
+    check(s1 != s2, "подпись замера учитывает reasoning/DRY")
+    # тюнер пропускает связку в команду сервера, а чужой флаг — нет
+    import tools.tune_models as _tm
+    kinds_full = {"--reasoning-budget": "int",
+                  "--reasoning-budget-message": "string",
+                  "--dry-multiplier": "int"}
+    _tm._KIND_CACHE["fake-bin"] = kinds_full
+    import argparse as _ap
+    ns = _ap.Namespace(keep_mmproj=False, allow_vision=False, allow_ot=False,
+                       load_mode="default", ngl=99, threads=8, threads_batch=8,
+                       flash_attn="auto", kv_cache_type="f16", kv_unified="auto",
+                       jinja=False, cache_reuse=0, keep_checkpoints=False)
+    caps = {"ctx-size": True}
+    cmd = _tm.build_server_command(
+        "fake-bin",
+        {"model": "/m.gguf", "c": "8192", "reasoning-budget": "2048",
+         "reasoning-effort": "medium", "dry-multiplier": "0.5"}, 8080,
+        caps, ns)
+    joined = " ".join(cmd)
+    check("--reasoning-budget 2048" in joined,
+          "тюнер везёт budget в команду сервера")
+    check("--dry-multiplier 0.5" in joined,
+          "тюнер везёт DRY в команду сервера")
+    check("reasoning-effort" not in joined,
+          "чужой для сборки флаг в команду не попадает")
+    del _tm._KIND_CACHE["fake-bin"]
+
+
 # ── слияние ──
 def test_merge():
     print("слияние пресетов")
