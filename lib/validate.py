@@ -144,12 +144,18 @@ def validate_section(name: str, pairs: dict[str, str], flags: dict,
 
     # ── семантика против метаданных ──
     ctx = budget._flag_int(pairs, "c", "ctx-size")
-    if ctx and meta.n_ctx_trained and ctx > meta.n_ctx_trained:
+    if ctx is not None and ctx < 0:
+        rep.add("error", name, "c", f"контекст отрицательный: {ctx}",
+                "опечатка в знаке; llama-server такое значение не примет")
+    elif ctx and meta.n_ctx_trained and ctx > meta.n_ctx_trained:
         rep.add("error", name, "c",
                 f"контекст {ctx} больше обученного {meta.n_ctx_trained}",
                 "модель не выучена на таком окне; качество деградирует")
     ncpu = budget._flag_int(pairs, "n-cpu-moe", "ncmoe")
-    if ncpu and meta.n_layer and ncpu > meta.n_layer:
+    if ncpu is not None and ncpu < 0:
+        rep.add("error", name, "n-cpu-moe", f"выгрузка отрицательная: {ncpu}",
+                "опечатка в знаке; столько слоёв выгрузить нельзя")
+    elif ncpu and meta.n_layer and ncpu > meta.n_layer:
         rep.add("error", name, "n-cpu-moe",
                 f"{ncpu} больше числа слоёв ({meta.n_layer})")
     ngl = budget._flag_int(pairs, "n-gpu-layers", "ngl", "gpu-layers")
@@ -178,9 +184,12 @@ KNOWN_TRAPS = [
         # («CUDA error: out of memory» в update_slots). Наблюдалось на
         # qwen3.8-35B-A3B-miniplus-128ctx-ngram-mmproj-vram с ubatch 512.
         "id": "mmproj-vram-ubatch",
+        # Ключа может не быть: дефолт у --mmproj-offload — enabled, то есть
+        # mmproj в VRAM. Раньше ловушка молчала, если ключ не записан вовсе,
+        # а это самый частый случай — тот самый OOM и не варнился.
         "applies": lambda p: str(p.get("mmproj", "")).strip() != ""
                               and str(p.get("mmproj-offload", "")).strip()
-                              in ("1", "true", "yes", "on")
+                              .lower() not in ("0", "false", "no", "off")
                               and int(budget._flag_int(p, "ubatch-size", "ub") or 512) >= 512,
         "message": "mmproj в VRAM при ubatch-size >= 512 — не хватает VRAM "
                    "префиллу на 12 ГБ (проверено: CUDA OOM при 114688)",
@@ -193,8 +202,10 @@ KNOWN_TRAPS = [
         # (tiel-coder-nanoplus-128ctx-mmproj-moe16 измерен: 29.3 t/s, 1616 MiB
         # свободно). Падает он в паре с ускорителем — 2048 + ngram-mod роняет
         # CUDA по compute buffer на 110k токенах, 1024 работает.
+        # Порог «от 2048», а не ровно 2048: 4096 с ускорителем на 12 ГБ —
+        # тот же OOM, только ещё глубже, и раньше он проходил без варна.
         "id": "ubatch-2048-oom",
-        "applies": lambda p: str(p.get("ubatch-size", p.get("ub", ""))) == "2048"
+        "applies": lambda p: int(budget._flag_int(p, "ubatch-size", "ub", default=0) or 0) >= 2048
                               and str(p.get("spec-type", "")).strip() != "",
         "message": "ubatch-size=2048 вместе с ускорителем на 12 ГБ VRAM — "
                    "подтверждённая причина OOM",

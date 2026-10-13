@@ -36,19 +36,61 @@ SIGNIFICANT = ("c", "n-cpu-moe", "n-gpu-layers", "ngl", "b", "batch-size",
                "presence-penalty", "frequency-penalty")
 
 
+# Один и тот же флаг llama.cpp пишут по-разному: `ub` и `ubatch-size`,
+# `ngl` и `n-gpu-layers`, `ctk` и `cache-type-k`. Без сведения к канону
+# подпись зависит от того, как записан пресет, и живой замер терялся:
+# тюнер писал `ubatch-size`, а пресет использовал `ub` — budget показывал
+# оценку вместо факта.
+ALIASES = {
+    "m": "model",
+    "ub": "ubatch-size",
+    "ngl": "n-gpu-layers",
+    "gpu-layers": "n-gpu-layers",
+    "ncmoe": "n-cpu-moe",
+    "cmoe": "n-cpu-moe",
+    "ncmoe-": "n-cpu-moe",
+    "ctk": "cache-type-k",
+    "ctv": "cache-type-v",
+    "np": "parallel",
+    "tb": "threads-batch",
+    "ctx-size": "c",
+    "lm": "load-mode",
+    "fa": "flash-attn",
+    "kvu": "kv-unified",
+}
+
+# Значения, которые пишут по-разному, а значат одно: true/on/1/yes — это
+# одно и то же включение. Без нормализации `fa = on` и `fa = true` давали
+# разные подписи одной и той же конфигурации.
+_TRUE = {"1", "true", "on", "yes", "y"}
+_FALSE = {"0", "false", "off", "no", "n"}
+_FLAGGY = {"fa", "flash-attn", "kv-unified", "kvu", "jinja", "cont-batching",
+           "cache-prompt", "context-shift", "mmproj-offload", "fit"}
+
+
+def _norm_value(key: str, value) -> str:
+    v = str(value).strip()
+    if key in _FLAGGY:
+        low = v.lower()
+        if low in _TRUE:
+            return "on"
+        if low in _FALSE:
+            return "off"
+    return v
+
+
 def signature(config: dict[str, str]) -> str:
-    """Стабильный ключ конфигурации: нечувствителен к порядку и регистру.
+    """Стабильный ключ конфигурации: нечувствителен к порядку, регистру и алиасам.
 
     «model» входит в подпись: замер тяжёлой модели не должен выдаваться
-    за замер лёгкой с теми же флагами. «m» — алиас того же ключа.
+    за замер лёгкой с теми же флагами.
     """
     norm = {}
     for k, v in config.items():
-        key = k.lower()
-        if key == "m":
-            key = "model"
-        if key in SIGNIFICANT:
-            norm[key] = str(v).strip()
+        key = k.lower().strip()
+        key = ALIASES.get(key, key)
+        if key in SIGNIFICANT or key in ALIASES.values():
+            norm[key] = _norm_value(key, v)
     blob = json.dumps(norm, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 

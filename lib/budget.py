@@ -43,10 +43,15 @@ SPEC_UBATCH_LIMIT = 1024
 # q4_0 = 18/32, q4_1 = 20/32 — у «_1» есть поле min, q5_0 = 22/32, q5_1 = 24/32)
 KV_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 1.0625, "q8_1": 1.125,
             "q6_0": 0.8125, "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625,
-            "q4_0": 0.5625, "iq4_nl": 0.5625, "iq4_xs": 0.5625}
+            "q4_0": 0.5625, "iq4_nl": 0.5625, "iq4_xs": 0.5625,
+            # K-типы llama.cpp: q4_K/q5_K/q6_K — реальные названия из --help.
+            # Без них молчаливый откат на f16 (2 байта) завышал KV втрое.
+            "q4_k": 0.5625, "q5_k": 0.6875, "q6_k": 0.8125,
+            "iq3_xxs": 0.34, "iq4_nll": 0.5625}
 
 
 def kv_bytes_for(kind: str) -> float:
+    """Байт на элемент. Неизвестное имя — f16 с честной оговоркой в callers."""
     return KV_BYTES.get((kind or "f16").lower(), 2.0)
 
 
@@ -315,7 +320,9 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
                 "n-cpu-moe проигнорирован: override-tensor уже учтён точно")
     elif est.cpu_moe and meta.n_layer:
         share = expert_weight_share(meta)
-        frac = min(1.0, (est.cpu_moe / meta.n_layer) * share * realization)
+        # клип в [0, 1]: отрицательный n-cpu-moe (опечатка) не должен
+        # раздувать оценку весов больше размера файла
+        frac = max(0.0, min(1.0, (est.cpu_moe / meta.n_layer) * share * realization))
         weights *= (1.0 - frac)
         per_layer = meta.size_bytes / GIB * share * realization / meta.n_layer
         est.notes.append(
@@ -331,7 +338,10 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
     # ── KV-кэш ──
     ctk = kv_bytes_for(_get_str(low, "cache-type-k", "ctk", default="f16"))
     ctv = kv_bytes_for(_get_str(low, "cache-type-v", "ctv", default="f16"))
-    np_ = _get_int(low, "parallel", "np", default=1) or 1
+    # parallel=0 — не «ноль слотов», а опечатка; дефолт 1, а не falsy-подмена,
+    # где любой невалидный вроде abc молча превращался бы в 0
+    np_ = _get_int(low, "parallel", "np", default=1)
+    np_ = np_ if np_ and np_ > 0 else 1
     kv_unified = _get_str(low, "kv-unified", "kvu", default="")
     if meta.is_mla:
         # MLA (DeepSeek-стиль, xing4_0): KV — одна строка на слой,
@@ -436,7 +446,10 @@ def shrink_to_fit(pairs: dict[str, str], meta: ModelMeta | None,
     if meta is None or not total_mib:
         return Shrink(ctx=cur_ctx, cpu_moe=cur_moe)
     usable_mib = total_mib - reserve_mib
-    max_moe = max(0, meta.n_layer - 1) if meta.is_moe else 0
+    # n_layer, а не n_layer-1: validate разрешает выгрузить все слои, и пресет,
+    # который влезает только при полной выгрузке экспертов, имеет право
+    # считаться вмещающимся
+    max_moe = max(0, meta.n_layer) if meta.is_moe else 0
 
     meas = measure_lookup(pairs)
     if meas and meas.get("used_mib"):

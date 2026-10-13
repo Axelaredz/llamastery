@@ -67,7 +67,8 @@ def prompt_from_file(path: str | Path, target_tokens: int,
 
 
 def build_prompt(target_tokens: int, varied: bool = False,
-                 model: str | None = None, tail: int = 0) -> str:
+                 model: str | None = None, tail: int = 0,
+                 seed: int = 12345) -> str:
     """Текст примерно на target_tokens токенов.
 
     По умолчанию — повторяющийся (lorem). Так удобно мерить prefill и удобно
@@ -78,7 +79,7 @@ def build_prompt(target_tokens: int, varied: bool = False,
     if target_tokens <= 0:
         return ""
     if varied:
-        return build_varied_prompt(target_tokens, tail=tail)
+        return build_varied_prompt(target_tokens, seed=seed, tail=tail)
     unit = LOREM
     per_unit = tokenize(unit, model)
     if per_unit <= 0:
@@ -268,8 +269,11 @@ def probe(target_tokens: int = 8192, max_tokens: int = 64,
     if image is None and from_file:
         prompt = prompt_from_file(from_file, target_tokens, model, tail=tail)
     else:
+        # seed обязателен: varied-текст строится им же, и без него все
+        # повторы давали один и тот же промпт — вторая проба бралась из
+        # prompt cache, и замер prefill/tg врал
         prompt = (build_prompt(target_tokens, varied=varied, model=model,
-                               tail=tail) if image is None else "")
+                               tail=tail, seed=seed) if image is None else "")
     res = completion(prompt, model, max_tokens, image=image, timeout=timeout)
     res["target_tokens"] = target_tokens
     res["with_image"] = bool(image)

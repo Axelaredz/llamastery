@@ -396,7 +396,9 @@ def learn(min_pairs: int = 2) -> dict:
             continue
         s = stats.setdefault(key, {"pairs": 0, "tps_gain": None,
                                    "vram_gain": None, "values": len(vals)})
-        s["pairs"] = len(tp) + len(vp)
+        # пары считали как len(tp)+len(vp), и одна и та же пара попадала в
+        # оба списка — «пар» получалось вдвое больше, чем измерений
+        s["pairs"] = max(len(tp), len(vp))
         s["values"] = len(vals)
         s["tps_gain"] = round(max(tp), 2) if len(tp) >= min_pairs else None
         s["vram_gain"] = round(max(vp), 2) if len(vp) >= min_pairs else None

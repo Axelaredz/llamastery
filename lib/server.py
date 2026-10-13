@@ -164,8 +164,6 @@ def healthy(build_name: str | None = None, timeout: float = 3.0) -> bool:
     j = http("GET", f"{base}/health", timeout=timeout)
     if isinstance(j, dict) and j.get("status") == "ok":
         return True
-    if isinstance(j, dict) and "error" not in j:
-        return True
     # старый single-сервер ik_llama отдаёт /health plain-текстом
     try:
         with urllib.request.urlopen(f"{base}/health", timeout=timeout) as r:
@@ -610,6 +608,7 @@ def _spawn(build: builds.Build, env: dict, argv: list[str], timeout: int,
                 res.ok = False
                 res.message = (f"процесс умер с кодом {proc.returncode}. "
                                f"лог: {log_file()}")
+                _forget_pid(proc.pid)
                 return res
             if healthy():
                 res.ok = True
@@ -617,9 +616,38 @@ def _spawn(build: builds.Build, env: dict, argv: list[str], timeout: int,
                                f"({build.name}, pid {proc.pid})")
                 return res
             time.sleep(0.5)
+        # не дождались: ребёнок остаётся жить, держит порт и кусок VRAM,
+        # а pid-файл после этого никто не читает — следующий start решит,
+        # что сервера нет, и поднимет второй поверх. Гасим и убираем pid.
+        _kill(proc.pid)
+        _forget_pid(proc.pid)
         res.ok = False
-        res.message = (f"сервер не ответил за {timeout} с. лог: {log_file()}")
+        res.message = (f"сервер не ответил за {timeout} с и остановлен. "
+                       f"лог: {log_file()}")
         return res
+
+
+def _forget_pid(pid: int | None) -> None:
+    """Снять pid-файл, если он всё ещё про этого ребёнка."""
+    try:
+        if read_pid() == pid:
+            pid_file().unlink()
+    except OSError:
+        pass
+
+
+def _kill(pid: int | None) -> None:
+    """SIGTERM, затем SIGKILL — тихо, без исключений наружу."""
+    if not pid:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and alive(pid):
+            time.sleep(0.2)
 
 
 def stop(timeout: int = 30) -> tuple[bool, str]:
@@ -672,10 +700,14 @@ def stop(timeout: int = 30) -> tuple[bool, str]:
             msgs.append(f"{who} (pid {pid}): не уходит даже по SIGKILL")
         else:
             msgs.append(f"{who} (pid {pid}): остановлен")
-    try:
-        pid_file().unlink()
-    except OSError:
-        pass
+    # pid-файл снимаем только если ничего живого не осталось: убрать его
+    # при живом процессе — потерять его из виду (повиснет в VRAM навсегда,
+    # и ни stop, ни status его уже не найдут).
+    if not any(alive(p) for p in pids):
+        try:
+            pid_file().unlink()
+        except OSError:
+            pass
     return ok_all, "; ".join(msgs)
 
 

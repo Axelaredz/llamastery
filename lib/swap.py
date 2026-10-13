@@ -17,6 +17,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -69,10 +70,16 @@ def section_to_cmd(section_name: str, pairs: dict, build: builds.Build) -> tuple
     argv, warns = server.preset_to_argv(clean, flags)
     parts = [str(build.server_bin)] + argv + ["--port", "${PORT}"]
     env = dict(build.env or {})
-    # LD_LIBRARY_PATH для shared-сборок (faks/upstream — thin-бинари + .so рядом)
+    # путь к библиотекам: имя переменной платформенное (LD/DYLD/PATH) —
+    # иначе на macOS и Windows под swap не запускались бы shared-сборки
     bindir = str(build.server_bin.parent)
-    if "LD_LIBRARY_PATH" not in env:
-        env["LD_LIBRARY_PATH"] = bindir
+    libvar = ("PATH" if os.name == "nt"
+              else "DYLD_LIBRARY_PATH" if sys.platform == "darwin"
+              else "LD_LIBRARY_PATH")
+    if libvar not in env:
+        env[libvar] = bindir if libvar == "LD_LIBRARY_PATH" else (
+            f"{bindir}{os.pathsep}{env.get(libvar, '')}"
+            if libvar == "PATH" else f"{bindir}:{env.get(libvar, '')}")
     # вся команда — одна YAML-строка: несколько quoted-сегментов подряд
     # YAML не принимает ("did not find expected key"), поэтому shlex внутри,
     # json.dumps снаружи
@@ -207,6 +214,10 @@ def parse_listen(text: str) -> tuple[str, int]:
 
     Принимает '0.0.0.0:8080', '127.0.0.1:8090', ':8080', '8080',
     'http://127.0.0.1:8080/'.
+
+    Некорректный адрес — ValueError с внятным текстом. Раньше падал голый
+    int() с «invalid literal for int() with base 10: 'foo'», и в CLI это
+    вылетало traceback'ом вместо строки об ошибке.
     """
     s = (text or "").strip()
     s = s.split("://", 1)[-1].rstrip("/")
@@ -214,7 +225,11 @@ def parse_listen(text: str) -> tuple[str, int]:
         host, _, port = s.rpartition(":")
     else:
         host, port = "", s
-    return host or "0.0.0.0", int(port)
+    try:
+        return host or "0.0.0.0", int(port)
+    except ValueError:
+        raise ValueError(f"не разобрать адрес {text!r}: "
+                         f"ожидалось host:port, например 127.0.0.1:8087") from None
 
 
 # ── демон: своими руками, как роутер ──
@@ -277,7 +292,10 @@ def resolve_listen(listen: str | None = None, auto: bool = True) -> tuple[str, s
     от дефолта. `auto=False` означает «не смещать молча».
     """
     if listen:
-        host, port = parse_listen(listen)
+        try:
+            host, port = parse_listen(listen)
+        except ValueError as exc:
+            return "", str(exc)
         if auto and is_port_busy(host, port):
             if daemon_pid():
                 return listen, f"уже запущен на {listen}"
@@ -287,7 +305,11 @@ def resolve_listen(listen: str | None = None, auto: bool = True) -> tuple[str, s
         return listen, ""
     st = load_state()
     if st.get("listen"):
-        host, port = parse_listen(st["listen"])
+        try:
+            host, port = parse_listen(st["listen"])
+        except ValueError as exc:
+            # битый swap.json не должен ронять запуск: порт просто не подсказан
+            return listen, str(exc)
         if not is_port_busy(host, port):
             return st["listen"], "порт из прошлого запуска"
         if not auto:
@@ -343,8 +365,11 @@ def up(config: str | None = None, listen: str | None = None,
         at = st.get("listen") or listen or SWAP_LISTEN
         return {"ok": True, "pid": pid, "url": f"http://{at}",
                 "message": f"уже работает (pid {pid}) на {at}"}
-    listen, why = resolve_listen(listen, auto=auto_port)
-    host, port = parse_listen(listen)
+    try:
+        listen, why = resolve_listen(listen, auto=auto_port)
+        host, port = parse_listen(listen)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
     if is_port_busy(host, port):
         return {"ok": False,
                 "message": f"порт {port} занят: {describe_owner(port_owner(port))}"
@@ -367,6 +392,7 @@ def up(config: str | None = None, listen: str | None = None,
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if proc.poll() is not None:
+                _forget_pid(proc.pid)
                 return {"ok": False, "pid": proc.pid,
                         "message": f"процесс умер (код {proc.returncode}). "
                                    f"лог: {log_file()}"}
@@ -376,8 +402,22 @@ def up(config: str | None = None, listen: str | None = None,
                         "message": (f"swap поднят на {listen} (pid {proc.pid})"
                                     + (f"\n  {why}" if why else ""))}
             time.sleep(0.5)
+        # не ответил за отведённое время: демон остался бы жить, держал порт
+        # и бэкенды, а pid-файл после этого никто не читает. Гасим и чистим.
+        server._kill(proc.pid)
+        _forget_pid(proc.pid)
         return {"ok": False, "pid": proc.pid,
-                "message": f"не ответил за {timeout} с. лог: {log_file()}"}
+                "message": f"не ответил за {timeout} с и остановлен. "
+                           f"лог: {log_file()}"}
+
+
+def _forget_pid(pid: int | None) -> None:
+    try:
+        if (pid_file().exists()
+                and pid_file().read_text(encoding="utf-8").strip() == str(pid)):
+            pid_file().unlink()
+    except OSError:
+        pass
 
 
 def next_steps(url: str) -> list[str]:

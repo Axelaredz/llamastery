@@ -312,6 +312,22 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def port_is_busy(port: int) -> bool:
+    """Кто-то уже слушает этот порт?
+
+    Проверка одним bind'ом: SO_REUSEADDR не ставим, иначе проверка всегда
+    говорила бы «свободно» — в том числе для сервера, который уже занял
+    порт (Linux считает его busy только без REUSEADDR).
+    """
+    import socket as _s
+    with _s.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+    return False
+
+
 def tail_file(path, chars=5000):
     try:
         size = path.stat().st_size
@@ -829,6 +845,11 @@ def probe_series(
         "estimated_median": round(statistics.median(estimated_values), 1),
         "needle_ok": all(bool(s["needle_ok"]) for s in samples),
         "needle_retries": sum(1 for s in samples if s.get("needle_retried")),
+        # вырожденные пробы (1–5 токенов вместо n_predict) дают правдоподобный
+        # gen_tps на пустом месте; раньше флаг считался и нигде не влиял,
+        # и такой прогон мог выиграть отбор
+        "low_decode_sample": any(bool(s.get("low_decode_sample"))
+                                 for s in samples),
         "answer": samples[0]["answer"],
         "warmup": warmup_info,
         "samples": samples,
@@ -905,7 +926,19 @@ def extract_log_signals(path):
 
 
 def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only=False):
+    # free_port() — окно между закрытием сокета и bind'ом сервера. Если порт
+    # успел занять кто-то (висящий сервер прошлого прогона, чужой процесс),
+    # наш llama-server не поднимется, а /health ответит ЧУЖОЙ сервер — замеры
+    # пойдут против него и тихо станут «победителем». Поэтому проверяем порт
+    # до старта и при неудаче перебираем следующий свободный.
     port = free_port()
+    for _ in range(8):
+        if not port_is_busy(port):
+            break
+        port = free_port()
+    else:
+        return {"ok": False, "error": f"не нашёлся свободный порт для замера",
+                "config": {}, "min_observed_free_mib": 0}
 
     cfg = dict(base_opts)
     ubatch = safe_int(variant.get("ubatch", 2048), 2048)
@@ -986,7 +1019,10 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                env=os.environ.copy(),
+                # tool_env, а не os.environ: у thin-сборок рядом с бинарём
+                # лежат libllama-*.so, и без LD_LIBRARY_PATH сервер не
+                # стартовал — все кандидаты выходили ok=False
+                env=tool_env(cmd[0]),
             )
 
             watcher = threading.Thread(
@@ -1334,6 +1370,11 @@ def rank_score(result, weights=(0.55, 0.30, 0.15)):
     gmin = float(deep.get("gen_tps_min") or gen)
     gmax = float(deep.get("gen_tps_max") or gen)
     stability = (gmin / gmax) if gmax > 0 else 0.0
+    if deep.get("low_decode_sample"):
+        # декод в 1–5 токенов: gen_tps измеряет не генерацию, а обрыв по EOS
+        gen *= 0.5
+        gmax *= 0.5
+        gmin *= 0.5
     free = float(result.get("min_observed_free_mib") or 0.0)
     # headroom: 0..1, насыщение после 2 ГБ запаса
     headroom = min(1.0, max(0.0, free / 2048.0))
@@ -1402,6 +1443,7 @@ def run_llama_sweep_bench(tool, caps, model, ctx, variant, args, log_path):
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 timeout=args.bench_timeout,
+                env=tool_env(tool),   # как у run_llama_bench
             )
             rc = proc.returncode
         except subprocess.TimeoutExpired:
@@ -1524,7 +1566,12 @@ def knob_axes(present_flags=None):
     (или правки приоритета) они разъезжаются, и тюнер крутит не то.
     """
     from lib import axes as _axes
-    learned = _axes.learn()
+    try:
+        learned = _axes.learn()
+    except Exception as exc:            # noqa: BLE001 — реестр осей не критичен
+        # битый tune-results/**/results.json не должен ронять даже --help
+        _sys.stderr.write(f"предупреждение: замеры осей не прочитаны: {exc}\n")
+        learned = {}
     order = _axes.order(learned, present_flags)
     out = []
     for key in order:
@@ -1845,11 +1892,22 @@ def _rank_all(results, weights):
          if r.get("deep") and r["deep"].get("gen_tps")),
         default=0.0,
     )
+    # сравнивать прогоны разной глубины бессмысленно: tg на 32k всегда выше,
+    # чем на 114k, и «лучшим» оказывался бы мелкоконтекстный. Ранжируем
+    # только целевой контекст (самый глубокий из измеренных).
+    def _ctx_of(r):
+        try:
+            return int((r.get("config") or {}).get("c") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    target_ctx = max((_ctx_of(r) for r in results), default=0)
+    at_ctx = [r for r in results if _ctx_of(r) == target_ctx] or results
     close = [
-        r for r in results
+        r for r in at_ctx
         if r.get("deep") and r["deep"].get("gen_tps")
         and float(r["deep"]["gen_tps"]) >= fastest_gen * 0.90
-    ] or [r for r in results if r.get("deep") is not None]
+    ] or [r for r in at_ctx if r.get("deep") is not None]
     # `is not None`, а не truthiness: у провального прогона deep бывает
     # пустым словарём, и именно его замеры VRAM должен показать отчёт
     for r in close:

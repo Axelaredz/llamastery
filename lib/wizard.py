@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from . import builds, budget, gguf, measure, paths, presets, server, swap, vram
+from . import builds, budget, gguf, measure, paths, presets, server, swap, tui, vram
 
 STAR = "★"
 ARROW = "│"
@@ -56,6 +56,26 @@ def qnum() -> str:
 def reset_questions() -> None:
     global _qcount
     _qcount = 0
+    _crumbs.clear()
+
+
+# ── хлебные крошки для интерактивного режима ──
+# После каждого ответа консоль очищается, а сверху рисуется, что уже выбрано:
+# следующий вопрос виден в контексте, а не в пустоте.
+_crumbs: list[tuple[str, str]] = []
+
+
+def _short(title: str) -> str:
+    """«Вопрос 3 · какая сборка» → «какая сборка» (для крошек)."""
+    return re.sub(r"^Вопрос \d+ · ", "", title)
+
+
+def _remember(title: str, answer: str) -> None:
+    """Ответ в крошки + чистый экран под новое состояние."""
+    _crumbs.append((_short(title), answer))
+    if tui.enabled():
+        tui.clear()
+        tui.render_crumbs(sys.stdout, _crumbs)
 
 
 def note(text: str) -> None:
@@ -187,6 +207,8 @@ def ask(title: str, options: list[tuple[str, str]], default: int,
     При paste_model=True вставленный путь к .gguf возвращается как
     PastedPath, и вызывающий сам решает, что с ним делать.
     """
+    if tui.enabled():
+        return _ask_tui(title, options, default, sub, paste_model)
     head(title, sub)
     for i, (label, desc) in enumerate(options, 1):
         mark = f" {STAR}" if i == default else "  "
@@ -211,6 +233,38 @@ def ask(title: str, options: list[tuple[str, str]], default: int,
     return idx
 
 
+def _ask_tui(title: str, options: list[tuple[str, str]], default: int,
+             sub: str = "", paste_model: bool = False) -> int | PastedPath:
+    """Тот же вопрос, но стрелками: меню перерисовывается, выбор — Enter.
+
+    Пустой Enter здесь не нужен: курсор стартует на ★-дефолте, Enter его и
+    берёт. "/" открывает вставку пути (только при paste_model), пустая
+    вставка — отмена, возврат в меню. 0/Esc/← — назад через _GoBack.
+    """
+    items = [(label, desc, i + 1 == default)
+             for i, (label, desc) in enumerate(options)]
+    footer = f"↑/↓ — ходить, Enter — выбрать, цифры — быстро, 0/Esc/← — {BACK}"
+    if paste_model:
+        footer += ", / — вставить путь к .gguf"
+    while True:
+        act, idx = tui.menu_select(title, sub, items, default - 1,
+                                   _crumbs, footer, allow_paste=paste_model)
+        if act == tui.BACK:
+            _go_back()
+        if act == tui.PASTE:
+            raw = _read("вставь путь к .gguf (пусто — назад в меню) ▸")
+            if not raw:
+                continue
+            pasted = _as_model_path(raw)
+            if pasted:
+                _remember(title, pasted)
+                return PastedPath(pasted)
+            warn(f"не путь к .gguf: {raw[:60]!r} — выбираю из списка")
+            continue
+        _remember(title, options[idx][0])
+        return idx
+
+
 def ask_pick(title: str, options: list[tuple[str, str]], default: int,
              sub: str = "", paste_model: bool = False) -> str | PastedPath:
     """Вопрос со списком → возвращает выбранную метку (или вставленный путь)."""
@@ -218,7 +272,8 @@ def ask_pick(title: str, options: list[tuple[str, str]], default: int,
     if isinstance(idx, PastedPath):
         return idx
     label = options[idx][0]
-    print(f"    {ARROW} ответ: {label}")
+    if not tui.enabled():
+        print(f"    {ARROW} ответ: {label}")
     return label
 
 
@@ -230,6 +285,12 @@ def ask_yn(title: str, default_yes: bool = False, sub: str = "") -> bool:
     default_yes остался параметром только ради подписи в тексте вопроса
     (что рекомендовано) и больше ничего не меняет.
     """
+    if tui.enabled():
+        act, val = tui.confirm_select(title, sub, _crumbs, default_yes)
+        if act == tui.BACK:
+            _go_back()
+        _remember(title, "да" if val else "нет")
+        return val
     head(title, sub)
     hint = "y/д/n/нет"
     if default_yes:
@@ -243,13 +304,19 @@ def ask_yn(title: str, default_yes: bool = False, sub: str = "") -> bool:
 
 
 def ask_text(title: str, default: str, sub: str = "") -> str:
+    if tui.enabled():
+        tui.clear()
+        tui.render_crumbs(sys.stdout, _crumbs)
     head(title, sub)
     hint = f"Enter = {default}, " if default else ""
     raw = _read(f"{hint}0 = {BACK} ▸")
     if raw == "0":
         _go_back()
     val = raw or default
-    print(f"    {ARROW} ответ: {val}")
+    if tui.enabled():
+        _remember(title, val)
+    else:
+        print(f"    {ARROW} ответ: {val}")
     return val
 
 
@@ -905,6 +972,8 @@ def run() -> int:
     if not sys.stdin.isatty():
         print("мастер интерактивный — запусти в терминале: llamastery wizard")
         return 2
+    if tui.enabled():
+        tui.clear()
     print("╔" + "═" * 62 + "╗")
     print("║  llamastery · мастер".ljust(63) + "║")
     print("╚" + "═" * 62 + "╝")
@@ -956,7 +1025,8 @@ def _main_menu(swap_url: str) -> tuple[int, str | None]:
         note("вышел из мастера")
         return 0, None
     action = labels[idx]
-    print(f"    {ARROW} ответ: {action}")
+    if not tui.enabled():
+        print(f"    {ARROW} ответ: {action}")
     return 0, action
 
 

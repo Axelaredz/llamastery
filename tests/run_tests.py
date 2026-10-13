@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from lib import budget, gguf, inifile, measure, paths, presets, schema, swap, validate, wizard  # noqa: E402
+from lib import budget, gguf, inifile, measure, paths, presets, schema, swap, tui, validate, wizard  # noqa: E402
 
 FAILED: list[str] = []
 
@@ -2737,6 +2737,204 @@ def test_tuner_rank_all_when_nobody_measured():
     ranked = T._rank_all(results, (0.55, 0.30, 0.15))
     check(isinstance(ranked, list) and len(ranked) == 1,
           "отчёт построен, прогон с deep отсортирован", ranked)
+
+
+def test_tui_interactive():
+    """Интерактивный слой: стрелки, быстрый выбор, назад, безопасность «нет».
+
+    Клавиши подсовываются, кадры ловятся в StringIO — настоящий терминал
+    не нужен. Регрессии, которые ловим:
+    * Enter берёт подсвеченное, а не «первый пункт»;
+    * 0/Esc/← — это назад, а не выбор;
+    * в вопросе да/нет курсор стартует на «нет», даже если рекомендовано «да»
+      (иначе один Enter соглашается на 10–30 минут GPU);
+    * "/" вне режима вставки игнорируется, а не роняет меню.
+    """
+    import io
+
+    print("tui: стрелки и безопасность")
+
+    def feeder(*keys):
+        it = iter(keys)
+
+        def read():
+            try:
+                return next(it)
+            except StopIteration:
+                raise AssertionError("меню запросило клавиш больше, чем дано")
+        return read
+
+    def run_menu(keys, **kw):
+        out = io.StringIO()
+        kw.setdefault("title", "Вопрос 1 · что делаем?")
+        kw.setdefault("sub", "")
+        kw.setdefault("items", [("a", "", False), ("b", "", True),
+                                ("c", "пояснение", False)])
+        kw.setdefault("cursor", 1)
+        kw.setdefault("crumbs", [])
+        kw.setdefault("footer", "подсказки")
+        kw.setdefault("key_reader", feeder(*keys))
+        kw.setdefault("out", out)
+        kw.setdefault("height", 30)
+        return tui.menu_select(**kw), out.getvalue()
+
+    (act, idx), frame = run_menu(["\r"])
+    check((act, idx) == (tui.PICK, 1), "Enter берёт подсвеченный ★-дефолт",
+          (act, idx))
+    check("►" in frame and "b" in frame, "курсор и крошки в кадре")
+
+    (act, idx), _ = run_menu([tui.DOWN, "\r"])
+    check((act, idx) == (tui.PICK, 2), "вниз + Enter", (act, idx))
+    (act, idx), _ = run_menu([tui.UP, "\r"])
+    check((act, idx) == (tui.PICK, 0), "вверх от дефолта", (act, idx))
+    (act, idx), _ = run_menu([tui.UP, "\r"], cursor=0)
+    check((act, idx) == (tui.PICK, 2), "наверх с закольцовыванием", (act, idx))
+    (act, idx), _ = run_menu(["3"])
+    check((act, idx) == (tui.PICK, 2), "цифра — быстрый выбор", (act, idx))
+    (act, idx), _ = run_menu(["9", "\r"])
+    check((act, idx) == (tui.PICK, 1), "цифры вне списка игнорируются",
+          (act, idx))
+    for key in ("0", tui.ESC, tui.LEFT):
+        (act, idx), _ = run_menu([key])
+        check((act, idx) == (tui.BACK, None), f"{key!r} — это назад",
+              (act, idx))
+    (act, idx), _ = run_menu(["/", "\r"])
+    check((act, idx) == (tui.PICK, 1), "'/' без allow_paste игнорируется",
+          (act, idx))
+    (act, idx), _ = run_menu(["/"], allow_paste=True)
+    check((act, idx) == (tui.PASTE, None), "'/' с allow_paste — вставка",
+          (act, idx))
+
+    def run_yn(keys, **kw):
+        out = io.StringIO()
+        kw.setdefault("title", "Вопрос 2 · грузим?")
+        kw.setdefault("sub", "")
+        kw.setdefault("crumbs", [])
+        kw.setdefault("recommended_yes", True)
+        kw.setdefault("key_reader", feeder(*keys))
+        kw.setdefault("out", out)
+        kw.setdefault("height", 30)
+        return tui.confirm_select(**kw)
+
+    check(run_yn(["\r"]) == (tui.PICK, False),
+          "пустой Enter в да/нет = «нет», даже при ★ да")
+    check(run_yn([tui.RIGHT, "\r"]) == (tui.PICK, True), "стрелка + Enter = да")
+    check(run_yn(["y", "\r"]) == (tui.PICK, True), "y = да")
+    check(run_yn(["д", "\r"]) == (tui.PICK, True), "д = да")
+    check(run_yn(["n", "\r"]) == (tui.PICK, False), "n = нет")
+    check(run_yn(["0"]) == (tui.BACK, None), "0 в да/нет — назад")
+
+    check(tui._window(0, 3, 10) == (0, 3), "короткий список без прокрутки")
+    check(tui._window(9, 20, 6) == (6, 12), "окно следует за курсором")
+    check(tui._window(0, 20, 6) == (0, 6), "окно у начала")
+
+    # чтение клавиш идёт мимо буфера TextIOWrapper: иначе select после Esc
+    # видит пустоту и стрелки превращаются в Esc (поймано pty-прогоном).
+    # Проверяем на pipe: двухбайтовое «д» читается целиком.
+    import os as _os
+    rfd, wfd = _os.pipe()
+    try:
+        _os.write(wfd, "д".encode("utf-8"))
+        check(tui._read_char(rfd) == "д", "кириллица с fd — целиком")
+        _os.write(wfd, b"y")
+        check(tui._read_char(rfd) == "y", "латиница с fd")
+    finally:
+        _os.close(rfd)
+        _os.close(wfd)
+
+    check(wizard._short("Вопрос 3 · какая сборка") == "какая сборка",
+          "крошки без номера вопроса")
+    wizard._crumbs.clear()
+    wizard._remember("Вопрос 1 · что делаем?", "загрузить пресет")
+    check(wizard._crumbs == [("что делаем?", "загрузить пресет")],
+          "ответ запомнен в крошки", wizard._crumbs)
+    wizard._crumbs.clear()
+    check(isinstance(tui.enabled(), bool), "enabled() — просто флаг")
+
+
+def test_audit_fixes_2026_10_13():
+    """Регрессии аудита 2026-10-13: подпись замеров, ловушки, бюджет, порт.
+
+    Каждый пункт — реальный баг, найденный разбором кода:
+    * подпись замера зависела от написания ключа (`ub` против `ubatch-size`)
+      и от формы булева значения (`fa = on` против `fa = true`) — живой замер
+      терялся, и budget показывал оценку вместо факта;
+    * ловушка mmproj-vram-ubatch молчала, если mmproj-offload не записан
+      вовсе, а дефолт у него — enabled, то есть ровно тот случай OOM;
+    * порог «ubatch 2048» ловил ровно 2048, а 4096 с ускорителем — тот же OOM;
+    * q4_K/q5_K/q6_K в бюджете молчали на f16 и завышали KV втрое;
+    * порт для замера брался свободным «по мнению сокета» — чужой сервер
+      на том же порте отвечал бы вместо нашего.
+    """
+    print("аудит 2026-10-13: регрессии")
+
+    from lib import swap as SW
+
+    # подпись замера: алиасы и булевы значения не должны давать разные ключи
+    a = measure.signature({"ubatch-size": "512", "ngl": "999", "fa": "on"})
+    b = measure.signature({"ub": "512", "n-gpu-layers": "999",
+                           "flash-attn": "true"})
+    check(a == b, "подпись не зависит от алиаса и формы булева значения",
+          (a, b))
+    c = measure.signature({"n-cpu-moe": "29"})
+    d = measure.signature({"ncmoe": "29"})
+    check(c == d, "n-cpu-moe и ncmoe — одна подпись", (c, d))
+    check(measure.signature({"ubatch-size": "512"})
+          != measure.signature({"ubatch-size": "1024"}),
+          "разные значения — разные подписи")
+
+    # ловушки: дефолт mmproj-offload = enabled, поэтому отсутствие ключа
+    # означает VRAM, а не «не в VRAM»
+    def trap_keys(pairs):
+        rep = validate.Report()
+        validate.check_traps("pres", pairs, rep)
+        return [f.message for f in rep.findings]
+
+    check(any("mmproj" in m for m in trap_keys(
+        {"mmproj": "/x.gguf", "ubatch-size": "512"})),
+        "mmproj без явного offload ловится")
+    check(not trap_keys({"mmproj": "/x.gguf", "mmproj-offload": "0",
+                         "ubatch-size": "512"}),
+          "mmproj-offload = 0 не ловится")
+    check(any("ubatch" in m for m in trap_keys(
+        {"spec-type": "ngram-mod", "ubatch-size": "4096"})),
+        "ubatch 4096 с ускорителем ловится")
+    check(not trap_keys({"spec-type": "ngram-mod", "ubatch-size": "1024"}),
+          "ubatch 1024 с ускорителем не ловится")
+
+    # бюджет: K-типы llama.cpp посчитаны, а не сведены к f16
+    check(budget.kv_bytes_for("q4_K") < budget.kv_bytes_for("f16"),
+          "q4_K дешевле f16", budget.kv_bytes_for("q4_K"))
+    check(budget.kv_bytes_for("q5_K") < budget.kv_bytes_for("f16"),
+          "q5_K дешевле f16")
+    check(budget.kv_bytes_for("q8_0") < budget.kv_bytes_for("f16"),
+          "q8_0 дешевле f16")
+
+    # swap: битый адрес — внятная ошибка, а не голый int()
+    try:
+        SW.parse_listen("foo")
+        check(False, "битый адрес должен падать")
+    except ValueError as exc:
+        check("host:port" in str(exc), "битый адрес объясняет ожидаемый формат",
+              exc)
+
+    # порт: занятый порт виден без SO_REUSEADDR
+    import socket as _sock
+    probe = _sock.socket()
+    probe.bind(("127.0.0.1", 0))
+    probe.listen(1)
+    busy = probe.getsockname()[1]
+    try:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "tune_tools_port", ROOT / "tools" / "tune_models.py")
+        T = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(T)
+        check(T.port_is_busy(busy) is True, "занятый порт виден как занятый")
+        free = T.free_port()
+        check(T.port_is_busy(free) is False, "свободный порт виден как свободный")
+    finally:
+        probe.close()
 
 
 if __name__ == "__main__":
