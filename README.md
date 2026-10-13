@@ -132,14 +132,14 @@ bin/llamastery runtime stop
 
 Читай на том языке, который быстрее идёт — содержание одинаковое.
 
-| Тема | RU | EN | 中文 |
-|-------|---|---|---|
-| Установка и первое действие | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| Сборки, форки, схема флагов | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| Пресеты: формат, правка, оформление | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
-| Бюджет VRAM и замеры | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| Автотюнинг: методика и ловушки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap: экспорт и связка | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| Тема | RU | EN | 中文 | DE |
+|-------|---|---|---|---|
+| Установка и первое действие | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| Сборки, форки, схема флагов | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| Пресеты: формат, правка, оформление | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [comments](docs/de/comments.md) |
+| Бюджет VRAM и замеры | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| Автотюнинг: методика и ловушки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap: экспорт и связка | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 Новичкам: `getting-started` → `builds` → `presets` → `measure`. Остальное — по мере вопросов.
 
@@ -301,14 +301,14 @@ Three layers, bottom up:
 
 Read in whichever language is fastest — the content is the same.
 
-| Topic | RU | EN | 中文 |
-|-------|---|---|---|
-| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
-| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| Topic | RU | EN | 中文 | DE |
+|-------|---|---|---|---|
+| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [comments](docs/de/comments.md) |
+| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 Beginners: `getting-started` → `builds` → `presets` → `measure`.
 
@@ -424,14 +424,14 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 
 选读起来最快的那份即可，内容完全一致。
 
-| 主题 | RU | EN | 中文 |
-|-------|---|---|---|
-| 安装与上手 | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| 构建、分支、参数表 | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) |
-| 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| 自动调优：方法与陷ки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| 主题 | RU | EN | 中文 | DE |
+|-------|---|---|---|---|
+| 安装与上手 | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| 构建、分支、参数表 | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [注释](docs/de/comments.md) |
+| 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| 自动调优：方法与陷ки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 新手顺序：`getting-started` → `builds` → `presets` → `measure`。
 
@@ -553,14 +553,14 @@ See [Documentation](#documentation) for file details.
 
 Read in whichever language is fastest — the content is the same.
 
-| Topic | RU | EN | 中文 |
-|-------|---|---|---|
-| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
-| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| Topic | RU | EN | 中文 | DE |
+|-------|---|---|---|---|
+| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [comments](docs/de/comments.md) |
+| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 Beginners: `getting-started` → `builds` → `presets` → `measure`.
 
@@ -677,14 +677,14 @@ Three layers, bottom up:
 
 Read in whichever language is fastest — the content is the same.
 
-| Topic | RU | EN | 中文 |
-|-------|---|---|---|
-| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
-| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| Topic | RU | EN | 中文 | DE |
+|-------|---|---|---|---|
+| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [comments](docs/de/comments.md) |
+| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 Beginners: `getting-started` → `builds` → `presets` → `measure`.
 
@@ -800,14 +800,14 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 
 选读起来最快的那份即可，内容完全一致。
 
-| 主题 | RU | EN | 中文 |
-|-------|---|---|---|
-| 安装与上手 | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| 构建、分支、参数表 | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) |
-| 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| 自动调优：方法与陷阱 | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| 主题 | RU | EN | 中文 | DE |
+|-------|---|---|---|---|
+| 安装与上手 | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| 构建、分支、参数表 | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [注释](docs/de/comments.md) |
+| 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| 自动调优：方法与陷阱 | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 新手顺序：`getting-started` → `builds` → `presets` → `measure`。
 
@@ -960,14 +960,14 @@ bin/llamastery runtime stop
 Читай на том языке, который быстрее идёт — содержание одинаковое.
 Краткая памятка для агента — только на русском: [SKILL.md](SKILL.md).
 
-| Тема | RU | EN | 中文 |
-|---|---|---|---|
-| Установка и первое действие | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| Сборки, форки, схема флагов | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| Пресеты: формат, правка, оформление | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
-| Бюджет VRAM и замеры | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| Автотюнинг: методика и ловушки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap: экспорт и связка | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| Тема | RU | EN | 中文 | DE |
+|---|---|---|---|---|
+| Установка и первое действие | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| Сборки, форки, схема флагов | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| Пресеты: формат, правка, оформление | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [comments](docs/de/comments.md) |
+| Бюджет VRAM и замеры | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| Автотюнинг: методика и ловушки | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap: экспорт и связка | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 Новичкам: `getting-started` → `builds` → `presets` → `measure`. Остальное — по мере вопросов.
 
@@ -1132,14 +1132,14 @@ Three layers, bottom up:
 
 Read in whichever language is fastest — the content is the same.
 
-| Topic | RU | EN | 中文 |
-|---|---|---|---|
-| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) |
-| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| Topic | RU | EN | 中文 | DE |
+|---|---|---|---|---|
+| Install and first steps | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| Builds, forks, flag schema | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| Presets: format, editing, comments | [docs/ru/presets.md](docs/ru/presets.md) · [comments](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [comments](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [comments](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [comments](docs/de/comments.md) |
+| VRAM budget and measurements | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| Auto-tuning: method and traps | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap: export and backend | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 Beginners: `getting-started` → `builds` → `presets` → `measure`.
 
@@ -1255,14 +1255,14 @@ bin/llamastery probe --tokens 110000 --from-file server.cpp
 
 选读起来最快的那份即可，内容完全一致。
 
-| 主题 | RU | EN | 中文 |
-|---|---|---|---|
-| 安装与上手 | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) |
-| 构建、分支、参数表 | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) |
-| preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) |
-| 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) |
-| 自动调优：方法与陷阱 | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) |
-| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) |
+| 主题 | RU | EN | 中文 | DE |
+|---|---|---|---|---|
+| 安装与上手 | [docs/ru/getting-started.md](docs/ru/getting-started.md) | [docs/en/getting-started.md](docs/en/getting-started.md) | [docs/zh/getting-started.md](docs/zh/getting-started.md) | [docs/de/getting-started.md](docs/de/getting-started.md) |
+| 构建、分支、参数表 | [docs/ru/builds.md](docs/ru/builds.md) | [docs/en/builds.md](docs/en/builds.md) | [docs/zh/builds.md](docs/zh/builds.md) | [docs/de/builds.md](docs/de/builds.md) |
+| preset：格式、编辑、注释规范 | [docs/ru/presets.md](docs/ru/presets.md) · [注释](docs/ru/comments.md) | [docs/en/presets.md](docs/en/presets.md) · [注释](docs/en/comments.md) | [docs/zh/presets.md](docs/zh/presets.md) · [注释](docs/zh/comments.md) | [docs/de/presets.md](docs/de/presets.md) · [注释](docs/de/comments.md) |
+| 显存预算与实测 | [docs/ru/measure.md](docs/ru/measure.md) | [docs/en/measure.md](docs/en/measure.md) | [docs/zh/measure.md](docs/zh/measure.md) | [docs/de/measure.md](docs/de/measure.md) |
+| 自动调优：方法与陷阱 | [docs/ru/tuning.md](docs/ru/tuning.md) | [docs/en/tuning.md](docs/en/tuning.md) | [docs/zh/tuning.md](docs/zh/tuning.md) | [docs/de/tuning.md](docs/de/tuning.md) |
+| llama-swap：导出与后端 | [docs/ru/swap.md](docs/ru/swap.md) | [docs/en/swap.md](docs/en/swap.md) | [docs/zh/swap.md](docs/zh/swap.md) | [docs/de/swap.md](docs/de/swap.md) |
 
 新手顺序：`getting-started` → `builds` → `presets` → `measure`。
 
