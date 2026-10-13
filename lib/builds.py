@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import paths
+from .i18n import t
 
 # Форматы строк версий у сборок разные:
 #   ik:      "version: 104 (32cddbf)"
@@ -238,7 +239,7 @@ def _load() -> dict:
                            encoding="utf-8")
         except OSError:
             bak = None
-        print(f"реестр сборок повреждён ({exc}); копия: {bak or 'не создана'}",
+        print(t('реестр сборок повреждён ({0}); копия: {1}', exc, bak or 'не создана'),
               file=sys.stderr)
         return {"version": 1, "builds": {}}
 

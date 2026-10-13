@@ -14,6 +14,8 @@ import select
 import shutil
 import sys
 
+from .i18n import t
+
 try:
     import termios
     import tty
@@ -226,14 +228,13 @@ def confirm_select(title: str, sub: str, crumbs: list[tuple[str, str]],
         if sub:
             out.write(f"  {sub}\n")
         if recommended_yes:
-            out.write("  ★ рекомендовано: да (но выбираешь ты)\n")
+            out.write(t('  ★ рекомендовано: да (но выбираешь ты)\n'))
         cells = []
         for i, word in enumerate(("нет", "да")):
             cells.append(f"{REV_ON} {word} {REV_OFF}" if i == cur
                          else f"  {word} ")
         out.write(f"\n  {' '.join(cells)}\n")
-        out.write("\n  ←/→ выбор, Enter — подтвердить "
-                  "(подсвеченное), y/д/n/н — быстро, 0/Esc — назад\n")
+        out.write(t('\n  ←/→ выбор, Enter — подтвердить (подсвеченное), y/д/n/н — быстро, 0/Esc — назад\n'))
         out.flush()
         try:
             key = key_reader()

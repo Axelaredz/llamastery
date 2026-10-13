@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 
 from . import server
+from .i18n import t
 
 LOREM = (
     "The quick brown fox jumps over the lazy dog. "
@@ -339,7 +340,7 @@ def probe_repeat(target_tokens: int = 8192, max_tokens: int = 64,
     ok = [r for r in runs if r.get("ok") and r.get("gen_tps")]
     for r in runs:
         if r.get("ok") and r.get("note"):
-            print(f"  проба с tg пропущена: {r['note']}")
+            print(t('  проба с tg пропущена: {0}', r['note']))
     cold = [r for r in ok if not r.get("cached")]
     out = {"runs": runs, "ok_count": len(ok)}
     if ok:
@@ -353,8 +354,7 @@ def probe_repeat(target_tokens: int = 8192, max_tokens: int = 64,
         out["prefill_runs"] = len(pre)
         out["cached_runs"] = len(ok) - len(cold)
         if out["cached_runs"]:
-            print(f"  из {len(ok)} проб в прогноз prefill попало {len(pre)}: "
-                  f"{out['cached_runs']} пришли из прогретого KV и не учитываются")
+            print(t('  из {0} проб в прогноз prefill попало {1}: {2} пришли из прогретого KV и не учитываются', len(ok), len(pre), out['cached_runs']))
         if not cold:
             out["prefill_tps"] = None
             out["note"] = ("все пробы пришли из прогретого KV — честного "

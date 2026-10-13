@@ -13,6 +13,7 @@
 from dataclasses import dataclass, field
 
 from . import budget, gguf, schema
+from .i18n import t
 
 # Аргументы, которыми роутер управляет сам. Источник истины —
 # tools/server/server-models.cpp, функция unset_reserved_args().
@@ -74,47 +75,46 @@ def validate_section(name: str, pairs: dict[str, str], flags: dict,
         k = key.lower()
         if k in HARD_CONTROL:
             rep.add("error", name, key,
-                    "роутер вырезает этот аргумент из пресета",
-                    "убери из пресета; значение задаётся только CLI роутера")
+                    t('роутер вырезает этот аргумент из пресета'),
+                    t('убери из пресета; значение задаётся только CLI роутера'))
             continue
         if k in ROUTER_FORCED:
             rep.add("warn", name, key,
-                    "роутер всё равно подставит своё значение",
-                    "в пресете смысла нет; лишнее только путает при чтении")
+                    t('роутер всё равно подставит своё значение'),
+                    t('в пресете смысла нет; лишнее только путает при чтении'))
             continue
         f = schema.resolve(flags, k)
         if f is None:
-            rep.add("warn", name, key, "такого флага нет в этой сборке",
-                    "проверь `llama-server --help`; в форках флаги добавляют "
-                    "и переименовывают")
+            rep.add("warn", name, key, t('такого флага нет в этой сборке'),
+                    t('проверь `llama-server --help`; в форках флаги добавляют и переименовывают'))
             continue
         if f.canonical.lstrip("-") in HARD_CONTROL:
             rep.add("error", name, key,
-                    "роутер вырезает этот аргумент из пресета",
-                    "убери из пресета; значение задаётся только CLI роутера")
+                    t('роутер вырезает этот аргумент из пресета'),
+                    t('убери из пресета; значение задаётся только CLI роутера'))
             continue
         if f.canonical.lstrip("-") in ROUTER_FORCED:
             rep.add("warn", name, key,
-                    "роутер всё равно подставит своё значение",
-                    "в пресете смысла нет; лишнее только путает при чтении")
+                    t('роутер всё равно подставит своё значение'),
+                    t('в пресете смысла нет; лишнее только путает при чтении'))
             continue
         # значение против enum
         if f.enum and str(val).strip():
             v = str(val).strip().lower()
             if v not in [e.lower() for e in f.enum] and v not in TRUE | FALSE \
                     and v not in ("all", "auto"):
-                rep.add("warn", name, key, f"значение {val!r} не из списка {f.enum}")
+                rep.add("warn", name, key, t('значение {0!r} не из списка {1}', val, f.enum))
         if f.kind in ("int", "float") and str(val).strip():
             try:
                 float(str(val).strip())
             except ValueError:
-                rep.add("error", name, key, f"ожидалось число, а стоит {val!r}")
+                rep.add("error", name, key, t('ожидалось число, а стоит {0!r}', val))
 
     # ── пути ──
     model = low.get("model") or low.get("m") or ""
     if not model:
-        rep.add("error", name, "model", "не указан путь к модели",
-                "пресет без model не запустится; для HF укажи hf-repo")
+        rep.add("error", name, "model", t('не указан путь к модели'),
+                t('пресет без model не запустится; для HF укажи hf-repo'))
     elif check_paths and not model.startswith(("http://", "https://")):
         if model_cache is not None and model in model_cache:
             ok, meta = model_cache[model]
@@ -127,8 +127,8 @@ def validate_section(name: str, pairs: dict[str, str], flags: dict,
                     meta = None
                 ok = meta is not None
             else:
-                rep.add("error", name, "model", "файла нет или это не GGUF",
-                        f"проверь путь: {model}")
+                rep.add("error", name, "model", t('файла нет или это не GGUF'),
+                        t('проверь путь: {0}', model))
                 ok, meta = False, None
             if model_cache is not None:
                 model_cache[model] = (ok, meta)
@@ -137,7 +137,7 @@ def validate_section(name: str, pairs: dict[str, str], flags: dict,
         p = low.get(key)
         if p and check_paths and not p.startswith(("http://", "https://")):
             if not gguf.is_gguf(p):
-                rep.add("error", name, key, "файла нет или это не GGUF", f"путь: {p}")
+                rep.add("error", name, key, t('файла нет или это не GGUF'), t('путь: {0}', p))
 
     if meta is None:
         return None
@@ -145,24 +145,24 @@ def validate_section(name: str, pairs: dict[str, str], flags: dict,
     # ── семантика против метаданных ──
     ctx = budget._flag_int(pairs, "c", "ctx-size")
     if ctx is not None and ctx < 0:
-        rep.add("error", name, "c", f"контекст отрицательный: {ctx}",
-                "опечатка в знаке; llama-server такое значение не примет")
+        rep.add("error", name, "c", t('контекст отрицательный: {0}', ctx),
+                t('опечатка в знаке; llama-server такое значение не примет'))
     elif ctx and meta.n_ctx_trained and ctx > meta.n_ctx_trained:
         rep.add("error", name, "c",
-                f"контекст {ctx} больше обученного {meta.n_ctx_trained}",
-                "модель не выучена на таком окне; качество деградирует")
+                t('контекст {0} больше обученного {1}', ctx, meta.n_ctx_trained),
+                t('модель не выучена на таком окне; качество деградирует'))
     ncpu = budget._flag_int(pairs, "n-cpu-moe", "ncmoe")
     if ncpu is not None and ncpu < 0:
-        rep.add("error", name, "n-cpu-moe", f"выгрузка отрицательная: {ncpu}",
-                "опечатка в знаке; столько слоёв выгрузить нельзя")
+        rep.add("error", name, "n-cpu-moe", t('выгрузка отрицательная: {0}', ncpu),
+                t('опечатка в знаке; столько слоёв выгрузить нельзя'))
     elif ncpu and meta.n_layer and ncpu > meta.n_layer:
         rep.add("error", name, "n-cpu-moe",
-                f"{ncpu} больше числа слоёв ({meta.n_layer})")
+                t('{0} больше числа слоёв ({1})', ncpu, meta.n_layer))
     ngl = budget._flag_int(pairs, "n-gpu-layers", "ngl", "gpu-layers")
     if ngl is not None and meta.n_layer and 0 <= ngl < meta.n_layer:
         rep.add("info", name, "n-gpu-layers",
-                f"{ngl} из {meta.n_layer} слоёв в VRAM — часть модели в RAM",
-                "медленнее генерация; осознанное решение для больших моделей")
+                t('{0} из {1} слоёв в VRAM — часть модели в RAM', ngl, meta.n_layer),
+                t('медленнее генерация; осознанное решение для больших моделей'))
     return meta
 
 
@@ -261,7 +261,7 @@ def check_traps(name: str, pairs: dict[str, str], rep: Report,
         # замер глушит только эвристики: предсказание падения он не отменяет
         if proven and trap.get("kind") == "heuristic":
             rep.add("info", name, "профиль",
-                    f"{trap['message']} — но есть замер, прошедший проверку",
+                    t('{0} — но есть замер, прошедший проверку', trap['message']),
                     f"min free {measured.get('min_free_mib')} MiB")
             continue
         rep.add(trap["level"], name, "профиль", trap["message"], trap["hint"])
@@ -282,10 +282,8 @@ def check_crash_history(name: str, rep: Report) -> None:
     when = e.get("last", "?")
     howmany = e.get("count", 1)
     rep.add("warn", name, "падение",
-            f"этот пресет ронял сервер ({e.get('why')}), "
-            f"{howmany} раз, последний — {when}",
-            f"проверенные условия: глубина {e.get('depth', '?')} токенов. "
-            f"исправь или убери; после успешного замера запись снимется сама")
+            t('этот пресет ронял сервер ({0}), {1} раз, последний — {2}', e.get('why'), howmany, when),
+            t('проверенные условия: глубина {0} токенов. исправь или убери; после успешного замера запись снимется сама', e.get('depth', '?')))
 
 
 # ── reasoning / DRY / сэмплинг: проверка актуальных флагов ──
@@ -341,32 +339,24 @@ def check_reasoning_quality(name: str, pairs: dict[str, str], flags: dict,
     # ── несуществующие / неподдержанные флаги ──
     if "reasoning-budget-conclusion" in low:
         rep.add("warn", name, "reasoning-budget-conclusion",
-                "такого флага нет ни в одной из проверенных сборок "
-                "(faks/upstream/ik/xing4)",
-                "вероятно, выдуман или из чужой документации; убери — "
-                "иначе ключ молча игнорируется. Проверь "
-                "`llamastery schema --build <сборка> --grep reasoning`")
+                t('такого флага нет ни в одной из проверенных сборок (faks/upstream/ik/xing4)'),
+                t('вероятно, выдуман или из чужой документации; убери — иначе ключ молча игнорируется. Проверь `llamastery schema --build <сборка> --grep reasoning`'))
     if "reasoning-effort" in low and not supported("reasoning-effort"):
         rep.add("warn", name, "reasoning-effort",
-                "эта сборка не знает --reasoning-effort "
-                "(есть в upstream/xing4, нет в faks/ik)",
-                "ключ будет проигнорирован; либо убери, либо переезжай "
-                "на сборку с поддержкой, либо держи уровень через чат-шаблон")
+                t('эта сборка не знает --reasoning-effort (есть в upstream/xing4, нет в faks/ik)'),
+                t('ключ будет проигнорирован; либо убери, либо переезжай на сборку с поддержкой, либо держи уровень через чат-шаблон'))
 
     # ── значения enum ──
     fmt = raw("reasoning-format").strip().lower()
     if fmt and fmt not in REASONING_FORMAT_VALUES:
         rep.add("warn", name, "reasoning-format",
-                f"значение {raw('reasoning-format')!r} не из списка "
-                f"{list(REASONING_FORMAT_VALUES)}",
-                "для отделения мыслей от ответа нужен deepseek "
-                "(мысли — в message.reasoning_content)")
+                t('значение {0!r} не из списка {1}', raw('reasoning-format'), list(REASONING_FORMAT_VALUES)),
+                t('для отделения мыслей от ответа нужен deepseek (мысли — в message.reasoning_content)'))
     eff = raw("reasoning-effort").strip().lower()
     if eff and eff not in REASONING_EFFORT_VALUES:
         rep.add("warn", name, "reasoning-effort",
-                f"значение {raw('reasoning-effort')!r} не из списка "
-                f"{list(REASONING_EFFORT_VALUES)}",
-                "проверь `llama-server --help | grep reasoning-effort`")
+                t('значение {0!r} не из списка {1}', raw('reasoning-effort'), list(REASONING_EFFORT_VALUES)),
+                t('проверь `llama-server --help | grep reasoning-effort`'))
 
     # ── бюджет + сообщение ──
     b_raw = raw("reasoning-budget").strip()
@@ -374,17 +364,15 @@ def check_reasoning_quality(name: str, pairs: dict[str, str], flags: dict,
     has_msg = bool(raw("reasoning-budget-message").strip())
     if b_raw and b_num is not None and b_num > 0 and not has_msg:
         rep.add("warn", name, "reasoning-budget",
-                f"бюджет {b_raw} без reasoning-budget-message — мысли "
-                "обрубаются резко, без красивого завершения",
-                'добавь reasoning-budget-message = "Wrap up and give '
-                'the final answer."')
+                t('бюджет {0} без reasoning-budget-message — мысли обрубаются резко, без красивого завершения', b_raw),
+                t('добавь reasoning-budget-message = "Wrap up and give the final answer."'))
     if has_msg and (not b_raw or (b_num is not None and b_num < 0)):
         rep.add("warn", name, "reasoning-budget-message",
-                "сообщение о завершении инертно без reasoning-budget > 0",
-                "либо задай бюджет (например 2048), либо убери сообщение")
+                t('сообщение о завершении инертно без reasoning-budget > 0'),
+                t('либо задай бюджет (например 2048), либо убери сообщение'))
     if b_raw and b_num is None:
         rep.add("error", name, "reasoning-budget",
-                f"ожидалось число, а стоит {b_raw!r}")
+                t('ожидалось число, а стоит {0!r}', b_raw))
 
     # ── DRY ──
     m_raw = raw("dry-multiplier").strip()
@@ -397,15 +385,12 @@ def check_reasoning_quality(name: str, pairs: dict[str, str], flags: dict,
         w_num = _fnum(w_raw) if w_raw else None
         if w_num == 0:
             rep.add("warn", name, "dry-penalty-last-n",
-                    "окно штрафа 0 при включённом DRY — сэмплер не видит "
-                    "повторы и не работает",
-                    "поставь окно под контекст (например 4096) или убери ключ")
+                    t('окно штрафа 0 при включённом DRY — сэмплер не видит повторы и не работает'),
+                    t('поставь окно под контекст (например 4096) или убери ключ'))
     elif dry_extra:
         rep.add("info", name, "dry",
-                "DRY-ключи заданы, но dry-multiplier выключен (0/нет) — "
-                "они инертны",
-                "для борьбы с зацикливанием: dry-multiplier = 0.5, "
-                "dry-allowed-length = 6, dry-penalty-last-n = 4096")
+                t('DRY-ключи заданы, но dry-multiplier выключен (0/нет) — они инертны'),
+                t('для борьбы с зацикливанием: dry-multiplier = 0.5, dry-allowed-length = 6, dry-penalty-last-n = 4096'))
 
     # ── reasoning-модель без антизацикливающей связки ──
     model_id = " ".join([
@@ -419,9 +404,5 @@ def check_reasoning_quality(name: str, pairs: dict[str, str], flags: dict,
                              "reasoning-effort", "reasoning-budget-message"))
     if (looks_reasoning or has_any_reasoning) and not has_any_reasoning:
         rep.add("info", name, "reasoning",
-                "похоже на reasoning-модель, но reasoning-флагов нет — "
-                "на низких квантах (IQ4/IQ3/Q3) возможны зацикливания в мыслях",
-                "проверь поддержку (`schema --grep reasoning`) и добавь связку: "
-                "reasoning-format = deepseek, reasoning-budget = 2048 + "
-                "reasoning-budget-message, DRY 0.5/6/4096, "
-                "temp 0.6 / top-p 0.95 / top-k 20")
+                t('похоже на reasoning-модель, но reasoning-флагов нет — на низких квантах (IQ4/IQ3/Q3) возможны зацикливания в мыслях'),
+                t('проверь поддержку (`schema --grep reasoning`) и добавь связку: reasoning-format = deepseek, reasoning-budget = 2048 + reasoning-budget-message, DRY 0.5/6/4096, temp 0.6 / top-p 0.95 / top-k 20'))

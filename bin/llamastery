@@ -19,8 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib import (axes, budget, builds, crashes, gguf, measure, paths,  # noqa: E402
+from lib import (axes, budget, builds, crashes, gguf, i18n, measure, paths,  # noqa: E402
                  presets, runtime, schema, server, swap, validate, wizard)
+from lib.i18n import t  # noqa: E402
 from lib.inifile import IniFile  # noqa: E402
 
 MIB = 2 ** 20
@@ -47,7 +48,7 @@ def cmd_builds_stale(args) -> int:
     if args.name:
         names = [args.name]
     if not names:
-        print("реестр пуст. Заполнить: llamastery builds detect --apply")
+        print(t('реестр пуст. Заполнить: llamastery builds detect --apply'))
         return 1
     stale, code = [], 0
     for n in names:
@@ -75,21 +76,21 @@ def cmd_builds_stale(args) -> int:
             for c in r.get("new_commits", [])[:6]:
                 print(f"         + {c}")
             if len(r.get("new_commits", [])) > 6:
-                print(f"         + …ещё {behind - 6}")
+                print(t('         + …ещё {0}', behind - 6))
             if r.get("flags_may_change"):
                 files = ", ".join(Path(f).name for f in r.get("flag_files", []))
-                print(f"         ! менялись файлы с флагами: {files}")
+                print(t('         ! менялись файлы с флагами: {0}', files))
                 for ln in r.get("flag_diffstat", []):
                     print(f"           {ln.strip()}")
-                print(f"         после обновления схема флагов пересоберётся сама;")
-                print(f"         проверь её: llamastery schema {n} --refresh")
+                print(t('         после обновления схема флагов пересоберётся сама;'))
+                print(t('         проверь её: llamastery schema {0} --refresh', n))
     if not stale:
-        print("\nвсе сборки актуальны")
+        print(t('\nвсе сборки актуальны'))
         return 0
-    print(f"\nтребуют внимания: {', '.join(n for n, _ in stale)}")
-    print("обновление и пересборка — решение человека:")
-    print("  git -C <путь> pull && cmake --build build -j$(nproc)")
-    print("затем: llamastery schema <сборка> --refresh")
+    print(t('\nтребуют внимания: {0}', ', '.join((n for n, _ in stale))))
+    print(t('обновление и пересборка — решение человека:'))
+    print(t('  git -C <путь> pull && cmake --build build -j$(nproc)'))
+    print(t('затем: llamastery schema <сборка> --refresh'))
     return 3
 
 
@@ -99,19 +100,18 @@ def cmd_builds(args) -> int:
     if args.action == "list":
         reg = builds.all_builds()
         if not reg:
-            print("реестр пуст. Заполнить: llamastery builds detect --apply")
+            print(t('реестр пуст. Заполнить: llamastery builds detect --apply'))
             return 0
         for name, b in reg.items():
             st = b.status()
             mark = "ok " if st["bin_exists"] else "—  "
             print(f"[{mark}] {name:<10} {st['server_bin']}")
             if st.get("version"):
-                print(f"         версия: {st['version']}")
+                print(t('         версия: {0}', st['version']))
             if st.get("git", {}).get("branch"):
                 dirty = " (грязное дерево)" if st["git"].get("dirty") else ""
                 print(f"         git: {st['git']['branch']} {st['git'].get('commit','')}{dirty}")
-            print(f"         router: {'да' if st['router'] else 'нет (single)'}"
-                  f" | менеджер: {st['manager'] or '—'}")
+            print(t('         router: {0} | менеджер: {1}', 'да' if st['router'] else 'нет (single)', st['manager'] or '—'))
             if st["note"]:
                 print(f"         {st['note']}")
         return 0
@@ -119,19 +119,18 @@ def cmd_builds(args) -> int:
     if args.action == "detect":
         found = builds.detect()
         if not found:
-            print("типичных форков не найдено")
+            print(t('типичных форков не найдено'))
             return 1
         for b in found:
             st = b.status()
             print(f"{b.name:<10} {b.path}")
-            print(f"           бинарь: {'есть' if st['bin_exists'] else 'НЕТ сборки'}"
-                  f"  remote: {b.remote}")
+            print(t('           бинарь: {0}  remote: {1}', 'есть' if st['bin_exists'] else 'НЕТ сборки', b.remote))
         if args.apply:
             for b in found:
                 builds.upsert(b)
-            print(f"\nзаписано в {paths.builds_file()}")
+            print(t('\nзаписано в {0}', paths.builds_file()))
         else:
-            print("\n(только просмотр; добавь --apply чтобы записать в реестр)")
+            print(t('\n(только просмотр; добавь --apply чтобы записать в реестр)'))
         return 0
 
     if args.action == "add":
@@ -139,11 +138,11 @@ def cmd_builds(args) -> int:
                          router=not args.no_router, manager=args.manager or "",
                          note=args.note or "", port=args.port)
         builds.upsert(b)
-        print(f"добавлен: {b.name} -> {b.server_bin}")
+        print(t('добавлен: {0} -> {1}', b.name, b.server_bin))
         if b.port:
-            print(f"  порт: {b.port}")
+            print(t('  порт: {0}', b.port))
         if not b.server_bin.exists():
-            print("  ВНИМАНИЕ: бинарь не собран (build/bin/llama-server отсутствует)")
+            print(t('  ВНИМАНИЕ: бинарь не собран (build/bin/llama-server отсутствует)'))
         return 0
 
     if args.action == "rm":
@@ -153,7 +152,7 @@ def cmd_builds(args) -> int:
     if args.action == "show":
         b = builds.get(args.name)
         if not b:
-            print(f"нет сборки {args.name!r}", file=sys.stderr)
+            print(t('нет сборки {0!r}', args.name), file=sys.stderr)
             return 1
         out(b.status())
         return 0
@@ -165,7 +164,7 @@ def cmd_schema(args) -> int:
     binary, src = builds.resolve_binary(args.build)
     flags, meta = schema.load(binary, refresh=args.refresh)
     if meta.get("error"):
-        print(f"ошибка схемы: {meta['error']}", file=sys.stderr)
+        print(t('ошибка схемы: {0}', meta['error']), file=sys.stderr)
         return 1
     if args.json:
         uniq = {f.canonical: f for f in {id(v): v for v in flags.values()}.values()}
@@ -186,8 +185,8 @@ def cmd_schema(args) -> int:
                     print(f"    {f.description[:110]}")
         return 0
     uniq = {id(v): v for v in flags.values()}
-    print(f"источник: {meta.get('binary')} ({src})")
-    print(f"флагов:   {len(uniq)}   mtime: {meta.get('mtime')}")
+    print(t('источник: {0} ({1})', meta.get('binary'), src))
+    print(t('флагов:   {0}   mtime: {1}', len(uniq), meta.get('mtime')))
     return 0
 
 
@@ -208,8 +207,8 @@ def cmd_presets(args) -> int:
             ctx = p.get("c") or p.get("ctx-size") or "?"
             mark = g and name == "*"
             print(f"{name}")
-            print(f"    модель: {Path(model).name if model != '—' else model}")
-            print(f"    ctx: {ctx}  ключей: {len(p)}")
+            print(t('    модель: {0}', Path(model).name if model != '—' else model))
+            print(t('    ctx: {0}  ключей: {1}', ctx, len(p)))
         return 0
 
     if args.action == "show":
@@ -217,7 +216,7 @@ def cmd_presets(args) -> int:
         for name in args.names:
             sec = ini.section(name)
             if not sec:
-                print(f"нет секции {name!r}", file=sys.stderr)
+                print(t('нет секции {0!r}', name), file=sys.stderr)
                 continue
             print(f"[{name}]")
             for k, v in sec.pairs().items():
@@ -228,7 +227,7 @@ def cmd_presets(args) -> int:
         ini = _load_ini(args.ini)
         g = ini.globals()
         if not g:
-            print("глобальной секции [*] нет")
+            print(t('глобальной секции [*] нет'))
             return 0
         for k, v in g.items():
             print(f"{k} = {v}")
@@ -249,17 +248,16 @@ def cmd_presets(args) -> int:
                                      lineterm="", n=1)
             print("\n".join(d))
         else:
-            print(f"переписано блоков: {len(rep['changed'])}")
-        print(f"\nизменено секций: {len(rep['changed'])} из "
-              f"{len(rep['metrics'])}")
+            print(t('переписано блоков: {0}', len(rep['changed'])))
+        print(t('\nизменено секций: {0} из {1}', len(rep['changed']), len(rep['metrics'])))
         if rep["unparsed"]:
-            print("\nНЕ РАСПОЗНАНО (перенесено в Нюанс как есть):")
+            print(t('\nНЕ РАСПОЗНАНО (перенесено в Нюанс как есть):'))
             for name, lines in rep["unparsed"].items():
                 print(f"  [{name}]")
                 for l in lines:
                     print(f"      {l[:100]}")
         if args.dry_run or not args.apply:
-            print("\n(dry-run: файл не тронут; --apply чтобы записать)")
+            print(t('\n(dry-run: файл не тронут; --apply чтобы записать)'))
         return 0
 
     if args.action == "export":
@@ -269,7 +267,7 @@ def cmd_presets(args) -> int:
             sys.stdout.write(text)
         else:
             Path(args.output).expanduser().write_text(text, encoding="utf-8")
-            print(f"записано: {args.output} ({len(text)} байт)")
+            print(t('записано: {0} ({1} байт)', args.output, len(text)))
         return 0
 
     if args.action == "import":
@@ -289,7 +287,7 @@ def cmd_presets(args) -> int:
         else:
             # импорт в новый файл — это нормальный сценарий, а не ошибка
             tgt = IniFile(str(target_path), "")
-            print(f"цель не существует, будет создана: {target_path}")
+            print(t('цель не существует, будет создана: {0}', target_path))
 
         # --conflicts — явное разрешение перезаписать конфликтующие ключи
         on_conflict = "overwrite" if args.conflicts else args.on_conflict
@@ -297,29 +295,27 @@ def cmd_presets(args) -> int:
                                  rename=dict(p.split("=", 1) for p in (args.rename or [])
                                              if "=" in p),
                                  on_conflict=on_conflict)
-        print(f"источник: {origin}")
-        print(f"цель:     {target_path}")
-        print(f"добавлено: {len(res.added)}  обновлено: {len(res.updated)}  "
-              f"пропущено: {len(res.skipped)}")
+        print(t('источник: {0}', origin))
+        print(t('цель:     {0}', target_path))
+        print(t('добавлено: {0}  обновлено: {1}  пропущено: {2}', len(res.added), len(res.updated), len(res.skipped)))
         for s in res.added:
             print(f"  + {s}")
         for s in res.updated:
             print(f"  ~ {s}")
         if res.conflicts:
-            print("\nконфликты (было -> стало):")
+            print(t('\nконфликты (было -> стало):'))
             for sec, key, ch in res.conflicts[:30]:
                 print(f"  [{sec}] {key}: {ch}")
             if len(res.conflicts) > 30:
-                print(f"  ... ещё {len(res.conflicts) - 30}")
+                print(t('  ... ещё {0}', len(res.conflicts) - 30))
         if not res.changed:
-            print("\nизменений нет")
+            print(t('\nизменений нет'))
             return 0
         if args.dry_run:
-            print("\n(dry-run: файл не тронут)")
+            print(t('\n(dry-run: файл не тронут)'))
             return 0
         if res.conflicts and on_conflict == "skip":
-            print("\nесть конфликты — перезапись не разрешена: "
-                  "добавь --conflicts или --on-conflict overwrite")
+            print(t('\nесть конфликты — перезапись не разрешена: добавь --conflicts или --on-conflict overwrite'))
             return 3
         bk = (presets.backup(target_path) if target_path.exists()
               else None)
@@ -358,14 +354,14 @@ def cmd_load(args) -> int:
     ini = _load_ini(args.ini)
     name, cands = runtime.pick_preset_name(args.preset, ini)
     if not name:
-        print(f"пресет {args.preset!r} не найден", file=sys.stderr)
+        print(t('пресет {0!r} не найден', args.preset), file=sys.stderr)
         for c in cands:
-            print(f"  похоже: {c}", file=sys.stderr)
+            print(t('  похоже: {0}', c), file=sys.stderr)
         if not cands:
-            print("  подсказка: llamastery presets list", file=sys.stderr)
+            print(t('  подсказка: llamastery presets list'), file=sys.stderr)
         return 2
     if len(cands) > 1:
-        print(f"подходит {len(cands)} секций, укажи точное имя:", file=sys.stderr)
+        print(t('подходит {0} секций, укажи точное имя:', len(cands)), file=sys.stderr)
         for c in cands:
             print(f"  {c}", file=sys.stderr)
         return 2
@@ -375,19 +371,17 @@ def cmd_load(args) -> int:
     b = builds.get(build_name) if build_name else None
     pairs = ini.section(name).pairs()
     ok, report = runtime.preflight(name, pairs, build_name)
-    print(f"пресет: {name}")
-    print(f"сборка: {build_name or '?'}   бинарь: {binary}")
+    print(t('пресет: {0}', name))
+    print(t('сборка: {0}   бинарь: {1}', build_name or '?', binary))
     if report:
         print(report)
     if not ok and not args.force:
-        print("\nотказ: пресет не проходит проверку. Исправить или --force.")
+        print(t('\nотказ: пресет не проходит проверку. Исправить или --force.'))
         return 1
 
     # ---- сборка без роутера: единственный способ — старт с трансляцией пресета
     if b is not None and not b.router:
-        print(f"внимание: {build_name} без роутера (--models-preset не "
-              f"работает), пресет транслируется в argv и сервер "
-              f"перезапускается")
+        print(t('внимание: {0} без роутера (--models-preset не работает), пресет транслируется в argv и сервер перезапускается', build_name))
         if args.dry_run:
             from lib import schema as _sch
             flags, meta = _sch.load(b.server_bin)
@@ -408,8 +402,7 @@ def cmd_load(args) -> int:
     _adopt_running_build()
     if not server.healthy():
         if args.dry_run:
-            print("\n(dry-run) сервер не запущен; выполнится: "
-                  f"llamastery runtime start --build {build_name or '?'}")
+            print(t('\n(dry-run) сервер не запущен; выполнится: llamastery runtime start --build {0}', build_name or '?'))
             return 0
         if build_name:
             res = server.start(build_name, ini=str(ini.path))
@@ -417,13 +410,12 @@ def cmd_load(args) -> int:
             if not res.ok:
                 return 1
         else:
-            print("сервер не запущен и сборка не указана: "
-                  "llamastery runtime start", file=sys.stderr)
+            print(t('сервер не запущен и сборка не указана: llamastery runtime start'), file=sys.stderr)
             return 1
 
     listed = server.models(reload=True)
     if not listed:
-        print(f"в пресете нет моделей ({ini.path})", file=sys.stderr)
+        print(t('в пресете нет моделей ({0})', ini.path), file=sys.stderr)
         return 1
     idx = None
     for i, m in enumerate(listed):
@@ -436,51 +428,50 @@ def cmd_load(args) -> int:
                 idx = i
                 break
     if idx is None:
-        print(f"секции {name!r} нет среди моделей роутера", file=sys.stderr)
+        print(t('секции {0!r} нет среди моделей роутера', name), file=sys.stderr)
         for i, m in enumerate(listed, 1):
             print(f"  {i}. {m['id']} [{m['status']}]", file=sys.stderr)
         return 2
 
     m = listed[idx]
     if m["status"] == "loaded":
-        print(f"уже загружена: {m['id']}")
+        print(t('уже загружена: {0}', m['id']))
         return 0
     if args.dry_run:
-        print(f"\n(dry-run) загрузится: {m['id']}")
+        print(t('\n(dry-run) загрузится: {0}', m['id']))
         return 0
 
     if m["status"] == "loading":
-        print(f"уже грузится: {m['id']}, жду")
+        print(t('уже грузится: {0}, жду', m['id']))
     else:
         # VRAM на карте одна: выгружаем всё остальное
         for o in listed:
             if o["id"] == m["id"]:
                 continue
             if o["status"] in ("loaded", "sleeping", "loading"):
-                print(f"выгружаю {o['id']} (место в VRAM нужно)")
+                print(t('выгружаю {0} (место в VRAM нужно)', o['id']))
                 server.api_unload(o["id"])
                 server.wait_status(o["id"], ("unloaded", "sleeping"), timeout=300)
         resp = server.api_load(m["id"])
         if isinstance(resp, dict) and resp.get("success") is not True:
-            print(f"запрос на загрузку не подтверждён: {resp}", file=sys.stderr)
+            print(t('запрос на загрузку не подтверждён: {0}', resp), file=sys.stderr)
             return 1
 
-    print(f"жду загрузки {m['id']}...")
+    print(t('жду загрузки {0}...', m['id']))
     st = server.wait_status(m["id"], ("loaded", "sleeping"),
                             timeout=args.timeout)
     if st in ("loaded", "sleeping"):
-        print(f"готово: {m['id']} — {server.STATUS_LABEL.get(st, st)}")
+        print(t('готово: {0} — {1}', m['id'], server.STATUS_LABEL.get(st, st)))
         return 0
     if st == "failed":
-        print(f"не загрузилась (OOM или ошибка). Проверь n-gpu-layers / "
-              f"n-cpu-moe в {ini.path}", file=sys.stderr)
+        print(t('не загрузилась (OOM или ошибка). Проверь n-gpu-layers / n-cpu-moe в {0}', ini.path), file=sys.stderr)
         crashes.note(name, build_name or "?",
                      crashes.tail_log(server.log_file()),
                      depth=budget._flag_int(pairs, "c"),
                      log=str(server.log_file()))
         _say_crash(name)
         return 1
-    print(f"таймаут загрузки, статус {st}. Лог: {server.log_file()}",
+    print(t('таймаут загрузки, статус {0}. Лог: {1}', st, server.log_file()),
           file=sys.stderr)
     return 1
 
@@ -490,10 +481,10 @@ def _say_crash(name: str) -> None:
     e = crashes.known(name)
     if not e:
         return
-    print(f"\nпадение записано в журнал ({e['kind']}): {e['why']}", file=sys.stderr)
-    print(f"  теперь validate и presets annotate будут предупреждать о {name}",
+    print(t('\nпадение записано в журнал ({0}): {1}', e['kind'], e['why']), file=sys.stderr)
+    print(t('  теперь validate и presets annotate будут предупреждать о {0}', name),
           file=sys.stderr)
-    print(f"  прошёл замер — сбросить: llamastery crashes forget {name}", file=sys.stderr)
+    print(t('  прошёл замер — сбросить: llamastery crashes forget {0}', name), file=sys.stderr)
 
 
 def calibrate_from_log() -> int:
@@ -508,7 +499,7 @@ def calibrate_from_log() -> int:
     try:
         text = server.log_file().read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        print(f"не прочитать лог {server.log_file()}: {exc}", file=sys.stderr)
+        print(t('не прочитать лог {0}: {1}', server.log_file(), exc), file=sys.stderr)
         return 1
     ub = None
     for ln in text.splitlines():
@@ -519,18 +510,17 @@ def calibrate_from_log() -> int:
         if m and ub:
             pts.setdefault(ub, []).append(float(m.group(1)))
     if not pts:
-        print("в логе нет ни одной строки «CUDA0 compute buffer size»")
-        print(f"  лог: {server.log_file()}")
-        print("  такие строки сервер печатает при загрузке модели; в режиме")
-        print("  роутера отчёт инстанса иногда не попадает в общий лог — тогда")
-        print("  запусти одиночный сервер (llamastery runtime start --preset ...) и повтори")
+        print(t('в логе нет ни одной строки «CUDA0 compute buffer size»'))
+        print(t('  лог: {0}', server.log_file()))
+        print(t('  такие строки сервер печатает при загрузке модели; в режиме'))
+        print(t('  роутера отчёт инстанса иногда не попадает в общий лог — тогда'))
+        print(t('  запусти одиночный сервер (llamastery runtime start --preset ...) и повтори'))
         return 1
 
-    print("найдено в логе:")
+    print(t('найдено в логе:'))
     for u in sorted(pts):
         vals = pts[u]
-        print(f"  ubatch {u:>5}: {statistics.median(vals):8.0f} MiB "
-              f"({len(vals)} сообщ.)")
+        print(t('  ubatch {0}: {1} MiB ({2} сообщ.)', u, statistics.median(vals), len(vals)))
     ub_ref, vals_ref = sorted(pts.items())[0]
     mib = statistics.median(vals_ref)
     cal = budget.load_calibration()
@@ -541,9 +531,9 @@ def calibrate_from_log() -> int:
                              f"n_ubatch={ub_ref} (точек в логе: "
                              f"{sum(len(v) for v in pts.values())})")
     budget.save_calibration(cal)
-    print(f"\nбыло: {old:.3f} GiB при ub={cal.get('compute_ref_ubatch')}")
-    print(f"стало: {cal['compute_gb']:.3f} GiB при ub={ub_ref}  [запись сохранена]")
-    print("проверь: llamastery budget --ini <файл> <секция>")
+    print(t('\nбыло: {0} GiB при ub={1}', old, cal.get('compute_ref_ubatch')))
+    print(t('стало: {0} GiB при ub={1}  [запись сохранена]', cal['compute_gb'], ub_ref))
+    print(t('проверь: llamastery budget --ini <файл> <секция>'))
     return 0
 
 
@@ -554,23 +544,21 @@ def cmd_crashes(args) -> int:
         ok = crashes.forget(args.forget)
         print(f"удалено: {args.forget}" if ok else "такой записи нет")
         if ok:
-            print(f"не забудь перезаписать пресет: llamastery presets annotate "
-                  f"--ini <файл> --apply")
+            print(t('не забудь перезаписать пресет: llamastery presets annotate --ini <файл> --apply'))
         return 0 if ok else 1
     if not entries:
-        print("падений не записано")
-        print(f"  журнал: {paths.crashes_file()}")
+        print(t('падений не записано'))
+        print(t('  журнал: {0}', paths.crashes_file()))
         return 0
-    print(f"падений записано: {len(entries)}\n")
+    print(t('падений записано: {0}\n', len(entries)))
     for name, e in sorted(entries.items(),
                           key=lambda kv: kv[1].get("last", ""), reverse=True):
         depth = f", глубина {e['depth']} ток." if e.get("depth") else ""
         print(f"  {name}")
         print(f"    {e.get('why', '')} [{e.get('kind', '?')}]")
-        print(f"    {e.get('count', 1)} раз, последний {e.get('last', '?')}"
-              f", сборка {e.get('build', '?')}{depth}")
-    print(f"\nжурнал: {paths.crashes_file()}")
-    print(f"сбросить после успешного замера: llamastery crashes forget <пресет>")
+        print(t('    {0} раз, последний {1}, сборка {2}{3}', e.get('count', 1), e.get('last', '?'), e.get('build', '?'), depth))
+    print(t('\nжурнал: {0}', paths.crashes_file()))
+    print(t('сбросить после успешного замера: llamastery crashes forget <пресет>'))
     return 0
 
 
@@ -578,31 +566,30 @@ def cmd_runtime(args) -> int:
     """Собственный жизненный цикл сервера. Внешние менеджеры не нужны."""
     if args.verb == "status":
         st = server.status()
-        print(f"роутер:    {st['url']}   "
-              f"{'отвечает' if st['up'] else 'НЕ отвечает'}")
-        print(f"порт:      {st['port']}")
+        print(t('роутер:    {0}   {1}', st['url'], 'отвечает' if st['up'] else 'НЕ отвечает'))
+        print(t('порт:      {0}', st['port']))
         print(f"pid:       {st['pid'] or '-'}")
-        print(f"сборка:    {st['build'] or 'не определена'}")
-        print(f"пресет:    {st['ini']}")
+        print(t('сборка:    {0}', st['build'] or 'не определена'))
+        print(t('пресет:    {0}', st['ini']))
         if st.get("single"):
             print(f"single:    {st['single'].get('preset')}")
-        print(f"лог:       {st['log']}")
+        print(t('лог:       {0}', st['log']))
         if st["models"]:
-            print("модели:")
+            print(t('модели:'))
             for m in st["models"]:
                 label = server.STATUS_LABEL.get(m["status"], m["status"])
                 print(f"  [{m['status']:<10}] {m['id']}"
                       + (f"   {label}" if m["status"] != "loaded" else ""))
         else:
-            print("модели:    нет (VRAM свободна)")
+            print(t('модели:    нет (VRAM свободна)'))
         return 0 if st["up"] else 1
 
     if args.verb == "start":
         if server.healthy():
-            print(f"уже работает на {server.server_url()}")
+            print(t('уже работает на {0}', server.server_url()))
             if args.reload:
                 n = len(server.models(reload=True))
-                print(f"пресет перечитан: {n} моделей")
+                print(t('пресет перечитан: {0} моделей', n))
             return 0
         res = server.start(args.build, ini=args.ini, preset=args.preset)
         for w in res.warnings:
@@ -626,7 +613,7 @@ def cmd_runtime(args) -> int:
 
     if args.verb == "unload":
         if not server.healthy():
-            print("сервер не запущен — выгружать нечего, VRAM свободна")
+            print(t('сервер не запущен — выгружать нечего, VRAM свободна'))
             return 0
         # позиционный аргумент (`runtime unload имя`) — то же, что --model:
         # без этого лишний аргумент молча игнорировался, и вместо одной
@@ -637,15 +624,15 @@ def cmd_runtime(args) -> int:
                                       if m["status"] in
                                       ("loaded", "sleeping", "loading")]
         if not want:
-            print("загруженных моделей нет")
+            print(t('загруженных моделей нет'))
             return 0
         for mid in want:
-            print(f"выгружаю {mid}...")
+            print(t('выгружаю {0}...', mid))
             server.api_unload(mid)
         for mid in want:
             st = server.wait_status(mid, ("unloaded", "sleeping"), timeout=300)
             print(f"  {mid}: {server.STATUS_LABEL.get(st, st)}")
-        print(f"сервер жив на {server.server_url()}")
+        print(t('сервер жив на {0}', server.server_url()))
         return 0
 
     if args.verb == "logs":
@@ -654,7 +641,7 @@ def cmd_runtime(args) -> int:
             data = server.log_file().read_text(encoding="utf-8",
                                                errors="replace").splitlines()
         except OSError as exc:
-            print(f"лог недоступен: {exc}", file=sys.stderr)
+            print(t('лог недоступен: {0}', exc), file=sys.stderr)
             return 1
         for line in data[-n:]:
             print(line)
@@ -663,7 +650,7 @@ def cmd_runtime(args) -> int:
     if args.verb == "doctor":
         return cmd_doctor(argparse.Namespace(build=args.build))
 
-    print(f"неизвестный verb: {args.verb}", file=sys.stderr)
+    print(t('неизвестный verb: {0}', args.verb), file=sys.stderr)
     return 2
 
 
@@ -672,12 +659,11 @@ def cmd_validate(args) -> int:
     ini = _load_ini(args.ini)
     binary, src = builds.resolve_binary(args.build)
     if not args.build:
-        print("внимание: --build не указан, схема взята у сборки по умолчанию "
-              f"({src}). Проверка флагов другой сборки будет ложной.",
+        print(t('внимание: --build не указан, схема взята у сборки по умолчанию ({0}). Проверка флагов другой сборки будет ложной.', src),
               file=sys.stderr)
     flags, meta = schema.load(binary)
     if meta.get("error"):
-        print(f"ошибка схемы: {meta['error']}", file=sys.stderr)
+        print(t('ошибка схемы: {0}', meta['error']), file=sys.stderr)
         return 1
     names = args.names or [n for n in ini.names() if n != "*"]
     rep = validate.Report()
@@ -704,12 +690,12 @@ def cmd_validate(args) -> int:
              "errors": rep.count("error"), "warnings": rep.count("warn"),
              "findings": [f.__dict__ for f in rep.findings]})
     else:
-        print(f"проверено секций: {checked_models}   схема: {meta.get('binary')}")
+        print(t('проверено секций: {0}   схема: {1}', checked_models, meta.get('binary')))
         if not rep.findings:
-            print("проблем не найдено")
+            print(t('проблем не найдено'))
         for f in rep.findings:
             print(f.line())
-        print(f"\nошибок: {rep.count('error')}  предупреждений: {rep.count('warn')}")
+        print(t('\nошибок: {0}  предупреждений: {1}', rep.count('error'), rep.count('warn')))
     return 0 if rep.ok else 1
 
 
@@ -752,14 +738,16 @@ def cmd_budget(args) -> int:
         rows.append((name, est, meas))
 
     if not rows:
-        print("нет секций для расчёта")
+        print(t('нет секций для расчёта'))
         return 1
 
-    print(f"VRAM на карте: {vram} MiB" if vram else "VRAM: неизвестно (нет nvidia-smi)")
-    print(f"compute buffer (калибровка): {cal.get('compute_gb', 0.0):.2f} GiB"
-          + ("" if cal.get("compute_gb") else "   ← НЕ КАЛИБРОВАНО, оценка занижена"))
+    print(t('VRAM на карте: {0} MiB', vram) if vram
+          else t('VRAM: неизвестно (нет nvidia-smi)'))
+    print(t('compute buffer (калибровка): {0} GiB', f"{cal.get('compute_gb', 0.0):.2f}")
+          + ("" if cal.get("compute_gb") else t('   ← НЕ КАЛИБРОВАНО, оценка занижена')))
     print()
-    hdr = f"{'пресет':<44} {'веса':>9} {'KV':>8} {'mmproj':>7} {'прочее':>8} {'всего':>9} {'tg':>7}"
+    hdr = (f"{t('пресет'):<44} {t('веса'):>9} {t('KV'):>8} {t('mmproj'):>7} "
+           f"{t('прочее'):>8} {t('всего'):>9} {t('tg'):>7}")
     print(hdr)
     print("-" * len(hdr))
     for name, est, meas in rows:
@@ -775,8 +763,7 @@ def cmd_budget(args) -> int:
     reserve = args.reserve
     if budget_mib:
         usable = budget_mib - reserve
-        print(f"\nслот одновременно (models-max = {args.models_max}), "
-              f"резерв {reserve} MiB → доступно {usable} MiB")
+        print(t('\nслот одновременно (models-max = {0}), резерв {1} MiB → доступно {2} MiB', args.models_max, reserve, usable))
 # Живой замер важнее прогноза: пресет, который уже мерился и влезает,
         # нельзя объявлять невмещающимся из-за неточной модели.
         def need_mib(est, meas):
@@ -794,20 +781,19 @@ def cmd_budget(args) -> int:
                 break
         for name, mib, is_meas in loaded:
             src = "замер" if is_meas else "оценка"
-            print(f"  влезает: {name}  ({mib / 1024.0:.2f} GiB, {src})")
+            print(t('  влезает: {0}  ({1:.2f} GiB, {2})', name, mib / 1024.0, src))
         if len(loaded) < min(args.models_max, len(ranked)):
-            print("  не влезает:")
+            print(t('  не влезает:'))
             for name, est, meas in ranked[len(loaded):min(args.models_max, len(ranked))]:
                 mib = need_mib(est, meas)
                 src = "замер" if (meas and meas.get("used_mib")) else "оценка"
-                print(f"    {name}  нужно {mib / 1024.0:.2f} GiB ({src}), "
-                      f"осталось {(usable - used) / 1024.0:.2f} GiB")
+                print(t('    {0}  нужно {1} GiB ({2}), осталось {3} GiB', name, mib / 1024.0, src, (usable - used) / 1024.0))
     else:
-        print("\n(прогноз по слотам не построен: неизвестен объём VRAM)")
+        print(t('\n(прогноз по слотам не построен: неизвестен объём VRAM)'))
 
     if args.explain and rows:
         name, est, _ = rows[0]
-        print(f"\nразбор «{name}»:")
+        print(t('\nразбор «{0}»:', name))
         for n in est.notes:
             print(f"  - {n}")
     return 0
@@ -841,22 +827,22 @@ def cmd_calibrate(args) -> int:
     if not names:
         store = measure.load_store()
         names = list(store.get("records", {}).keys())
-        print("укажи секции явно (измерения по подписям не разворачиваются в секции)")
+        print(t('укажи секции явно (измерения по подписям не разворачиваются в секции)'))
     structural, measured, residuals = [], [], []
     for name in names:
         sec = ini.section(name)
         if not sec:
-            print(f"нет секции {name!r}", file=sys.stderr)
+            print(t('нет секции {0!r}', name), file=sys.stderr)
             continue
         pairs = sec.pairs()
         model = pairs.get("model") or ""
         if not model:
-            print(f"{name}: нет модели — пропуск")
+            print(t('{0}: нет модели — пропуск', name))
             continue
         try:
             meta = gguf.probe(model)
         except (gguf.GGUFError, OSError):
-            print(f"{name}: нет модели — пропуск")
+            print(t('{0}: нет модели — пропуск', name))
             continue
         mm = None
         if pairs.get("mmproj"):
@@ -882,17 +868,15 @@ def cmd_calibrate(args) -> int:
             free = pick(args.free_mib)
             total = budget.gpu_total_mib()
             if free is None or not total:
-                print(f"{name}: не хватает данных (нужно --used-gib или "
-                      f"--free-mib, можно точечно: --free-mib {name}=1147)")
+                print(t('{0}: не хватает данных (нужно --used-gib или --free-mib, можно точечно: --free-mib {1}=1147)', name, name))
                 continue
             used = (total - free) / 1024.0    # MiB -> GiB
         structural.append(est.weights_gb + est.kv_gb + est.mmproj_gb)
         measured.append(used)
         residuals.append(used - structural[-1])
-        print(f"{name}: структура {structural[-1]:.2f} GiB, факт {used:.2f} GiB, "
-              f"остаток {used - structural[-1]:+.2f} GiB")
+        print(t('{0}: структура {1} GiB, факт {2} GiB, остаток {3} GiB', name, structural[-1], used, used - structural[-1]))
     if not structural:
-        print("нечего калибровать")
+        print(t('нечего калибровать'))
         return 1
     if len(residuals) > 1:
         spread = max(residuals) - min(residuals)
@@ -921,7 +905,7 @@ def calibrate_from_tune() -> int:
     real = cal.get("offload_realization", 0.89)
     total_mib = budget.gpu_total_mib()
     if not total_mib:
-        print("нужен nvidia-smi")
+        print(t('нужен nvidia-smi'))
         return 1
     # переопределение калибровки на время расчёта структуры: раньше оно
     # писалось на диск и восстанавливалось после каждого прогона, и любая
@@ -980,7 +964,7 @@ def calibrate_from_tune() -> int:
                 residuals.append(used - s)
                 ubs.append(int(cfg.get("ubatch-size") or cfg.get("ub") or 0))
     if not residuals:
-        print("подходящих прогонов не найдено (нужны ok=True и min_observed_free_mib)")
+        print(t('подходящих прогонов не найдено (нужны ok=True и min_observed_free_mib)'))
         return 1
     value = statistics.median(residuals)
     ub = int(statistics.median([u for u in ubs if u])) if any(ubs) else 0
@@ -992,10 +976,9 @@ def calibrate_from_tune() -> int:
     cal["compute_source"] = (f"медиана остатка по {len(residuals)} успешным "
                              f"прогонам при ub={ub}")
     p = budget.save_calibration(cal)
-    print(f"учтено прогонов: {len(residuals)}")
-    print(f"compute_gb = {value:.3f} при ubatch={ub}  (разброс "
-          f"{min(residuals):.2f}..{max(residuals):.2f} GiB)")
-    print(f"записано: {p}")
+    print(t('учтено прогонов: {0}', len(residuals)))
+    print(t('compute_gb = {0} при ubatch={1}  (разброс {2}..{3} GiB)', value, ub, min(residuals), max(residuals)))
+    print(t('записано: {0}', p))
     return 0
 
 
@@ -1008,12 +991,12 @@ def cmd_probe(args) -> int:
     """
     from lib import probe as _probe
     if not _adopt_running_build() and not server.healthy():
-        print("сервер не запущен: llamastery runtime start", file=sys.stderr)
+        print(t('сервер не запущен: llamastery runtime start'), file=sys.stderr)
         return 1
     loaded = [m for m in server.loaded_models()
               if m["status"] in ("loaded", "sleeping")]
     if not loaded:
-        print("в VRAM ничего не загружено: llamastery load <пресет>", file=sys.stderr)
+        print(t('в VRAM ничего не загружено: llamastery load <пресет>'), file=sys.stderr)
         return 1
     single = bool(loaded[0].get("single"))
     model = None if single else (args.model or loaded[0]["id"])
@@ -1030,7 +1013,7 @@ def cmd_probe(args) -> int:
                               from_file=args.from_file)
     for i, r in enumerate(res["runs"], 1):
         if not r.get("ok"):
-            print(f"  проба {i}: ОШИБКА — {r.get('error')}")
+            print(t('  проба {0}: ОШИБКА — {1}', i, r.get('error')))
             # сервер мог упасть целиком: модель выгружена, а пресет остаётся
             # в ini как ни в чём не бывало. Запоминаем причину по логу.
             e = crashes.note(model or loaded[0]["id"],
@@ -1038,8 +1021,8 @@ def cmd_probe(args) -> int:
                              crashes.tail_log(server.log_file()),
                              depth=args.tokens, log=str(server.log_file()))
             if e:
-                print(f"  проба уронила сервер: {e['why']}", file=sys.stderr)
-                print(f"  записано в журнал падений: {model}", file=sys.stderr)
+                print(t('  проба уронила сервер: {0}', e['why']), file=sys.stderr)
+                print(t('  записано в журнал падений: {0}', model), file=sys.stderr)
             continue
         print(f"  проба {i}: prompt {r.get('prompt_n')} ток., "
               f"сгенерировано {r.get('predicted_n')}, "
@@ -1048,7 +1031,7 @@ def cmd_probe(args) -> int:
               f"время {r['wall_s']} с"
               + ("   ПРОГРЕТО, в prefill не учтена" if r.get("cached") else ""))
         if r.get("content"):
-            print(f"           ответ: {r['content'][:110]!r}")
+            print(t('           ответ: {0!r}', r['content'][:110]))
     if not res.get("ok_count"):
         return 1
     print(f"\nитого: tg худший {res['gen_tps_min']} t/s, "
@@ -1057,13 +1040,12 @@ def cmd_probe(args) -> int:
     if res.get("note"):
         print(f"  {res['note']}", file=sys.stderr)
     if res.get("cached_runs"):
-        print(f"  проб из прогретого KV: {res['cached_runs']} "
-              f"(в prefill не попали)", file=sys.stderr)
+        print(t('  проб из прогретого KV: {0} (в prefill не попали)', res['cached_runs']), file=sys.stderr)
 
     # успешный замер снимает претензию «этот пресет падает»
     if model and not res.get("cached_runs"):
         if crashes.forget(model):
-            print(f"  журнал падений очищен: {model} прошёл замер", file=sys.stderr)
+            print(t('  журнал падений очищен: {0} прошёл замер', model), file=sys.stderr)
 
     if args.record and args.preset:
         ini = _load_ini(args.ini)
@@ -1088,9 +1070,9 @@ def cmd_probe(args) -> int:
             entry.setdefault("sources", []).append(
                 f"llamastery probe {args.tokens}t")
             measure.save_store(store)
-            print(f"записано в measurements.json: {args.preset}")
+            print(t('записано в measurements.json: {0}', args.preset))
         else:
-            print(f"секции {args.preset!r} нет в {ini.path} — не записано",
+            print(t('секции {0!r} нет в {1} — не записано', args.preset, ini.path),
                   file=sys.stderr)
     return 0
 
@@ -1113,10 +1095,9 @@ def cmd_measure(args) -> int:
           + (f" из {cap['total_mib']} MiB, свободно {cap['free_mib']} MiB"
              if cap.get("total_mib") else ""))
     if not cap["loaded"]:
-        print("в VRAM ничего не загружено — снимать нечего")
+        print(t('в VRAM ничего не загружено — снимать нечего'))
         if not swap_url:
-            print("  (модель под llama-swap? укажи --swap-url, "
-                  "напр. --swap-url http://127.0.0.1:8087)")
+            print(t('  (модель под llama-swap? укажи --swap-url, напр. --swap-url http://127.0.0.1:8087)'))
         return 1
     where = {"swap": " (по данным llama-swap)"}.get(cap.get("source", ""), "")
     print(f"загружено{where}: " + ", ".join(cap["loaded"]))
@@ -1137,25 +1118,24 @@ def cmd_measure(args) -> int:
                     name = sec
                     break
         if not name:
-            print(f"секция {want!r} не найдена в {ini.path}", file=sys.stderr)
+            print(t('секция {0!r} не найдена в {1}', want, ini.path), file=sys.stderr)
             rc = 2
             continue
         pairs = ini.section(name).pairs()
         rec = vram.record(name, pairs, cap)
         used_gb = rec.get("vram_mib", 0) / 1024.0
         print(f"\n{name}")
-        print(f"  записано: vram {used_gb:.2f} GiB [замер], "
-              f"свободно {rec.get('min_free_mib')} MiB")
+        print(t('  записано: vram {0} GiB [замер], свободно {1} MiB', used_gb, rec.get('min_free_mib')))
         if args.recalibrate:
             model = pairs.get("model") or ""
             if not (model and gguf.is_gguf(model)):
-                print("  перекалибровка пропущена: нет файла модели")
+                print(t('  перекалибровка пропущена: нет файла модели'))
                 continue
             try:
                 meta = gguf.probe(model)
             except gguf.GGUFError as exc:
                 # недокачанный/битый GGUF не должен ронять остаток прохода
-                print(f"  перекалибровка пропущена: {exc}", file=sys.stderr)
+                print(t('  перекалибровка пропущена: {0}', exc), file=sys.stderr)
                 continue
             mm = None
             if pairs.get("mmproj") and gguf.is_gguf(pairs["mmproj"]):
@@ -1168,9 +1148,8 @@ def cmd_measure(args) -> int:
             res = vram.calibrate_from_measurement(pairs, cap["used_mib"],
                                                  structural)
             if res:
-                print(f"  compute buffer: {res['compute_gb']} GiB "
-                      f"(остаток {res['residual']} GiB) → {res['store']}")
-    print(f"\nхранилище замеров: {measure.store_path()}")
+                print(t('  compute buffer: {0} GiB (остаток {1} GiB) → {2}', res['compute_gb'], res['residual'], res['store']))
+    print(t('\nхранилище замеров: {0}', measure.store_path()))
     return rc
 
 
@@ -1179,16 +1158,16 @@ def cmd_ingest(args) -> int:
     store = measure.build_store(args.ini)
     recs = store["records"]
     tune = measure.ingest_tune_results()
-    print(f"замеров из tune-results: {len(tune)}")
-    print(f"всего записей: {len(recs)}")
+    print(t('замеров из tune-results: {0}', len(tune)))
+    print(t('всего записей: {0}', len(recs)))
     with_tps = sum(1 for r in recs.values()
                    if r.get("short_tps") or r.get("deep_tps"))
-    print(f"из них со скоростью: {with_tps}")
+    print(t('из них со скоростью: {0}', with_tps))
     if args.apply:
         p = measure.save_store(store)
-        print(f"записано: {p}")
+        print(t('записано: {0}', p))
     else:
-        print("(только просмотр; --apply чтобы сохранить)")
+        print(t('(только просмотр; --apply чтобы сохранить)'))
     return 0
 
 
@@ -1197,11 +1176,11 @@ def cmd_tune(args) -> int:
     root = Path(__file__).resolve().parent.parent
     tuner = root / "tools" / "tune_models.py"
     if not tuner.exists():
-        print(f"нет тюнера: {tuner}", file=sys.stderr)
+        print(t('нет тюнера: {0}', tuner), file=sys.stderr)
         return 1
     binary, src = builds.resolve_binary(args.build)
     if not binary:
-        print("не найден llama-server; укажи --build", file=sys.stderr)
+        print(t('не найден llama-server; укажи --build'), file=sys.stderr)
         return 1
     cmd = [sys.executable, str(tuner), args.ini, args.section,
            "--server", str(binary)]
@@ -1214,29 +1193,30 @@ def cmd_tune(args) -> int:
     # артефакты прогона (tune-results/) должны ложиться рядом с пресетом,
     # а не в каталог, откуда запущен скилл
     run_dir = Path(args.ini).expanduser().parent
-    print("запуск:", " ".join(cmd), file=sys.stderr)
-    print(f"рабочий каталог: {run_dir}", file=sys.stderr)
+    print(t('запуск:'), " ".join(cmd), file=sys.stderr)
+    print(t('рабочий каталог: {0}', run_dir), file=sys.stderr)
     try:
         return subprocess.call(cmd, cwd=str(run_dir))
     except OSError as exc:
-        print(f"не удалось запустить тюнер: {exc}", file=sys.stderr)
+        print(t('не удалось запустить тюнер: {0}', exc), file=sys.stderr)
         return 1
 
 
 # ─────────────────────────── doctor ───────────────────────────
 def cmd_doctor(args) -> int:
     ok = True
-    print("пути")
-    for label, p in (("конфиг", paths.config_dir()), ("состояние", paths.state_dir()),
-                     ("кэш", paths.cache_dir())):
-        print(f"  {label:<10} {p}  {'ok' if p.exists() else 'нет (создастся)'}")
-    print(f"  {'пресет':<10} {paths.default_ini()}  "
-          f"{'ok' if paths.default_ini().exists() else 'НЕТ ФАЙЛА'}")
+    print(t('пути'))
+    for label, p in ((t('конфиг'), paths.config_dir()), (t('состояние'), paths.state_dir()),
+                     (t('кэш'), paths.cache_dir())):
+        print(f"  {label:<10} {p}  "
+              f"{t('ok') if p.exists() else t('нет (создастся)')}")
+    print(f"  {t('пресет'):<10} {paths.default_ini()}  "
+          f"{t('ok') if paths.default_ini().exists() else t('НЕТ ФАЙЛА')}")
 
-    print("\nсборки")
+    print(t('\nсборки'))
     reg = builds.all_builds()
     if not reg:
-        print("  реестр пуст — llamastery builds detect --apply")
+        print(t('  реестр пуст — llamastery builds detect --apply'))
         ok = False
     for name, b in reg.items():
         st = b.status()
@@ -1245,25 +1225,25 @@ def cmd_doctor(args) -> int:
         if st.get("version"):
             print(f"       {st['version']}")
     binary, src = builds.resolve_binary(args.build)
-    print(f"\nсхема флагов: {binary or 'НЕ НАЙДЕН llama-server'} (через {src})")
+    print(t('\nсхема флагов: {0} (через {1})', binary or 'НЕ НАЙДЕН llama-server', src))
     if not binary:
         ok = False
 
-    print("\nменеджеры на PATH")
+    print(t('\nменеджеры на PATH'))
     for cmd in ("llama", "llama-faks", "llama-ik", "catapult", "catapult-cn",
                 "llm-preset-manager", "llama-swap"):
         import shutil
         found = shutil.which(cmd)
         print(f"  {'ok ' if found else '—  '} {cmd:<22} {found or '—'}")
 
-    print("\nзамеры")
+    print(t('\nзамеры'))
     st = measure.load_store()
-    print(f"  записей в measurements.json: {len(st.get('records', {}))}")
+    print(t('  записей в measurements.json: {0}', len(st.get('records', {}))))
     tune_dirs = measure._tune_dirs()
-    print(f"  каталогов tune-results: {len(tune_dirs)}")
+    print(t('  каталогов tune-results: {0}', len(tune_dirs)))
 
     cal = budget.load_calibration()
-    print(f"  калибровка compute_gb: {cal.get('compute_gb', 'нет')}")
+    print(t('  калибровка compute_gb: {0}', cal.get('compute_gb', 'нет')))
     vram = budget.gpu_total_mib()
     print(f"  VRAM: {vram} MiB" if vram else "  VRAM: неизвестно")
 
@@ -1276,10 +1256,9 @@ def cmd_doctor(args) -> int:
         if r.get("behind") or r.get("bin_behind_tree"):
             stale.append(f"{n}(-{r.get('behind') or '?'}"
                          + (", флаги" if r.get("flags_may_change") else "") + ")")
-    print(f"  актуальность сборок: {'устарели: ' + ', '.join(stale) if stale else 'все актуальны'}")
+    print(t('  актуальность сборок: {0}', 'устарели: ' + ', '.join(stale) if stale else 'все актуальны'))
     if stale:
-        print("    → подробности: llamastery builds stale   "
-              "(обновление и пересборка — решение человека)")
+        print(t('    → подробности: llamastery builds stale   (обновление и пересборка — решение человека)'))
     return 0 if ok else 1
 
 
@@ -1287,7 +1266,7 @@ def cmd_doctor(args) -> int:
 def cmd_swap(args) -> int:
     if args.action == "up":
         binp = swap.find_binary()
-        print(f"бинарь: {binp or 'НЕ НАЙДЕН (swap install)'}")
+        print(t('бинарь: {0}', binp or 'НЕ НАЙДЕН (swap install)'))
         cfg = args.config or str(swap.default_output())
         res = swap.up(config=cfg, listen=args.listen,
                       auto_port=not args.no_auto_port)
@@ -1295,7 +1274,7 @@ def cmd_swap(args) -> int:
         if not res["ok"]:
             return 1
         if res.get("url") and not args.quiet:
-            print("дальше:")
+            print(t('дальше:'))
             for s in swap.next_steps(res["url"]):
                 print(f"  {s}")
         return 0
@@ -1305,30 +1284,28 @@ def cmd_swap(args) -> int:
         return 0 if res["ok"] else 1
     if args.action == "status":
         binp = swap.find_binary()
-        print(f"бинарь: {binp or 'НЕ НАЙДЕН (swap install)'}")
+        print(t('бинарь: {0}', binp or 'НЕ НАЙДЕН (swap install)'))
         url = args.url or swap.load_state().get("url") or swap.SWAP_LISTEN
         st = swap.status(url)
-        print(f"прокси {st['url']}: {'up' if st['up'] else 'down'}")
+        print(t('прокси {0}: {1}', st['url'], 'up' if st['up'] else 'down'))
         try:
             host, port = swap.parse_listen(st["url"])
         except ValueError:
             host, port = "0.0.0.0", 8080
         if st["up"]:
-            print(f"порт {port}: слушает swap")
+            print(t('порт {0}: слушает swap', port))
         elif swap.is_port_busy(host, port):
             owner = swap.describe_owner(swap.port_owner(port))
-            print(f"! порт {port} занят НЕ свапом: {owner}")
-            print(f"  swap на этот порт не встанет — смени --listen "
-                  f"или освободи порт")
+            print(t('! порт {0} занят НЕ свапом: {1}', port, owner))
+            print(t('  swap на этот порт не встанет — смени --listen или освободи порт'))
         else:
-            print(f"порт {port}: свободен — swap не запущен")
+            print(t('порт {0}: свободен — swap не запущен', port))
         if st.get("running"):
             print(json.dumps(st["running"], ensure_ascii=False, indent=1)[:2000])
         if st.get("error"):
             print(f"! {st['error']}")
         srv = server.status()
-        print(f"прямой сервер: {srv['url']} up={srv['up']} "
-              f"build={srv.get('build')} pid={srv.get('pid')}")
+        print(t('прямой сервер: {0} up={1} build={2} pid={3}', srv['url'], srv['up'], srv.get('build'), srv.get('pid')))
         return 0 if st["up"] else 1
     if args.action == "install":
         ver = args.version or "v261"
@@ -1340,7 +1317,7 @@ def cmd_swap(args) -> int:
                   "nt": "windows"}.get(sys.platform)
         ext = "zip" if osname == "windows" else "tar.gz"
         if not (cpu and osname):
-            print(f"install: неподдерживаемая платформа {sys.platform}/{machine}",
+            print(t('install: неподдерживаемая платформа {0}/{1}', sys.platform, machine),
                   file=sys.stderr)
             return 1
         num = ver[1:] if ver.startswith("v") else ver
@@ -1349,8 +1326,8 @@ def cmd_swap(args) -> int:
         dest = (Path(os.environ.get("LOCALAPPDATA", "~")).expanduser() / "bin"
                 if os.name == "nt" else Path("~/.local/bin").expanduser())
         dest.mkdir(parents=True, exist_ok=True)
-        print(f"качаю {url}")
-        print(f"цель: {dest}/llama-swap")
+        print(t('качаю {0}', url))
+        print(t('цель: {0}/llama-swap', dest))
         print("(dry-run)" if args.dry_run else "")
         if args.dry_run:
             return 0
@@ -1365,11 +1342,11 @@ def cmd_swap(args) -> int:
                 subprocess.run(["tar", "-xzf", str(tmp), "-C", str(dest)],
                                check=True)
             tmp.unlink(missing_ok=True)
-            print(f"готово: {dest}/llama-swap --version")
-            print("проверь PATH: каталог установки должен быть в $PATH")
+            print(t('готово: {0}/llama-swap --version', dest))
+            print(t('проверь PATH: каталог установки должен быть в $PATH'))
             return 0
         except subprocess.CalledProcessError as exc:
-            print(f"не скачалось: {exc}", file=sys.stderr)
+            print(t('не скачалось: {0}', exc), file=sys.stderr)
             return 1
     # export
     text, warns = swap.export_yaml(args.ini, args.build, args.only,
@@ -1381,24 +1358,22 @@ def cmd_swap(args) -> int:
     if args.output:
         outp = Path(args.output).expanduser()
         if args.dry_run:
-            print(f"(dry-run) записалось бы в {outp}:\n")
+            print(t('(dry-run) записалось бы в {0}:\n', outp))
             print(text[:4000])
             return 0
         if outp.exists():
             bak = outp.with_suffix(outp.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
             shutil.copy2(outp, bak)
-            print(f"бэкап: {bak}")
+            print(t('бэкап: {0}', bak))
         outp.parent.mkdir(parents=True, exist_ok=True)
         outp.write_text(text, encoding="utf-8")
-        print(f"записано: {outp}")
+        print(t('записано: {0}', outp))
         binp = swap.find_binary()
         listen, why = swap.resolve_listen(args.listen)
         if why:
             print(f"! {why}")
-        print(f"запуск: {binp or 'llama-swap'} --config {outp} "
-              f"--listen {listen}")
-        print("  (или одной командой: llamastery swap up "
-              f"--listen {listen})")
+        print(t('запуск: {0} --config {1} --listen {2}', binp or 'llama-swap', outp, listen))
+        print(t('  (или одной командой: llamastery swap up --listen {0})', listen))
         return 0
     print(text)
     return 0
@@ -1410,27 +1385,26 @@ def cmd_axes(args) -> int:
     if args.action == "refresh":
         b = builds.get(args.build) or builds.get(server.active_build() or "")
         if b is None:
-            print("сборка не указана и не определяется: --build", file=sys.stderr)
+            print(t('сборка не указана и не определяется: --build'), file=sys.stderr)
             return 1
         res = axes.diff_snapshot(b.name)
         if res.get("error"):
             print(res["error"], file=sys.stderr)
             return 1
         if res.get("first"):
-            print(f"снимок флагов создан: {res['count']} флагов → "
-                  f"{axes.snapshot_path(b.name)}")
+            print(t('снимок флагов создан: {0} флагов → {1}', res['count'], axes.snapshot_path(b.name)))
             return 0
-        print(f"сборка {b.name}: флагов {res['count']}")
+        print(t('сборка {0}: флагов {1}', b.name, res['count']))
         if res["added"]:
-            print("добавились:")
+            print(t('добавились:'))
             for f in res["added"]:
                 print(f"  + {f}")
         if res["removed"]:
-            print("исчезли:")
+            print(t('исчезли:'))
             for f in res["removed"]:
                 print(f"  - {f}")
         if not res["added"] and not res["removed"]:
-            print("набор флагов не изменился")
+            print(t('набор флагов не изменился'))
         return 0
 
     learned = axes.learn()
@@ -1439,36 +1413,35 @@ def cmd_axes(args) -> int:
         out({"order": [r["key"] for r in rows], "axes": rows,
              "learned": learned})
         return 0
-    print("порядок проверки (по убыванию ожидаемого прироста):")
+    print(t('порядок проверки (по убыванию ожидаемого прироста):'))
     for i, r in enumerate(rows, 1):
         mark = f" [{r['pairs']} пар, tps x{r['tps_gain']}, VRAM x{r['vram_gain']}]" \
             if r["pairs"] and r["values"] > 1 else ""
-        print(f"  {i}. {r['key']:<14} {r['flag']:<18} приоритет {r['prior']}{mark}")
+        print(t('  {0}. {1:<14} {2:<18} приоритет {3}{4}',
+              i, r['key'], r['flag'], r['prior'], mark))
         print(f"     {r['why']}")
     spec = rows_by_key = next((r for r in rows if r["key"] == "spec"), None)
     if spec:
         m = spec.get("measured") or {}
-        print("\nотдельно: спекулятивный декодер (ось со знаком, не сетка)")
+        print(t('\nотдельно: спекулятивный декодер (ось со знаком, не сетка)'))
         print("  измеренный эффект: повторяющийся текст x%s, уникальный x%s"
               % (m.get("repetitive"), m.get("unique")))
-        print("  приоритет высокий, но знакопеременный: на уникальном тексте")
-        print("  он почти бесполезен, поэтому в общую сетку осей не входит.")
+        print(t('  приоритет высокий, но знакопеременный: на уникальном тексте'))
+        print(t('  он почти бесполезен, поэтому в общую сетку осей не входит.'))
         ev = learned.get("spec") or {}
         if ev.get("repetitive"):
-            print(f"  твой свежий A/B: повторы x{ev['repetitive']}, "
-                  f"уникальный x{ev.get('unique')}")
+            print(t('  твой свежий A/B: повторы x{0}, уникальный x{1}', ev['repetitive'], ev.get('unique')))
         else:
-            print("  свежего A/B в tune-results нет — приоритет взят из docs.")
+            print(t('  свежего A/B в tune-results нет — приоритет взят из docs.'))
 
     b = builds.get(args.build)
     if b is not None:
         new = axes.discover(b.server_bin)
         if new:
-            print(f"\nне описаны в реестре, но похожи на ручки скорости "
-                  f"({len(new)}):")
+            print(t('\nне описаны в реестре, но похожи на ручки скорости ({0}):', len(new)))
             for f in new[:20]:
                 print(f"  ? {f}")
-            print("  → сначала validate/budget, потом добавь ось в lib/axes.py")
+            print(t('  → сначала validate/budget, потом добавь ось в lib/axes.py'))
     return 0
 
 
@@ -1478,6 +1451,28 @@ def cmd_wizard(args) -> int:
 
 
 # ─────────────────────────── main ───────────────────────────
+def _add_lang_arg(parser) -> None:
+    parser.add_argument(
+        "--lang", metavar="КОД", default=None,
+        help="язык вывода: " + ", ".join(i18n.available()) +
+             " (по умолчанию ru; иначе берётся из LANG/LC_ALL)")
+
+
+def cmd_lang(args) -> int:
+    """Показать, каким языком говорит инструмент, и какие ещё есть."""
+    langs = i18n.available()
+    cur = i18n.current()
+    if getattr(args, "action", "show") == "list":
+        for code in langs:
+            print(f"{'*' if code == cur else ' '} {code}")
+        return 0
+    print(t('язык: {0}', cur))
+    print(t('доступно: {0}', ', '.join(langs)))
+    if cur != "ru":
+        print(t('сбросить: export LLAMASTERY_LANG=ru   (или LANG=ru_RU.UTF-8)'))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="llamastery",
@@ -1665,7 +1660,20 @@ def main(argv=None) -> int:
     w = sub.add_parser("wizard", help="интерактивный мастер: сервер → swap → пресет → план")
     w.set_defaults(func=cmd_wizard)
 
+    lg = sub.add_parser("lang", help="язык вывода: список, текущий, сброс")
+    lg.add_argument("action", nargs="?", choices=["list", "show", "current"],
+                    default="show")
+    lg.set_defaults(func=cmd_lang)
+
+    # --lang стоит до подкоманд и после них: argparse не различает позиции,
+    # поэтому флаг добавляем и на корневой парсер, и на каждый подпарсер —
+    # иначе `llamastery budget --lang de` молча проигнорирует флаг.
+    _add_lang_arg(p)
+    for _sp in sub.choices.values():
+        _add_lang_arg(_sp)
+
     args = p.parse_args(argv)
+    i18n.init(args.lang)
     if args.cmd is None:
         return cmd_wizard(args)
     return args.func(args)
@@ -1677,5 +1685,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         raise SystemExit(130)
     except FileNotFoundError as exc:
-        print(f"файл не найден: {exc}", file=sys.stderr)
+        print(t('файл не найден: {0}', exc), file=sys.stderr)
         raise SystemExit(1)

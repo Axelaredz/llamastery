@@ -24,6 +24,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from . import builds, budget, gguf, measure, paths, presets, server, swap, tui, vram
+from .i18n import t
 
 STAR = "★"
 ARROW = "│"
@@ -149,7 +150,7 @@ class Nav:
             self.stale.discard(key)
             self.answers[key] = val
             self.i += 1
-        warn("слишком много переходов назад — возвращаюсь в меню")
+        warn(t('слишком много переходов назад — возвращаюсь в меню'))
         return None
 
 
@@ -163,7 +164,7 @@ def _read(prompt: str) -> str:
 
 def _go_back() -> None:
     """Ответ «0»: печатаем, что сделали, и выходим из экрана на шаг назад."""
-    print(f"    {ARROW} ответ: {BACK}")
+    print(t('    {0} ответ: {1}', ARROW, BACK))
     raise _GoBack
 
 
@@ -223,13 +224,13 @@ def ask(title: str, options: list[tuple[str, str]], default: int,
     if raw and not _is_int(raw):
         pasted = _as_model_path(raw) if paste_model else None
         if pasted:
-            print(f"    {ARROW} ответ: {pasted}")
+            print(t('    {0} ответ: {1}', ARROW, pasted))
             return PastedPath(pasted)
-        warn(f"не номер пункта: {raw[:60]!r} — беру {default} (Enter)")
+        warn(t('не номер пункта: {0!r} — беру {1} (Enter)', raw[:60], default))
         return default - 1
     idx = clamp_choice(raw, len(options), default) - 1
     if raw and idx + 1 != int(raw):
-        warn(f"в списке нет пункта {raw} — беру {default} (Enter)")
+        warn(t('в списке нет пункта {0} — беру {1} (Enter)', raw, default))
     return idx
 
 
@@ -259,7 +260,7 @@ def _ask_tui(title: str, options: list[tuple[str, str]], default: int,
             if pasted:
                 _remember(title, pasted)
                 return PastedPath(pasted)
-            warn(f"не путь к .gguf: {raw[:60]!r} — выбираю из списка")
+            warn(t('не путь к .gguf: {0!r} — выбираю из списка', raw[:60]))
             continue
         _remember(title, options[idx][0])
         return idx
@@ -273,7 +274,7 @@ def ask_pick(title: str, options: list[tuple[str, str]], default: int,
         return idx
     label = options[idx][0]
     if not tui.enabled():
-        print(f"    {ARROW} ответ: {label}")
+        print(t('    {0} ответ: {1}', ARROW, label))
     return label
 
 
@@ -299,7 +300,7 @@ def ask_yn(title: str, default_yes: bool = False, sub: str = "") -> bool:
     if raw == "0":
         _go_back()
     yes = raw in ("y", "yes", "д", "да")
-    print(f"    {ARROW} ответ: {'да' if yes else 'нет'}")
+    print(t('    {0} ответ: {1}', ARROW, 'да' if yes else 'нет'))
     return yes
 
 
@@ -316,7 +317,7 @@ def ask_text(title: str, default: str, sub: str = "") -> str:
     if tui.enabled():
         _remember(title, val)
     else:
-        print(f"    {ARROW} ответ: {val}")
+        print(t('    {0} ответ: {1}', ARROW, val))
     return val
 
 
@@ -475,11 +476,11 @@ def _bin() -> str:
 
 def _run_cli(*args: str) -> int:
     print()
-    print(f"  {ARROW} выполняю: llamastery {' '.join(args)}")
+    print(t('  {0} выполняю: llamastery {1}', ARROW, ' '.join(args)))
     try:
         return subprocess.call([_bin(), *args])
     except OSError as exc:
-        warn(f"не запустилось: {exc}")
+        warn(t('не запустилось: {0}', exc))
         return 1
 
 
@@ -513,10 +514,9 @@ def print_state(s: dict, swap_url: str) -> None:
         note(f"           {m}")
     if s["vram_used"] is not None and s["vram_total"]:
         free = s["vram_total"] - s["vram_used"]
-        note(f"VRAM     {s['vram_used']} / {s['vram_total']} MiB "
-             f"(свободно {free})")
+        note(t('VRAM     {0} / {1} MiB (свободно {2})', s['vram_used'], s['vram_total'], free))
     else:
-        note("VRAM     неизвестна (nvidia-smi не найден)")
+        note(t('VRAM     неизвестна (nvidia-smi не найден)'))
 
 
 # ── шаги настройки ──
@@ -542,14 +542,13 @@ def _pick_build_registry() -> dict:
     reg = builds.all_builds()
     if reg:
         return reg
-    warn("реестр сборок пуст — ищем форки автоматически")
+    warn(t('реестр сборок пуст — ищем форки автоматически'))
     if ask_yn(f"Вопрос {qnum()} · найти сборки (builds detect --apply)?",
               sub="обычные каталоги: ~/git/llama-*, ~/llama-*"):
         _run_cli("builds", "detect", "--apply")
         reg = builds.all_builds()
     if not reg:
-        warn("сборок нет. Собери llama-server и вернись: "
-             "cmake -B build && cmake --build build -j")
+        warn(t('сборок нет. Собери llama-server и вернись: cmake -B build && cmake --build build -j'))
     return reg
 
 
@@ -620,24 +619,24 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
     head("свой .gguf", "секции в ini нет — сделаем её из файла")
     if prefilled:
         raw = prefilled
-        note(f"путь из вставки: {raw}")
+        note(t('путь из вставки: {0}', raw))
     else:
         raw = ask_text(f"Вопрос {qnum()} · путь к .gguf", "",
                        sub="Enter — отмена; можно вставить путь из буфера "
                            "обмена")
         if not raw:
-            note("путь не задан — возвращаюсь к списку пресетов")
+            note(t('путь не задан — возвращаюсь к списку пресетов'))
             return None
     path = Path(raw).expanduser()
     if not path.exists():
-        warn(f"нет файла: {path}")
+        warn(t('нет файла: {0}', path))
         return None
     try:
         meta = gguf.probe(path)
     except gguf.GGUFError as exc:
         warn(str(exc))
         return None
-    note(f"на диске: {meta.summary()}")
+    note(t('на диске: {0}', meta.summary()))
 
     opts, sections, default_name = _preset_options(ini)
     if opts:
@@ -647,25 +646,24 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
                             "они указывают на чужой файл")
         base_pairs = ini.section(base).pairs()
     else:
-        warn("в ini нет ни одного пресета — беру только глобальные [*]")
+        warn(t('в ini нет ни одного пресета — беру только глобальные [*]'))
         base_pairs = ini.globals()
 
     mmproj = gguf.find_mmproj_near(path)
     if mmproj:
-        note(f"рядом нашёлся mmproj: {Path(mmproj).name}")
+        note(t('рядом нашёлся mmproj: {0}', Path(mmproj).name))
     else:
-        note("mmproj рядом не найден — зрения в этой секции не будет")
+        note(t('mmproj рядом не найден — зрения в этой секции не будет'))
 
     pairs = pairs_for_custom_model(base_pairs, str(path), meta, mmproj)
     name = section_name_for(str(path), [n for n in ini.names() if n != "*"])
     note("")
-    note(f"новая секция [{name}]: {len(pairs)} ключей, c={pairs.get('c', '?')}, "
-         f"n-cpu-moe={pairs.get('n-cpu-moe', '-')}")
+    note(t('новая секция [{0}]: {1} ключей, c={2}, n-cpu-moe={3}', name, len(pairs), pairs.get('c', '?'), pairs.get('n-cpu-moe', '-')))
 
     if not ask_yn(f"Вопрос {qnum()} · дописать [{name}] в {ini.path}?",
                   sub="пишется с резервной копией; дальше validate/budget/load "
                       "видят её как обычный пресет"):
-        warn("не записано — возвращаюсь к списку пресетов")
+        warn(t('не записано — возвращаюсь к списку пресетов'))
         return None
     bk = presets.backup(ini.path) if ini.path.exists() else None
     ini.sections[name] = Section(name=name, header_raw=f"[{name}]")
@@ -679,8 +677,7 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
     ini.save()
     note(f"записано: {ini.path}"
          + (f" (резервная копия: {bk})" if bk else ""))
-    note("роутер и llama-swap читают ini при старте: чтобы модель появилась "
-         "у живого сервера, нужен runtime restart (и swap export)")
+    note(t('роутер и llama-swap читают ini при старте: чтобы модель появилась у живого сервера, нужен runtime restart (и swap export)'))
     return name
 
 
@@ -698,12 +695,12 @@ def _report_files(ini) -> None:
             else:
                 missing.append(f"{name} ← {key}")
     head("проверка файлов", "пути из models.ini против диска")
-    note(f"на месте: {ok};  недостаёт: {len(missing)}")
+    note(t('на месте: {0};  недостаёт: {1}', ok, len(missing)))
     for m in missing[:6]:
-        warn(f"нет: {m}")
+        warn(t('нет: {0}', m))
     if len(missing) > 6:
-        warn(f"…ещё {len(missing) - 6}")
-    note(f"GGUF от IsValorum (abliterated, твои Qwen3.8/Tiel уже оттуда):")
+        warn(t('…ещё {0}', len(missing) - 6))
+    note(t('GGUF от IsValorum (abliterated, твои Qwen3.8/Tiel уже оттуда):'))
     note(f"  {ISVALORUM}")
 
 
@@ -872,8 +869,7 @@ def _report_shrink(shrink: budget.Shrink) -> None:
             else "")
          + f" + прочее {shrink.est.compute_gb:.2f})")
     if shrink.cpu_moe and shrink.ctx:
-        note("  n-cpu-moe в RAM = каждый токен считается на CPU: скорость "
-             "упадёт, зато контекст остался прежним")
+        note(t('  n-cpu-moe в RAM = каждый токен считается на CPU: скорость упадёт, зато контекст остался прежним'))
 
 
 def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
@@ -887,28 +883,24 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
     head("автотюн", "10–30 мин и GPU на 100% — это надолго")
     used, total = vram.gpu_used_mib(), vram.gpu_total_mib()
     if total:
-        note(f"VRAM: {used} / {total} MiB "
-             f"(свободно {max(0, total - (used or 0))})")
+        note(t('VRAM: {0} / {1} MiB (свободно {2})', used, total, max(0, total - (used or 0))))
 
     shrink = _shrink_for_tune(pairs, total)
     if shrink is None:
-        warn("посчитать бюджет нечем (нет nvidia-smi или модель не читается) — "
-             "запускаю как есть")
+        warn(t('посчитать бюджет нечем (нет nvidia-smi или модель не читается) — запускаю как есть'))
     else:
         usable = (total - 1024) / 1024.0
         if shrink.fits and (shrink.ctx or shrink.cpu_moe):
-            note(f"пресет не влезает в {usable:.2f} GiB — подбираю параметры, "
-                 "при которых влезет:")
+            note(t('пресет не влезает в {0} GiB — подбираю параметры, при которых влезет:', usable))
             _report_shrink(shrink)
         elif not shrink.fits:
-            warn(f"даже с подбором не влезает: {shrink.est.total_gb:.2f} GiB "
-                 f"против доступных {usable:.2f} GiB")
+            warn(t('даже с подбором не влезает: {0} GiB против доступных {1} GiB', shrink.est.total_gb, usable))
             if shrink.steps:
                 warn(f"  {shrink.steps[-1]}")
             if not ask_yn("всё равно запустить тюн?",
                           sub="вероятно, все прогоны упадут по VRAM. Модель "
                               "крупнее карты — поможет только меньший квант"):
-                note("не запускаю — команды в плане остаются ручными")
+                note(t('не запускаю — команды в плане остаются ручными'))
                 return 1
 
     busy = [m["id"] for m in server.status().get("models", [])
@@ -924,20 +916,16 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
         # не запускаем заведомо неработающую команду: тюнер молча упал бы на
         # usage, а человек — 10-30 минут на то, чтобы увидеть ошибку argparse
         warn("тюнер не знает флагов: " + ", ".join(unknown))
-        note("похоже, тюнер и мастер разошлись во флагах — "
-             "llamastery axes refresh")
+        note(t('похоже, тюнер и мастер разошлись во флагах — llamastery axes refresh'))
         return 1
     rc = _run_cli(*argv)
     if rc:
-        warn(f"тюнер вернул код {rc}")
+        warn(t('тюнер вернул код {0}', rc))
     else:
-        note("пресет не изменён: разбор — в tune-results рядом с models.ini, "
-             "запись — llamastery tune … --deep --apply")
+        note(t('пресет не изменён: разбор — в tune-results рядом с models.ini, запись — llamastery tune … --deep --apply'))
         if shrink is not None and (shrink.ctx != _int(pairs.get("c"))
                                    or shrink.cpu_moe):
-            note(f"подбор шёл на c={shrink.ctx}, n-cpu-moe={shrink.cpu_moe}: "
-                 "эти значения стоит записать в секцию, иначе load вернёт "
-                 "старое и упадёт по VRAM")
+            note(t('подбор шёл на c={0}, n-cpu-moe={1}: эти значения стоит записать в секцию, иначе load вернёт старое и упадёт по VRAM', shrink.ctx, shrink.cpu_moe))
     return rc
 
 
@@ -956,7 +944,7 @@ def _do_swap(action: str, swap_url: str):
         if res["ok"]:
             url = res.get("url") or swap_url
             note("")
-            note("дальше:")
+            note(t('дальше:'))
             for s in swap.next_steps(url):
                 note(s)
             head("быстрая проверка", "первый запрос грузит модель — это минуты")
@@ -970,15 +958,15 @@ def _do_swap(action: str, swap_url: str):
 
 def run() -> int:
     if not sys.stdin.isatty():
-        print("мастер интерактивный — запусти в терминале: llamastery wizard")
+        print(t('мастер интерактивный — запусти в терминале: llamastery wizard'))
         return 2
     if tui.enabled():
         tui.clear()
     print("╔" + "═" * 62 + "╗")
     print("║  llamastery · мастер".ljust(63) + "║")
     print("╚" + "═" * 62 + "╝")
-    print("Проверка пресетов, честный прогноз VRAM, замер факта.")
-    print("Замер важнее расчёта.")
+    print(t('Проверка пресетов, честный прогноз VRAM, замер факта.'))
+    print(t('Замер важнее расчёта.'))
 
     swap_url = swap.load_state().get("url") or f"http://{swap.SWAP_LISTEN}"
     # состояние печатает _main_menu: раньше run() рисовал его сам, а меню
@@ -990,7 +978,7 @@ def run() -> int:
             return rc
         if action == "Только показать состояние":
             print()
-            note("ничего не менял")
+            note(t('ничего не менял'))
             return 0
 
         try:
@@ -998,7 +986,7 @@ def run() -> int:
         except _GoBack:
             # 0 на экране вне Nav (например «какая сборка» внутри swap):
             # в меню — то же самое, что 0 в самом меню
-            note("назад")
+            note(t('назад'))
             continue
         if rc == "menu":             # 0 дошёл до начала — снова меню
             continue
@@ -1022,11 +1010,11 @@ def _main_menu(swap_url: str) -> tuple[int, str | None]:
                       "0 — выход")
     except _GoBack:
         print()
-        note("вышел из мастера")
+        note(t('вышел из мастера'))
         return 0, None
     action = labels[idx]
     if not tui.enabled():
-        print(f"    {ARROW} ответ: {action}")
+        print(t('    {0} ответ: {1}', ARROW, action))
     return 0, action
 
 
@@ -1080,21 +1068,21 @@ def _preset_flow(swap_url: str, preset_build: str | None = None):
     try:
         ini = IniFile.load(str(paths.default_ini()))
     except OSError as exc:
-        warn(f"не читается {paths.default_ini()}: {exc}")
+        warn(t('не читается {0}: {1}', paths.default_ini(), exc))
         return 1
     _report_files(ini)
     nav = Nav()
 
     def pick_build(a: dict):
         if preset_build:
-            note(f"сборка: {preset_build}")
+            note(t('сборка: {0}', preset_build))
             return preset_build
         return _ask_build()
 
     def pick_preset(a: dict):
         opts, sections, default_name = _preset_options(ini)
         if not opts:
-            warn(f"в {ini.path} нет ни одного пресета")
+            warn(t('в {0} нет ни одного пресета', ini.path))
             return None
         return ask_pick(f"Вопрос {qnum()} · какой пресет грузим", opts,
                         sections.index(default_name) + 1 if default_name else 1,
@@ -1135,7 +1123,7 @@ def _setup_flow(swap_url: str):
     try:
         ini = IniFile.load(str(paths.default_ini()))
     except OSError as exc:
-        warn(f"не читается {paths.default_ini()}: {exc}")
+        warn(t('не читается {0}: {1}', paths.default_ini(), exc))
         return 1
 
     nav = Nav()
@@ -1145,7 +1133,7 @@ def _setup_flow(swap_url: str):
 
     def s_swap(a: dict):
         if swap.find_binary():
-            note("llama-swap уже установлен")
+            note(t('llama-swap уже установлен'))
             return "установлен"
         if ask_yn(f"Вопрос {qnum()} · установить llama-swap?",
                   sub="прокси для хот-свапа: один порт, модели меняются полем model"):
@@ -1180,7 +1168,7 @@ def _setup_flow(swap_url: str):
                 continue
             if name:
                 return name
-        warn("слишком много откатов — возвращаюсь на шаг назад")
+        warn(t('слишком много откатов — возвращаюсь на шаг назад'))
         return BACK
 
     def s_tune(a: dict):
@@ -1194,8 +1182,8 @@ def _setup_flow(swap_url: str):
             return "не просил"
         # сам запуск — после плана: там человек один раз решает, можно ли
         # начинать, и к этому моменту известно про mmproj и ускорители
-        note(f"команда: llamastery {' '.join(_tune_argv(a.get('build'), preset, pairs))}")
-        note("запущу после плана — там же спрошу, можно ли начинать")
+        note(t('команда: llamastery {0}', ' '.join(_tune_argv(a.get('build'), preset, pairs))))
+        note(t('запущу после плана — там же спрошу, можно ли начинать'))
         return "да"
 
     def s_ctx(a: dict):
@@ -1212,7 +1200,7 @@ def _setup_flow(swap_url: str):
         sections = [n for n in ini.names() if n != "*"]
         sibling = find_mmproj_sibling(sections, preset)
         if "mmproj" in low:
-            note("зрение: в пресете уже есть mmproj")
+            note(t('зрение: в пресете уже есть mmproj'))
             return "включено"
         if sibling:
             if ask_yn(f"Вопрос {qnum()} · взять близнец с mmproj ({sibling})?",
@@ -1252,7 +1240,7 @@ def _setup_flow(swap_url: str):
 
     preset = res.get("preset")
     if not preset:
-        warn("без пресета план строить не на чем")
+        warn(t('без пресета план строить не на чем'))
         return 1
     # близнец с mmproj мог поменять пресет
     if res.get("vision") and res["vision"] not in ("включено", "текстовый"):
@@ -1276,12 +1264,9 @@ def _setup_flow(swap_url: str):
     for i, st in enumerate(steps, 1):
         print(f"    {i}. llamastery {st}")
     if res.get("ngram") or res.get("mtp"):
-        note(f"ускорители в тесте: ngram="
-             f"{'да' if res.get('ngram') else 'нет'}, "
-             f"mtp={'да' if res.get('mtp') else 'нет'} "
-             f"(флаги — в пресет перед load)")
+        note(t('ускорители в тесте: ngram={0}, mtp={1} (флаги — в пресет перед load)', 'да' if res.get('ngram') else 'нет', 'да' if res.get('mtp') else 'нет'))
     if ctx and ctx != str(pairs.get("c", "")):
-        warn(f"контекст {pairs.get('c')} → {ctx}: сначала правка models.ini")
+        warn(t('контекст {0} → {1}: сначала правка models.ini', pairs.get('c'), ctx))
     print()
     question = ("выполнить автотюн и первые два шага (validate + budget)?"
                 if want_tune else
@@ -1291,7 +1276,7 @@ def _setup_flow(swap_url: str):
                     sub="автотюн — надолго, GPU на 100%" if want_tune else "")
     except _GoBack:
         # последний экран потока: «назад» здесь — это в меню
-        note("ничего не выполнял")
+        note(t('ничего не выполнял'))
         return "menu"
     if go:
         if want_tune:
@@ -1304,6 +1289,5 @@ def _setup_flow(swap_url: str):
             _run_cli("validate", preset, "--build", res["build"])
             _run_cli("budget", preset, "--explain")
     print()
-    note(f"готово. загрузка вручную: "
-         f"llamastery load {preset} --build {res['build']}")
+    note(t('готово. загрузка вручную: llamastery load {0} --build {1}', preset, res['build']))
     return 0
