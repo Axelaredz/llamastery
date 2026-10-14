@@ -17,13 +17,14 @@
 
 import ast
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from . import builds, budget, gguf, measure, paths, presets, server, swap, tui, vram
+from . import builds, budget, gguf, launch, measure, paths, presets, schema, server, swap, tui, vram
 from .i18n import t
 
 STAR = "★"
@@ -377,7 +378,8 @@ CUSTOM_MODEL = "▸ свой .gguf — указать путь"
 # ключи, которые указывают на ФАЙЛЫ чужой модели: переносить их в новую
 # секцию нельзя, иначе validate поймает путь, а load — несовместимость
 _PATH_KEYS = ("model", "m", "hf-repo", "hf-file", "mmproj", "model-draft",
-              "mmproj-offload", "image-min-tokens")
+              "mmproj-offload", "image-min-tokens", "model-url", "hf-repo-draft",
+              "hf-file-draft", "chat-template-file", "lora", "lora-scaled")
 
 
 def _int(val) -> int:
@@ -410,6 +412,7 @@ def pairs_for_custom_model(base: dict, path: str, meta=None,
     по метаданным: контекст — по обученному окну, n-cpu-moe — по числу
     слоёв и только для MoE.
     """
+    base = launch.normalize(base, {})
     low = {k.lower(): v for k, v in base.items()}
     out = {"model": path}
     if mmproj:
@@ -423,6 +426,7 @@ def pairs_for_custom_model(base: dict, path: str, meta=None,
         out[k] = v
     if meta is None:
         return out
+    out.setdefault("c", str(min(meta.n_ctx_trained or 8192, 8192)))
 
     c = _int(out.get("c") or out.get("ctx-size"))
     if c and meta.n_ctx_trained and c > meta.n_ctx_trained:
@@ -435,6 +439,13 @@ def pairs_for_custom_model(base: dict, path: str, meta=None,
         ncpu = _int(out.get("n-cpu-moe"))
         if ncpu and meta.n_layer and ncpu > meta.n_layer:
             out["n-cpu-moe"] = str(meta.n_layer)
+    if meta.is_moe:
+        out.pop("n-cpu-ffn", None)
+    else:
+        nffn = _int(out.get("n-cpu-ffn"))
+        if meta.n_layer and nffn > meta.n_layer:
+            out["n-cpu-ffn"] = str(meta.n_layer)
+        out.pop("moe-cache-mib", None)
     # драфт-головы из базы мы не перенесли, поэтому внешний MTP не запустится:
     # ускоритель оставляем тот, что работает на любой модели
     if "draft" in str(out.get("spec-type", "")) and not meta.n_layer_nextn:
@@ -569,6 +580,10 @@ def measurement_of(pairs: dict, records: dict) -> dict | None:
             "runs": rec.get("runs", 0)}
 
 
+def _effective_pairs(ini, name):
+    return launch.effective_pairs(ini, name)
+
+
 def _preset_options(
         ini, custom: bool = False
 ) -> tuple[list[tuple[str, str]], list[str], str | None]:
@@ -604,7 +619,7 @@ def _preset_options(
     return opts, sections, default_name
 
 
-def _custom_preset(ini, prefilled: str | None = None) -> str | None:
+def _custom_preset(ini, prefilled: str | None = None, build: str | None = None) -> str | None:
     """Пункт «свой .gguf»: путь → чьи флаги → новая секция в models.ini.
 
     prefilled — путь, вставленный прямо в вопрос со списком пресетов: тогда
@@ -627,8 +642,8 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
         if not raw:
             note(t('путь не задан — возвращаюсь к списку пресетов'))
             return None
-    path = Path(raw).expanduser()
-    if not path.exists():
+    path = Path(raw.strip().strip("\"'")).expanduser().resolve()
+    if not path.is_file():
         warn(t('нет файла: {0}', path))
         return None
     try:
@@ -638,24 +653,50 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
         return None
     note(t('на диске: {0}', meta.summary()))
 
+    binary, _ = builds.resolve_binary(build)
+    flags, _ = schema.load(binary) if binary else ({}, {})
     opts, sections, default_name = _preset_options(ini)
-    if opts:
-        base = ask_pick(f"Вопрос {qnum()} · чьи флаги берём", opts,
-                        sections.index(default_name) + 1 if default_name else 1,
-                        sub="файловые ключи (model, mmproj, драфт) не копируются — "
-                            "они указывают на чужой файл")
-        base_pairs = ini.section(base).pairs()
-    else:
-        warn(t('в ini нет ни одного пресета — беру только глобальные [*]'))
-        base_pairs = ini.globals()
+    clean = "Без копирования чужого пресета"
+    base = ask_pick(f"Вопрос {qnum()} · чьи флаги берём",
+                    opts + [(clean, "только глобальные [*] и безопасный контекст")],
+                    len(opts) + 1,
+                    sub="копирование чужих настроек — только осознанно; "
+                        "ниже можно добавить флаги этой модели")
+    base_pairs = (ini.section(base).pairs() if base != clean else {})
+    base_pairs = launch.normalize(base_pairs, flags)
 
     mmproj = gguf.find_mmproj_near(path)
     if mmproj:
         note(t('рядом нашёлся mmproj: {0}', Path(mmproj).name))
+        if not ask_yn("использовать этот mmproj?",
+                      sub="соседний файл может быть от другой модели; Enter — без зрения"):
+            mmproj = None
     else:
         note(t('mmproj рядом не найден — зрения в этой секции не будет'))
 
     pairs = pairs_for_custom_model(base_pairs, str(path), meta, mmproj)
+    # Display inherited flags as well: the router and tuner both use [*].
+    note("флаги новой модели (включая [*]):")
+    for k, v in {**{k: v for k, v in ini.globals().items() if k != "version"},
+                 **pairs}.items():
+        note(f"  {k} = {v}")
+    for _ in range(MAX_SUBSTEP):
+        text = ask_text(f"Вопрос {qnum()} · дополнительные флаги llama-server", "",
+                        sub="например: --chat-template-file '/path/template.jinja' "
+                            "--rope-scaling yarn; Enter — без изменений; "
+                            "это НЕ параметры тюнера --extra")
+        try:
+            overrides = launch.parse_cli(text, flags)
+        except ValueError as exc:
+            warn(str(exc))
+            continue
+        pairs.update(launch.normalize(overrides, flags))
+        break
+    else:
+        return None
+    # Confirm the exact section, not just its key count.
+    for k, v in pairs.items():
+        note(f"  {k} = {v}")
     name = section_name_for(str(path), [n for n in ini.names() if n != "*"])
     note("")
     note(t('новая секция [{0}]: {1} ключей, c={2}, n-cpu-moe={3}', name, len(pairs), pairs.get('c', '?'), pairs.get('n-cpu-moe', '-')))
@@ -672,7 +713,7 @@ def _custom_preset(ini, prefilled: str | None = None) -> str | None:
         # первая строка получает пояснение, откуда взялась секция
         sec.add(k, v, comment=(f"создано мастером из {path.name}\n"
                               + (f"флаги скопированы из [{base}]"
-                                 if opts else "флаги — из [*]")
+                                 if base != clean else "без копирования пресета")
                               ) if i == 0 else None)
     ini.save()
     note(f"записано: {ini.path}"
@@ -760,28 +801,26 @@ def _tune_argv(build: str | None, preset: str, pairs: dict,
     if build:
         argv += ["--build", build]
 
+    pairs = launch.normalize(pairs, {})
     cur = _int(pairs.get("c"))
+    extra = []
+    if pairs.get("mmproj"):
+        extra.append("keep-mmproj")
+    if pairs.get("ot"):
+        extra.append("allow-ot")
+    if pairs.get("spec-type", "none") not in ("", "none"):
+        extra.append("with-spec")
     if shrink is not None:
-        # формат именно k=v: cmd_tune превращает «k=v» в «--k v», а
-        # отдельное значение без «=» стало бы флагом «--16384»
-        extra = []
         if shrink.ctx and shrink.ctx != cur:
             extra.append(f"search-ctx={shrink.ctx}")
         if shrink.cpu_moe:
-            # верх серии — максимум между подобранным и ТЕКУЩИМ n-cpu-moe
-            # пресета (заведомо рабочая точка), а не контекстом: `c` к числу
-            # слоёв отношения не имеет
             cur_moe = _int(pairs.get("n-cpu-moe")) or 0
             top = (max(shrink.cpu_moe + 1, min(shrink.n_layer - 1, cur_moe))
                    if shrink.n_layer else 0)
             extra.append(f"moe-values={_moe_series(shrink.cpu_moe, top)}")
-        if not extra:
-            return argv
-        return argv + ["--extra", *extra]
-
-    if cur > TUNE_SEARCH_CTX:
-        return argv + ["--extra", f"search-ctx={TUNE_SEARCH_CTX}"]
-    return argv
+    elif cur > TUNE_SEARCH_CTX:
+        extra.append(f"search-ctx={TUNE_SEARCH_CTX}")
+    return argv + (["--extra", *extra] if extra else [])
 
 
 def _moe_series(start: int, top: int) -> str:
@@ -903,13 +942,6 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
                 note(t('не запускаю — команды в плане остаются ручными'))
                 return 1
 
-    busy = [m["id"] for m in server.status().get("models", [])
-            if m.get("status") in ("loaded", "sleeping", "loading")]
-    if busy:
-        warn("в VRAM сидит: " + ", ".join(busy))
-        if ask_yn("выгрузить перед автотюном?",
-                  sub="иначе тюнеру не хватит памяти и прогоны упадут"):
-            _run_cli("runtime", "unload")
     argv = _tune_argv(build, preset, pairs, shrink)
     unknown = _tune_unknown_keys(argv)
     if unknown:
@@ -918,12 +950,26 @@ def _run_tune(build: str | None, preset: str, pairs: dict) -> int:
         warn("тюнер не знает флагов: " + ", ".join(unknown))
         note(t('похоже, тюнер и мастер разошлись во флагах — llamastery axes refresh'))
         return 1
+
+    busy = [m["id"] for m in server.status().get("models", [])
+            if m.get("status") in ("loaded", "sleeping", "loading")]
+    if busy:
+        warn("в VRAM сидит: " + ", ".join(busy))
+        if ask_yn("выгрузить перед автотюном?",
+                  sub="иначе тюнеру не хватит памяти и прогоны упадут"):
+            rc = _run_cli("runtime", "unload")
+            if rc:
+                warn("выгрузка не удалась — автотюн остановлен")
+                return rc
+        else:
+            note("автотюн отменён: модели остались в VRAM")
+            return 1
     rc = _run_cli(*argv)
     if rc:
         warn(t('тюнер вернул код {0}', rc))
     else:
-        note(t('пресет не изменён: разбор — в tune-results рядом с models.ini, запись — llamastery tune … --deep --apply'))
-        if shrink is not None and (shrink.ctx != _int(pairs.get("c"))
+        note('результаты подбора не записаны в пресет: разбор — в tune-results рядом с models.ini; запись — llamastery tune <ini> <секция> --extra deep apply')
+        if shrink is not None and ((shrink.ctx and shrink.ctx != _int(pairs.get("c")))
                                    or shrink.cpu_moe):
             note(t('подбор шёл на c={0}, n-cpu-moe={1}: эти значения стоит записать в секцию, иначе load вернёт старое и упадёт по VRAM', shrink.ctx, shrink.cpu_moe))
     return rc
@@ -1122,6 +1168,8 @@ def _setup_flow(swap_url: str):
     from .inifile import IniFile
     try:
         ini = IniFile.load(str(paths.default_ini()))
+    except FileNotFoundError:
+        ini = IniFile(paths.default_ini(), "")
     except OSError as exc:
         warn(t('не читается {0}: {1}', paths.default_ini(), exc))
         return 1
@@ -1163,7 +1211,7 @@ def _setup_flow(swap_url: str):
             if choice != CUSTOM_MODEL:
                 return choice
             try:
-                name = _custom_preset(ini, pasted)
+                name = _custom_preset(ini, pasted, a.get("build"))
             except _GoBack:
                 continue
             if name:
@@ -1175,28 +1223,33 @@ def _setup_flow(swap_url: str):
         preset = a.get("preset")
         if not preset:
             return None
-        pairs = ini.section(preset).pairs()
+        pairs = _effective_pairs(ini, preset)
         if not ask_yn(f"Вопрос {qnum()} · прогнать автотюн этого пресета?",
                       sub="долго (10–30 мин) и грузит GPU на 100% — "
                           "только явным «д», Enter ничего не запустит"):
             return "не просил"
         # сам запуск — после плана: там человек один раз решает, можно ли
         # начинать, и к этому моменту известно про mmproj и ускорители
-        note(t('команда: llamastery {0}', ' '.join(_tune_argv(a.get('build'), preset, pairs))))
+        note(t('команда: llamastery {0}', shlex.join(_tune_argv(a.get('build'), preset, pairs))))
         note(t('запущу после плана — там же спрошу, можно ли начинать'))
         return "да"
 
     def s_ctx(a: dict):
         preset = a.get("preset")
-        cur = ini.section(preset).pairs().get("c", "?") if preset else "?"
-        return ask_text(f"Вопрос {qnum()} · контекст", str(cur),
-                        sub="больше контекст = больше KV = больше VRAM")
+        cur = _effective_pairs(ini, preset).get("c", "8192") if preset else "8192"
+        for _ in range(MAX_SUBSTEP):
+            value = ask_text(f"Вопрос {qnum()} · контекст", str(cur),
+                             sub="целое число 4096..262144; больше KV = больше VRAM")
+            if value.isdigit() and 4096 <= int(value) <= 262144:
+                return str(int(value))
+            warn("контекст должен быть целым числом 4096..262144")
+        return BACK
 
     def s_vision(a: dict):
         preset = a.get("preset")
         if not preset:
             return None
-        low = {k.lower() for k in ini.section(preset).pairs()}
+        low = {k.lower() for k in _effective_pairs(ini, preset)}
         sections = [n for n in ini.names() if n != "*"]
         sibling = find_mmproj_sibling(sections, preset)
         if "mmproj" in low:
@@ -1213,14 +1266,14 @@ def _setup_flow(swap_url: str):
 
     def s_ngram(a: dict):
         preset = a.get("preset") or ""
-        pairs = ini.section(preset).pairs() if preset else {}
+        pairs = _effective_pairs(ini, preset) if preset else {}
         return ask_yn(f"Вопрос {qnum()} · тестить с ngram (спекулятивный декодер)?",
                       ngram_default(pairs),
                       sub="×3–4 на повторяющемся тексте, но медленнее на уникальном")
 
     def s_mtp(a: dict):
         preset = a.get("preset") or ""
-        pairs = ini.section(preset).pairs() if preset else {}
+        pairs = _effective_pairs(ini, preset) if preset else {}
         return ask_yn(f"Вопрос {qnum()} · тестить с MTP (черновая голова)?",
                       mtp_default(preset, pairs))
 
@@ -1246,8 +1299,19 @@ def _setup_flow(swap_url: str):
     if res.get("vision") and res["vision"] not in ("включено", "текстовый"):
         preset = res["vision"]
     ctx = res.get("ctx")
-    pairs = ini.section(preset).pairs()
+    pairs = _effective_pairs(ini, preset)
     want_tune = res.get("tune") == "да"
+    updates = {}
+    if ctx and ctx != pairs.get("c"):
+        updates["c"] = ctx
+    if want_tune:
+        spec = ("draft-mtp" if res.get("mtp") else
+                "ngram-mod" if res.get("ngram") else "none")
+        if spec != pairs.get("spec-type", "none"):
+            updates["spec-type"] = spec
+        if res.get("mtp") and res.get("ngram"):
+            note("выбраны оба ускорителя: для этого прогона используем MTP")
+    pairs.update(updates)
 
     head("план", "выполняется по порядку, каждый шаг можно пропустить")
     steps = [f"validate {preset} --build {res['build']}",
@@ -1255,7 +1319,7 @@ def _setup_flow(swap_url: str):
     if want_tune:
         # раньше тюн стоял первым, а выполнялся бы после проверок — список
         # должен совпадать с тем, что реально происходит
-        steps.append(" ".join(_tune_argv(res["build"], preset, pairs)))
+        steps.append(shlex.join(_tune_argv(res["build"], preset, pairs)))
     steps += [f"load {preset} --build {res['build']}",
               f"measure --swap-url {swap_url} {preset}",
               f"probe --tokens 110000 --from-file <реальный-код> --record "
@@ -1265,29 +1329,45 @@ def _setup_flow(swap_url: str):
         print(f"    {i}. llamastery {st}")
     if res.get("ngram") or res.get("mtp"):
         note(t('ускорители в тесте: ngram={0}, mtp={1} (флаги — в пресет перед load)', 'да' if res.get('ngram') else 'нет', 'да' if res.get('mtp') else 'нет'))
-    if ctx and ctx != str(pairs.get("c", "")):
-        warn(t('контекст {0} → {1}: сначала правка models.ini', pairs.get('c'), ctx))
+    if updates:
+        note("после подтверждения запишу в пресет с резервной копией: "
+             + ", ".join(f"{k}={v}" for k, v in updates.items()))
     print()
     question = ("выполнить автотюн и первые два шага (validate + budget)?"
                 if want_tune else
-                "выполнить первые два шага (validate + budget, безопасно)?")
+                "выполнить первые два шага (validate + budget)?")
     try:
         go = ask_yn(question,
-                    sub="автотюн — надолго, GPU на 100%" if want_tune else "")
+                    sub=("изменения выше будут записаны в models.ini с резервной копией. "
+                         if updates else "") +
+                        ("автотюн — надолго, GPU на 100%" if want_tune else ""))
     except _GoBack:
         # последний экран потока: «назад» здесь — это в меню
         note(t('ничего не выполнял'))
         return "menu"
     if go:
+        if updates:
+            presets.backup(ini.path)
+            sec = ini.section(preset)
+            for key, value in updates.items():
+                # Remove all aliases/duplicates of this setting first, otherwise
+                # the old long spelling may override the new short one.
+                sec.entries = [e for e in sec.entries
+                               if e.key is None or launch.option_key(e.key, {}) != key]
+                sec.add(key, value)
+            ini.save()
+        # Never spend 30 minutes after a failed preflight, nor report a failed
+        # tuner as success. Budget warnings are errors returned by the CLI too.
+        for command in (("validate", preset, "--build", res["build"]),
+                        ("budget", preset, "--explain")):
+            rc = _run_cli(*command)
+            if rc:
+                warn(f"{command[0]} вернул код {rc} — дальнейшие шаги остановлены")
+                return rc
         if want_tune:
-            # тюнеру память нужнее, чем проверке: сначала validate и budget
-            # (быстро), и только потом прогон на 10–30 минут
-            _run_cli("validate", preset, "--build", res["build"])
-            _run_cli("budget", preset, "--explain")
-            _run_tune(res["build"], preset, pairs)
-        else:
-            _run_cli("validate", preset, "--build", res["build"])
-            _run_cli("budget", preset, "--explain")
+            rc = _run_tune(res["build"], preset, pairs)
+            if rc:
+                return rc
     print()
     note(t('готово. загрузка вручную: llamastery load {0} --build {1}', preset, res['build']))
     return 0

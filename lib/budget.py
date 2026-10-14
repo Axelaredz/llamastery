@@ -69,11 +69,12 @@ class Estimate:
     model: str = ""
     notes: list[str] = field(default_factory=list)
     measured_min_free_mib: int | None = None
+    moe_cache_gb: float = 0.0
 
     def as_dict(self) -> dict:
         d = {k: v for k, v in self.__dict__.items()}
         d["total_gb"] = round(self.total_gb, 2)
-        for k in ("weights_gb", "kv_gb", "mmproj_gb", "compute_gb"):
+        for k in ("weights_gb", "kv_gb", "mmproj_gb", "moe_cache_gb", "compute_gb"):
             d[k] = round(d[k], 2)
         return d
 
@@ -373,7 +374,11 @@ def estimate(pairs: dict[str, str], meta: ModelMeta | None,
             est.mmproj_gb = mmproj_meta.size_bytes / GIB
 
     est.compute_gb = compute_gb
-    est.total_gb = est.weights_gb + est.kv_gb + est.mmproj_gb + est.compute_gb
+    est.moe_cache_gb = max(0, _get_int(low, "moe-cache-mib", default=0)) / 1024.0
+    if est.moe_cache_gb:
+        est.notes.append(f"MoE GPU cache: дополнительно до {est.moe_cache_gb:.2f} GiB; "
+                         "при нескольких GPU бюджет разделяется между ними")
+    est.total_gb = est.weights_gb + est.kv_gb + est.mmproj_gb + est.compute_gb + est.moe_cache_gb
     est.notes.append(
         f"compute buffer {compute_gb:.2f} GiB — подогнанная константа, "
         f"а не расчёт (см. llamastery budget calibrate)")
