@@ -1,0 +1,25 @@
+# Curated help declarations from ggml-org/llama.cpp common/arg.cpp
+# fcac19079f3f2985fe74ed845f0880e7e9a8030a (2026-10-14 review).
+# This is a test fixture, not the output of a locally built binary.
+-m, --model FNAME                        model
+-c, --ctx-size N                         context
+-ngl, --gpu-layers, --n-gpu-layers N      GPU layers
+-ncmoe, --n-cpu-moe N                    MoE experts in CPU
+--moe-cache-mib N                        GPU cache for CPU MoE experts (env: LLAMA_ARG_MOE_CACHE_MIB)
+-ncffn, --n-cpu-ffn N                    dense FFN in CPU
+-b, --batch-size N                      logical batch
+-ub, --ubatch-size N                    physical batch
+-t, --threads N                         decode threads
+-tb, --threads-batch N                   prefill threads
+-ctk, --cache-type-k TYPE                K cache
+-ctv, --cache-type-v TYPE                V cache
+-fa, --flash-attn [on|off|auto]          flash attention
+--op-offload, --no-op-offload            offload host operations
+--repack, -nr, --no-repack                CPU weight repacking
+-bs, --backend-sampling                  experimental backend sampling
+-fit, --fit [on|off]                     fit to device memory
+-kvu, --kv-unified, -no-kvu, --no-kv-unified  KV sharing
+-np, --parallel N                       slots
+--jinja                                 templates
+--host HOST                             listen host
+--port PORT                             listen port

@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib import (axes, budget, builds, crashes, gguf, i18n, measure, paths,  # noqa: E402
+from lib import (axes, budget, builds, crashes, gguf, i18n, launch, measure, paths,  # noqa: E402
                  presets, runtime, schema, server, swap, validate, wizard)
 from lib.i18n import t  # noqa: E402
 from lib.inifile import IniFile  # noqa: E402
@@ -674,7 +674,7 @@ def cmd_validate(args) -> int:
         sec = ini.section(name)
         if not sec:
             continue
-        pairs = sec.pairs()
+        pairs = launch.effective_pairs(ini, name, flags)
         meta_hit = validate.validate_section(name, pairs, flags, rep,
                                              check_paths=not args.no_paths,
                                              model_cache=cache)
@@ -722,7 +722,7 @@ def cmd_budget(args) -> int:
         sec = ini.section(name)
         if not sec:
             continue
-        pairs = sec.pairs()
+        pairs = launch.effective_pairs(ini, name)
         model = pairs.get("model") or pairs.get("m") or ""
         meta = None
         mp = pairs.get("mmproj")
@@ -756,7 +756,7 @@ def cmd_budget(args) -> int:
             tg = meas.get("deep_tps") or meas.get("short_tps") or ""
             tg = f"{tg:.0f} t/s" if isinstance(tg, (int, float)) else ""
         print(f"{name[:43]:<44} {est.weights_gb:8.2f}G {est.kv_gb:7.2f}G "
-              f"{est.mmproj_gb:6.2f}G {est.compute_gb:7.2f}G {est.total_gb:8.2f}G {tg:>9}")
+              f"{est.mmproj_gb:6.2f}G {est.compute_gb + est.moe_cache_gb:7.2f}G {est.total_gb:8.2f}G {tg:>9}")
 
     # прогноз против --models-max
     budget_mib = vram or int(cal.get("vram_total_mib", 0) or 0)
@@ -1182,8 +1182,9 @@ def cmd_tune(args) -> int:
     if not binary:
         print(t('не найден llama-server; укажи --build'), file=sys.stderr)
         return 1
-    cmd = [sys.executable, str(tuner), args.ini, args.section,
-           "--server", str(binary)]
+    ini_path = Path(args.ini).expanduser().resolve()
+    cmd = [sys.executable, str(tuner), str(ini_path), args.section,
+           "--server", str(binary.resolve())]
     for item in args.extra:
         if "=" in item:
             k, v = item.split("=", 1)
@@ -1192,11 +1193,13 @@ def cmd_tune(args) -> int:
             cmd.append(f"--{item.lstrip('-')}")
     # артефакты прогона (tune-results/) должны ложиться рядом с пресетом,
     # а не в каталог, откуда запущен скилл
-    run_dir = Path(args.ini).expanduser().parent
+    run_dir = ini_path.parent
     print(t('запуск:'), " ".join(cmd), file=sys.stderr)
     print(t('рабочий каталог: {0}', run_dir), file=sys.stderr)
     try:
-        return subprocess.call(cmd, cwd=str(run_dir))
+        build = builds.get(src)
+        env = server.build_env(build) if build else None
+        return subprocess.call(cmd, cwd=str(run_dir), env=env)
     except OSError as exc:
         print(t('не удалось запустить тюнер: {0}', exc), file=sys.stderr)
         return 1

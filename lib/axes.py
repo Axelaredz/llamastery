@@ -113,6 +113,38 @@ AXES = [
         "why": "логический батч: осмыслен только больше ubatch; в новых "
                "сборках n_batch клампится в n_ubatch",
     },
+    {
+        "key": "moe_cache", "flag": "--moe-cache-mib", "probe": "moe-cache",
+        "values": "int", "gain": 4, "stage": "server",
+        "why": "GPU-кэш CPU MoE-экспертов (upstream #29887, #30112): "
+               "обмен VRAM на меньший PCIe/CPU overhead; только для MoE с offload",
+    },
+    {
+        "key": "threads_batch", "flag": "--threads-batch", "alias": ["-tb"],
+        "probe": "threads-batch", "values": "int", "gain": 3,
+        "why": "потоки префилла отдельно от потоков декодинга",
+    },
+    {
+        "key": "cpu_ffn", "flag": "--n-cpu-ffn", "alias": ["-ncffn"],
+        "probe": "cpu-ffn", "values": "int", "gain": 4, "stage": "server",
+        "why": "offload dense FFN в RAM: явный список, только для плотных моделей",
+    },
+    {
+        "key": "op_offload", "flag": "--op-offload", "alias": ["--no-op-offload"],
+        "probe": "op-offload", "values": "enum:on,off", "gain": 2,
+        "why": "операции над host-тензорами на GPU или CPU; полезно при CPU offload",
+    },
+    {
+        "key": "repack", "flag": "--repack", "alias": ["--no-repack"],
+        "probe": "repack", "values": "enum:on,off", "gain": 2,
+        "why": "переупаковка CPU-весов; явный A/B, требует перезагрузки модели",
+    },
+    {
+        "key": "backend_sampling", "flag": "--backend-sampling", "alias": ["-bs"],
+        "probe": "backend-sampling", "values": "enum:off,on", "gain": 2,
+        "stage": "server",
+        "why": "экспериментальный sampling на backend; только по явному запросу",
+    },
 ]
 
 BY_KEY = {a["key"]: a for a in AXES}
@@ -307,6 +339,12 @@ CONFIG_KEY = {
     "threads": ("t", "threads"),
     "b": ("b", "batch-size"),
     "spec": ("spec-type",),
+    "moe_cache": ("moe-cache-mib",),
+    "cpu_ffn": ("n-cpu-ffn",),
+    "threads_batch": ("threads-batch",),
+    "op_offload": ("op-offload",),
+    "repack": ("repack",),
+    "backend_sampling": ("backend-sampling",),
 }
 
 
@@ -314,6 +352,9 @@ def _axis_values(cfg: dict) -> dict:
     """Значения осей в прогоне — по одному на ось."""
     out = {}
     for key, names in CONFIG_KEY.items():
+        if key == "kv_cache_type" and any(n in cfg for n in names):
+            out[key] = json.dumps([cfg.get("cache-type-k"), cfg.get("cache-type-v")])
+            continue
         val = next((str(cfg[n]) for n in names if n in cfg), None)
         if val is not None:
             out[key] = val
@@ -369,7 +410,10 @@ def learn(min_pairs: int = 2) -> dict:
         vram = r.get("min_observed_free_mib")
         if tps is None and vram is None:
             continue
-        runs.append({"axes": _axis_values(cfg),
+        axis_names = {n for names in CONFIG_KEY.values() for n in names}
+        identity = {k: v for k, v in cfg.items() if k not in axis_names}
+        identity["binary_fingerprint"] = r.get("binary_fingerprint")
+        runs.append({"identity": identity, "axes": _axis_values(cfg),
                      "tps": float(tps) if tps else None,
                      "vram": float(vram) if vram else None})
 
@@ -378,6 +422,8 @@ def learn(min_pairs: int = 2) -> dict:
         tp, vp, vals = [], [], set()
         for i, a in enumerate(runs):
             for b in runs[i + 1:]:
+                if a["identity"] != b["identity"]:
+                    continue
                 diff = [k for k in set(a["axes"]) | set(b["axes"])
                         if a["axes"].get(k) != b["axes"].get(k)]
                 if diff != [key]:

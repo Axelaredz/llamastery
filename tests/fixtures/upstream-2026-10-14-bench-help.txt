@@ -1,0 +1,19 @@
+# Curated print_usage declarations from tools/llama-bench/llama-bench.cpp
+# fcac19079f3f2985fe74ed845f0880e7e9a8030a. Only declarations actually
+# present in upstream bench are listed here.
+-fitt, --fit-target <MiB>                 fit margin (default: off)
+-fitc, --fit-ctx <n>                      minimum fit context (default: 0)
+-m, --model <filename>                   model
+-p, --n-prompt <n>                       prompt tokens
+-n, --n-gen <n>                          generated tokens
+-d, --n-depth <n>                        context depth
+-b, --batch-size <n>                     logical batch
+-ub, --ubatch-size <n>                   physical batch
+-ctk, --cache-type-k <t>                 K cache
+-ctv, --cache-type-v <t>                 V cache
+-t, --threads <n>                        threads
+-ngl, --n-gpu-layers <n>                 GPU layers
+-ncmoe, --n-cpu-moe <n>                  MoE in CPU
+-fa, --flash-attn <on|off|auto>           FA
+-nopo, --no-op-offload <0|1>             offload operations
+--repack <0|1>                           repacking

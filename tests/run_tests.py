@@ -486,6 +486,7 @@ def test_tuner_passthrough():
     kinds = {"--spec-type": "string", "--model-draft": "string",
              "--fit": "enum", "--spec-ngram-mod-n-max": "int"}
     orig = mod._flag_kinds
+    mod._SCHEMA_CACHE["/bin/true"] = {}
     mod._flag_kinds = lambda binary: kinds
     opts = {"model": "/m.gguf", "c": "114688", "n-gpu-layers": "99",
             "n-cpu-moe": "24", "b": "2048", "ubatch-size": "1024", "t": "8",
@@ -1376,7 +1377,7 @@ def test_tune_axes_skip_current_and_dedup() -> None:
           "текущее n-cpu-moe не проверяется заново",
           [c["moe"] for c in moe_axis])
     fa_axis = [c for c in cands if c["_axis"] == "fa"]
-    check(fa_axis and all(c["fa"] != base["fa"] for c in fa_axis),
+    check(all(c["fa"] != base["fa"] for c in fa_axis),
           "текущее fa не проверяется заново", [c["fa"] for c in fa_axis])
     ub_axis = [c for c in cands if c["_axis"] == "ubatch"]
     check(ub_axis and all(c["ubatch"] != base["ubatch"] for c in ub_axis),
@@ -1686,7 +1687,7 @@ def test_wizard_custom_gguf_preset(tmp: Path) -> None:
     ini_path = tmp / "models.ini"
     ini_path.write_text(CUSTOM_INI, encoding="utf-8")
     ini = inifile.IniFile(ini_path, CUSTOM_INI)
-    answers = iter([str(model), "1", "y"])   # путь, чьи флаги, дописать
+    answers = iter([str(model), "1", "y", "", "y"])   # путь, чьи флаги, дописать
     orig_read = wizard._read
     wizard._read = lambda prompt: next(answers)
     try:
@@ -1716,7 +1717,7 @@ def test_wizard_custom_gguf_preset(tmp: Path) -> None:
 
     # ── отказ не оставляет мусора ──
     ini2 = inifile.IniFile(ini_path, CUSTOM_INI)
-    answers2 = iter([str(model), "1", "n"])
+    answers2 = iter([str(model), "1", "n", "", "n"])
     wizard._read = lambda prompt: next(answers2)
     try:
         rc = wizard._custom_preset(ini2)
@@ -2056,7 +2057,8 @@ def test_wizard_pasted_path_is_not_a_number(tmp: Path) -> None:
 # Ответы: сборка, вставленный путь, чьи флаги, дописать, тюн, контекст,
 # ngram, mtp, финал
     model = _write_fake_gguf(tmp / "Pasted Model.gguf")
-    env, calls = _wizard_env(tmp, ["1", str(model), "1", "y", "n", "", "n",
+    (tmp / "mmproj-Q8_0.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+    env, calls = _wizard_env(tmp, ["1", str(model), "1", "y", "", "y", "n", "", "n",
                                    "n", "n"])
     with env:
         rc = wizard._setup_flow("http://127.0.0.1:8087")
@@ -2935,6 +2937,453 @@ def test_audit_fixes_2026_10_13():
         check(T.port_is_busy(free) is False, "свободный порт виден как свободный")
     finally:
         probe.close()
+
+
+
+
+CUSTOM_LAUNCH_HELP = """
+-m, --model FNAME                        model path
+-c, --ctx-size N                         context (env: LLAMA_ARG_CTX_SIZE)
+-C, --cpu-mask MASK                      CPU mask
+-ngl, --n-gpu-layers N                    layers
+-b, --batch-size N                       batch
+-ub, --ubatch-size N                     micro batch
+--model-draft FNAME                      draft path
+--chat-template-file FNAME               template path
+-rs, --rope-scaling TYPE                 scaling
+--rope-freq-scale N                      scale
+--custom-mode VALUE                      fork-specific mode
+--override-kv KEY=TYPE:VALUE              override metadata
+--custom-switch, --no-custom-switch      optional feature
+--spec-type TYPE                         speculative mode
+--port N                                server port
+"""
+
+
+def test_launch_custom_flags(tmp: Path) -> None:
+    from lib import launch
+    switches = schema.parse_help(
+        "-kvu, --kv-unified, -no-kvu, --no-kv-unified  KV sharing\n"
+        "-ot, --override-tensor <pattern>=<buffer>   tensor placement\n")
+    parsed = launch.parse_cli('-ot "blk.*=CPU" -no-kvu', switches)
+    check(launch.normalize(parsed, switches) == {"ot": "blk.*=CPU", "kv-unified": "false"},
+          "short negative alias and compound placeholder survive help parsing")
+    flags = schema.parse_help(CUSTOM_LAUNCH_HELP)
+    template = tmp / "template with spaces.jinja"
+    opts = launch.parse_cli(
+        f"--chat-template-file '{template}' -rs yarn --custom-mode=a=b "
+        "--rope-freq-scale -1 --no-custom-switch -c 8192 -C 0xff", flags)
+    override = launch.parse_cli("--override-kv model.key=int:42", flags)
+    check(launch.flag_argv("override-kv", override["override-kv"], flags)
+          == ["--override-kv", "model.key=int:42"], "complex help placeholder takes a value")
+    check(opts["chat-template-file"] == str(template), "CLI: quoted path stays one value")
+    check(opts["custom-mode"] == "a=b" and opts["rope-freq-scale"] == "-1",
+          "CLI: equals and negative numbers preserved")
+    check(opts["c"] == "8192" and opts["cpu-mask"] == "0xff",
+          "CLI: case-sensitive short aliases preserved")
+    check(launch.flag_argv("no-custom-switch", "true", flags) == ["--no-custom-switch"],
+          "negative switch is not inverted")
+    check(launch.flag_argv("custom-switch", "false", flags) == ["--no-custom-switch"],
+          "false emits the negative switch")
+    for text in ("--typo 1", "--custom-mode", "--port 9000", "--model x.gguf",
+                 "--custom-mode='unclosed", "--custom-mode 'a # comment'",
+                 "--custom-mode a --custom-mode b", "--rope-freq-scale nope"):
+        try:
+            launch.parse_cli(text, flags)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, f"invalid launch arguments rejected: {text}")
+    dense = gguf.probe(_write_fake_gguf(tmp / "alias-dense.gguf", moe=False))
+    pairs = wizard.pairs_for_custom_model(
+        {"ctx-size": "999999", "ncmoe": "8", "chat-template-file": "/other.jinja"},
+        "/new.gguf", dense)
+    check(pairs["c"] == str(dense.n_ctx_trained) and "ctx-size" not in pairs,
+          "custom model: context alias clamped without competing keys")
+    check("n-cpu-moe" not in pairs and "chat-template-file" not in pairs,
+          "dense model does not inherit MoE or foreign template")
+
+
+def test_tuner_custom_schema_and_globals(tmp: Path) -> None:
+    import argparse
+    m = _tune_module()
+    flags = schema.parse_help(CUSTOM_LAUNCH_HELP)
+    m._SCHEMA_CACHE["custom-server"] = flags
+    ini = tmp / "custom-tune.ini"
+    ini.write_text("""; leading global supported by wizard
+version = 1
+custom-mode = global
+[*]
+ctx-size = 16384
+n-gpu-layers = 12
+[MyModel]
+m = /test.gguf
+LLAMA_ARG_CTX_SIZE = 8192 ; inline comment
+C = 0xff
+custom-mode = a=b
+rope-scaling = yarn
+no-custom-switch = true
+""", encoding="utf-8")
+    opts = m.read_tune_options(ini, "mymodel", flags)
+    check(opts["c"] == "8192" and opts["n-gpu-layers"] == "12",
+          "tuner inherits globals; section env-alias overrides global context")
+    check(opts["cpu-mask"] == "0xff", "tuner does not lowercase -C into -c")
+    check("version" not in opts, "INI version metadata is not a server flag")
+    args = argparse.Namespace(keep_mmproj=False, allow_vision=False, allow_ot=False,
+                              load_mode="default", ngl=99, threads=8, threads_batch=8,
+                              flash_attn="auto", kv_cache_type="f16", kv_unified="auto",
+                              jinja=False, cache_reuse=0, keep_checkpoints=False)
+    cmd = m.build_server_command("custom-server", opts, 9000, {}, args)
+    check(cmd[cmd.index("--custom-mode") + 1] == "a=b" and "--rope-scaling" in cmd,
+          "arbitrary schema flags actually reach server argv")
+    check("--no-custom-switch" in cmd and "--custom-switch" not in cmd,
+          "negative flag reaches tuner unchanged")
+    check(cmd.count("--ctx-size") == 1 and cmd[cmd.index("--ctx-size") + 1] == "8192",
+          "normalized axis emitted only once")
+    for bad in ("typo", "port"):
+        try:
+            m.build_server_command("custom-server", {**opts, bad: "1"}, 9000, {}, args)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, f"unknown/control key {bad} fails instead of silently disappearing")
+    edited = m.replace_section_keys(ini.read_text(), "mymodel", {"c": "4096"}, flags)
+    ini.write_text(edited)
+    check(m.read_tune_options(ini, "MyModel", flags)["c"] == "4096",
+          "apply updates env/long aliases, not a conflicting new short key")
+
+
+def test_tuner_unknown_flag_preflight(tmp: Path) -> None:
+    import contextlib
+    import io
+    from unittest.mock import patch
+    m = _tune_module()
+    model = _write_fake_gguf(tmp / "preflight.gguf")
+    ini = tmp / "preflight.ini"
+    ini.write_text(f"[test]\nmodel = {model}\nc = 8192\ncustom-typo = 1\n")
+    binary = tmp / "preflight-server"
+    binary.write_text("#!/bin/sh\nexit 1\n")
+    binary.chmod(0o755)
+    m._SCHEMA_CACHE[str(binary)] = schema.parse_help(CUSTOM_LAUNCH_HELP)
+    stderr = io.StringIO()
+    with patch.object(sys, "argv", ["tuner", str(ini), "test", "--server", str(binary)]), \
+         patch.object(m, "detect_server_caps", return_value={}), \
+         patch.object(m, "gpu_mem", side_effect=AssertionError("GPU touched")), \
+         contextlib.redirect_stderr(stderr):
+        try:
+            m.main()
+            rc = 0
+        except SystemExit as exc:
+            rc = exc.code
+    check(rc == 2 and "custom-typo" in stderr.getvalue(),
+          "unsupported option fails during preflight before GPU work")
+
+
+def test_wizard_new_model_to_tune(tmp: Path) -> None:
+    from unittest.mock import patch
+    m = _tune_module()
+    flags = schema.parse_help(CUSTOM_LAUNCH_HELP)
+    model = _write_fake_gguf(tmp / "No preset model.gguf", moe=False)
+    # Start with no models.ini at all, not just with an empty preset list.
+    env, calls = _wizard_env(tmp, ["1", str(model), "", "--custom-mode=a=b -rs yarn",
+                                   "y", "y", "4096", "n", "n", "n", "y"])
+    seen = []
+
+    def run_tune(build, name, pairs):
+        saved = m.read_tune_options(tmp / "models.ini", name, flags)
+        seen.append((build, name, pairs, saved))
+        return 0
+
+    with env, patch.object(wizard.schema, "load", return_value=(flags, {})), \
+         patch.object(wizard.builds, "resolve_binary", return_value=(tmp / "server", "ik")), \
+         patch.object(wizard.gguf, "find_mmproj_near", return_value=None), \
+         patch.object(wizard, "_run_tune", side_effect=run_tune):
+        (tmp / "models.ini").unlink()
+        rc = wizard._setup_flow("http://127.0.0.1:8087")
+    check(rc == 0 and len(seen) == 1, "new GGUF reaches tune without an existing INI")
+    check(seen and seen[0][2]["c"] == seen[0][3]["c"] == "4096",
+          "confirmed context matches both budget input and actual tuner file")
+    check(seen and seen[0][3]["custom-mode"] == "a=b"
+          and seen[0][3]["rope-scaling"] == "yarn",
+          "custom model flags survive wizard -> INI -> tuner")
+    check(calls[0][0] == "validate" and calls[1][0] == "budget",
+          "new model is checked before tuning")
+    check(any(tmp.glob("models.ini.bak-*")), "confirmed context edit has a backup")
+
+
+def test_wizard_tune_failures_stop_flow(tmp: Path) -> None:
+    from unittest.mock import patch
+    for failed in ("validate", "budget", "tune"):
+        env, calls = _wizard_env(tmp, ["1", "1", "y", "", "n", "n", "y"])
+        with env:
+            def run_cli(*argv):
+                calls.append(argv)
+                return 7 if argv[0] == failed else 0
+            with patch.object(wizard, "_run_cli", side_effect=run_cli), \
+                 patch.object(wizard, "_run_tune", return_value=7) as tune:
+                rc = wizard._setup_flow("http://127.0.0.1:8087")
+        check(rc == 7, f"{failed} failure propagated to caller")
+        check(tune.call_count == (1 if failed == "tune" else 0),
+              f"{failed} failure does not start subsequent tuning")
+        check("готово. загрузка вручную" not in env.text, "no false success after failure")
+
+
+def test_tune_wrapper_relative_ini(tmp: Path) -> None:
+    import argparse
+    import runpy
+    from unittest.mock import patch
+    cli = runpy.run_path(str(ROOT / "bin" / "llamastery"))
+    cmd_tune = cli["cmd_tune"]
+    relative = Path("configs") / "model presets.ini"
+    with patch.object(cli["builds"], "resolve_binary", return_value=(tmp / "server", "test")), \
+         patch.object(cli["subprocess"], "call", return_value=0) as call:
+        rc = cmd_tune(argparse.Namespace(ini=str(relative), section="new", build=None, extra=[]))
+    argv = call.call_args.args[0]
+    check(rc == 0 and argv[2] == str(relative.resolve()),
+          "CLI wrapper resolves INI before changing working directory")
+    check(call.call_args.kwargs["cwd"] == str(relative.resolve().parent),
+          "tuner results still go beside the INI")
+
+
+
+
+def _current_upstream_help():
+    return (ROOT / "tests/fixtures/upstream-2026-10-14-server-help.txt").read_text()
+
+
+def test_tune_current_axes_capabilities(tmp: Path):
+    m = _tune_module()
+    flags = schema.parse_help(_current_upstream_help())
+    meta = gguf.probe(_write_fake_gguf(tmp / "current-moe.gguf"))
+    args = _tune_args(moe_values="0,20,40", moe_cache_values="auto",
+                      threads_batch_values="auto", cpu_ffn_values="",
+                      op_offload_values="on,off", repack_values="off,on",
+                      backend_sampling_values="off,on")
+    m.configure_search(args, {"n-cpu-moe": "20"}, flags, meta)
+    check({"moe_cache", "threads_batch", "backend_sampling", "op_offload", "repack"}
+          <= args.server_axes, "current server enables supported modern axes")
+    from unittest.mock import patch
+    bench_help = (ROOT / "tests/fixtures/upstream-2026-10-14-bench-help.txt").read_text()
+    with patch.object(m, "run_help", return_value=bench_help):
+        caps = m.detect_bench_caps("bench")
+    supported = m.supported_axes(args, flags, caps)
+    check(not ({"moe_cache", "threads_batch", "cpu_ffn", "backend_sampling"} & supported),
+          "upstream bench cannot silently test unsupported server-only axes")
+    check({"op_offload", "repack"} <= supported, "bench bool controls are supported separately")
+    dense = gguf.probe(_write_fake_gguf(tmp / "current-dense.gguf", moe=False))
+    dense_args = _tune_args(cpu_ffn_values="0,4,8", moe_cache_values="auto")
+    m.configure_search(dense_args, {}, flags, dense)
+    check("cpu_ffn" in dense_args.server_axes and not {"moe", "moe_cache"} & dense_args.server_axes,
+          "dense models get dense-FFN axis, not useless MoE sweeps")
+    for overrides, model in (({"moe_cache_values": "256"}, dense),
+                             ({"cpu_ffn_values": "4"}, meta),
+                             ({"moe_values": "999"}, meta),
+                             ({"repack_values": "perhaps"}, meta)):
+        try:
+            m.configure_search(_tune_args(**overrides), {}, flags, model)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(rejected, f"incompatible/invalid explicit axis rejected: {overrides}")
+    old = schema.parse_help("-c, --ctx-size N  context\n")
+    try:
+        m.configure_search(_tune_args(moe_cache_values="512"), {}, old, meta)
+        rejected = False
+    except ValueError:
+        rejected = True
+    check(rejected, "explicit new flag on old fork fails before measurement")
+    m.configure_search(_tune_args(moe_cache_values="auto"), {}, old, meta)
+    check(True, "auto quietly skips unavailable axes on old forks")
+
+
+def test_tune_dedup_and_compatibility():
+    m = _tune_module()
+    check(m.variant_key({"moe": 20, "_axis": "moe"}) ==
+          m.variant_key({"moe": 20, "_axis": "ubatch"}),
+          "same effective config deduplicated across different axis paths")
+    args = _tune_args(active_axes={"moe_cache", "fa", "threads_batch"},
+                      axis_options={"moe_cache": [0, 256, 512], "threads_batch": [4, 8]},
+                      model_is_moe=True, host_moe=False)
+    base = m.staged_base(args, {"n-cpu-moe": "20", "cache-type-k": "q8_0",
+                                "cache-type-v": "q4_0", "threads-batch": "8"})
+    base["moe_cache"] = 0
+    variants = m.axis_variants(base, args, True)
+    check(any(v.get("moe_cache") == 256 for v in variants), "MoE cache participates in real candidate generation")
+    check(not any(v["fa"] == "off" for v in variants), "quantized V + FA off pruned before GPU load")
+    tb = [v for v in variants if v["_axis"] == "threads_batch"]
+    check(tb and tb[0]["threads"] == base["threads"], "prefill threads do not alter decode threads")
+    check(m._with_axis(base, "threads", 3)["threads_batch"] == 8, "decode threads do not alter prefill threads")
+    base["moe"] = 0
+    check(not any(v["_axis"] == "moe_cache" for v in m.axis_variants(base, args, True)),
+          "cache with no CPU experts is not benchmarked")
+    check(m._axis_value({"b": 4096, "ubatch": 512}, "b") == 4096,
+          "actual logical batch used for baseline comparison")
+    fair = m.fair_variants([{"_axis": "moe", "moe": i} for i in range(10)] +
+                           [{"_axis": "moe_cache", "moe_cache": 256}])
+    check(fair[1]["_axis"] == "moe_cache", "offload grid cannot monopolize the candidate budget")
+
+
+def test_tune_bench_current_flags():
+    from unittest.mock import patch
+    m = _tune_module()
+    help_text = (ROOT / "tests/fixtures/upstream-2026-10-14-bench-help.txt").read_text()
+    with patch.object(m, "run_help", return_value=help_text):
+        caps = m.detect_bench_caps("bench")
+    args = _tune_args(screen_repeats=2, screen_pp=4096, screen_tg=64, bench_fit_target=1024)
+    base = m.staged_base(args, {"cache-type-k": "q8_0", "cache-type-v": "f16"})
+    base.update(op_offload="off", repack="on")
+    cmd = m.build_bench_command("bench", caps, "/m.gguf", 16384, base, args)
+    check("--ctx-size" not in cmd and cmd[cmd.index("--n-depth") + 1] == str(16384 - 4096 - 64),
+          "upstream bench uses real n-depth, not nonexistent ctx-size")
+    check(cmd[cmd.index("--fit-ctx") + 1] == "16384" and "--fit-target" in cmd,
+          "explicit fit respects target context after upstream #28331")
+    check(cmd[cmd.index("--no-op-offload") + 1] == "1" and cmd[cmd.index("--repack") + 1] == "1",
+          "bench uses numeric bool values, unlike server switches")
+    check(cmd[cmd.index("--cache-type-v") + 1] == "f16", "screening preserves mixed K/V baseline")
+    args.bench_fit_target = 0
+    cmd = m.build_bench_command("bench", caps, "/m.gguf", 8192, base, args)
+    check("--fit-ctx" not in cmd and "--fit-target" not in cmd,
+          "fit disabled by default; it must not silently alter searched axes")
+
+
+def test_tune_staged_budget_baseline_and_failures():
+    m = _tune_module()
+    args = _tune_args(active_axes={"moe_cache", "threads_batch"},
+                      axis_options={"moe_cache": [0, 256, 512], "threads_batch": [4, 8, 16]},
+                      model_is_moe=True, host_moe=False, refine_rounds=3, min_gain=0,
+                      reserve=1024)
+    base = {**m.default_variant(args), "moe": 20, "moe_cache": 0}
+    seen = []
+    def evaluate(v):
+        seen.append(dict(v))
+        # One failed variant must never be retried even in later rounds.
+        ok = v.get("moe_cache") != 512
+        return {"ok": ok, "min_observed_free_mib": 1800,
+                "deep": {"gen_tps": 30 + v.get("moe_cache", 0) / 64,
+                         "prefill_tps": 100 + v["threads_batch"]}}
+    results = m.staged_search(base, args, evaluate, limit=6,
+                              seeds=[{**base, "_axis": "fake"}])
+    check(seen[0] == base, "first server measurement is the actual preset, including without bench")
+    check(len(results) <= 6 and len({m.variant_key(v) for v in seen}) == len(seen),
+          "hard server budget and dedup include baseline, failures and seeds")
+    check(any(v.get("moe_cache") == 256 for v in seen), "new axis is actually measured, not merely listed")
+    seen.clear()
+    m.staged_search(base, args, evaluate, limit=1)
+    check(seen == [base], "one-candidate budget measures baseline only")
+
+
+def test_tune_cache_budget_and_measurement(tmp: Path):
+    meta = gguf.probe(_write_fake_gguf(tmp / "cache-budget.gguf"))
+    base = {"model": str(meta.path), "c": "8192", "n-cpu-moe": "20"}
+    cached = {**base, "moe-cache-mib": "512"}
+    a, b = budget.estimate(base, meta), budget.estimate(cached, meta)
+    check(abs(b.total_gb - a.total_gb - .5) < 1e-8 and b.moe_cache_gb == .5,
+          "MoE cache adds its VRAM budget instead of looking free")
+    for key, value in (("moe-cache-mib", "512"), ("n-cpu-ffn", "8"),
+                       ("backend-sampling", "on"), ("op-offload", "off"), ("repack", "off")):
+        check(measure.signature(base) != measure.signature({**base, key: value}),
+              f"measurement identity includes {key}")
+
+
+def test_tune_current_upstream_mock_campaign(tmp: Path):
+    """Exercise main end-to-end, but never start a server or use a GPU."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    m = _tune_module()
+    root = tmp / "current-campaign"
+    root.mkdir(exist_ok=True)
+    model = _write_fake_gguf(root / "model.gguf")
+    binary = root / "llama-server"
+    binary.write_text("#!/bin/sh\nexit 99\n")
+    binary.chmod(0o755)
+    ini = root / "models.ini"
+    ini.write_text(f"[test]\nmodel = {model}\nc = 8192\nn-cpu-moe = 20\n"
+                   "cache-type-k = q8_0\ncache-type-v = f16\nubatch-size = 1024\n")
+    bench_help = (ROOT / "tests/fixtures/upstream-2026-10-14-bench-help.txt").read_text()
+    bench_calls, server_calls = [], []
+    def help_for(binary):
+        return bench_help if "bench" in str(binary) else _current_upstream_help()
+    def bench(tool, caps, model, ctx, v, args):
+        bench_calls.append(m.build_bench_command(tool, caps, model, ctx, v, args))
+        rows = [{"kind": k, "ts": speed, "sd": 0, "n_prompt": 4096, "n_gen": 64}
+                for k, speed in (("pp", 100), ("tg", 30))]
+        return rows, "[]"
+    def evaluate(binary, opts, ctx, v, args, run_id, caps):
+        server_calls.append(dict(v))
+        cfg = {**opts, "c": str(ctx), "moe-cache-mib": str(v.get("moe_cache", 0))}
+        return {"ok": True, "config": cfg, "min_observed_free_mib": 2048,
+                "deep": {"gen_tps": 30 + v.get("moe_cache", 0) / 128, "prefill_tps": 100}}
+    argv = ["tuner", str(ini), "test", "--server", str(binary),
+            "--max-screen", "5", "--max-candidates", "9", "--refine-rounds", "3",
+            "--moe-values", "16,20,24", "--moe-cache-values", "0,256,512",
+            "--out", str(root / "results")]
+    with patch.object(sys, "argv", argv), patch.object(m, "run_help", side_effect=help_for), \
+         patch.object(m, "find_tool", return_value=root / "llama-bench"), \
+         patch.object(m, "run_llama_bench", side_effect=bench), \
+         patch.object(m, "evaluate", side_effect=evaluate), \
+         patch.object(m, "gpu_mem", return_value=(12288, 0, 12288)), \
+         patch.object(m, "ram_available_mib", return_value=32000), \
+         contextlib.redirect_stdout(io.StringIO()):
+        m.main()
+    check(0 < len(bench_calls) <= 5, "total screening + refine stays inside --max-screen")
+    check(0 < len(server_calls) <= 9 and server_calls[0]["moe"] == 20,
+          "end-to-end server search measures baseline within budget")
+    check(all("--moe-cache-mib" not in cmd for cmd in bench_calls),
+          "upstream bench never receives new server-only flag")
+    check(any(v.get("moe_cache", 0) > 0 for v in server_calls),
+          "upstream MoE cache axis reaches the actual server evaluation stage")
+    plans = list((root / "results").glob("*/plan.json"))
+    check(len(plans) == 1 and "moe_cache" in json.loads(plans[0].read_text())["server_axes"],
+          "campaign records effective capability-aware plan")
+    check("moe-cache-mib" not in ini.read_text(), "no --apply: original preset unchanged")
+
+
+
+
+def test_tune_modern_argv_and_apply(tmp: Path):
+    from lib import launch
+    m = _tune_module()
+    flags = schema.parse_help(_current_upstream_help())
+    m._SCHEMA_CACHE["modern-bin"] = flags
+    args = _tune_args(keep_mmproj=False, allow_vision=False, allow_ot=False,
+                      load_mode="default", jinja="on", cache_reuse=0, keep_checkpoints=False)
+    opts = {"model": "/model.gguf", "c": "8192", "n-cpu-moe": "20",
+            "moe-cache-mib": "512", "op-offload": "off", "repack": "off",
+            "backend-sampling": "on"}
+    cmd = m.build_server_command("modern-bin", opts, 8090, {}, args)
+    check(cmd[cmd.index("--moe-cache-mib") + 1] == "512", "new MoE cache reaches server argv with value")
+    check("--no-op-offload" in cmd and "--no-repack" in cmd,
+          "new bool axes emit proper negative server switches")
+    check("--backend-sampling" in cmd and cmd[-1] == "--backend-sampling",
+          "backend sampling is a switch, not '--backend-sampling on'")
+    text = "[m]\nno-op-offload = true\nno-repack = true\nmoe-cache-mib = 0\n"
+    updates = {"op-offload": "on", "repack": "on", "moe-cache-mib": "256"}
+    new = m.replace_section_keys(text, "m", updates, flags)
+    ini = inifile.IniFile(tmp / "negative-apply.ini", new)
+    cfg = launch.effective_pairs(ini, "m", flags)
+    check(all(cfg[k] == v for k, v in updates.items()) and "no-op-offload" not in cfg,
+          "apply replaces negative aliases without leaving conflicting values")
+    check(launch.parse_cli('--gpu-layers auto', flags)["n-gpu-layers"] == "auto",
+          "current upstream --gpu-layers auto/all is not rejected as non-numeric")
+
+
+def test_axes_learning_does_not_mix_models():
+    from lib import axes
+    from unittest.mock import patch
+    def run(model, threads, speed, binary):
+        return {"ok": True, "config": {"model": model, "c": "8192", "t": str(threads)},
+                "short": {"gen_tps": speed}, "binary_fingerprint": binary}
+    records = [run("a.gguf", 4, 20, "old"), run("b.gguf", 8, 200, "old"),
+               run("a.gguf", 8, 200, "new")]
+    with patch.object(axes, "_load_results", return_value=records):
+        learned = axes.learn(min_pairs=1)
+    check("threads" not in learned, "different models/builds cannot fabricate a thread speedup")
+    records.append(run("a.gguf", 8, 25, "old"))
+    with patch.object(axes, "_load_results", return_value=records):
+        learned = axes.learn(min_pairs=1)
+    check(learned["threads"]["pairs"] == 1 and learned["threads"]["tps_gain"] == 1.25,
+          "same model/context/build isolated pair still teaches axis priority")
 
 
 if __name__ == "__main__":

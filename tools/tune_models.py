@@ -151,7 +151,7 @@ WRITABLE_KEYS = {
     "kv-unified",
     "jinja",
     "cache-reuse",
-    "load-mode",
+    "fit", "load-mode", "moe-cache-mib", "n-cpu-ffn", "op-offload", "repack", "backend-sampling",
 }
 
 BENCH_FLAG_ALIASES = {
@@ -165,6 +165,11 @@ BENCH_FLAG_ALIASES = {
     "ub": ("--ubatch-size", "-ub"),
     "t": ("--threads", "-t"),
     "tb": ("--threads-batch", "-tb"),
+    "depth": ("--n-depth", "-d"),
+    "fit_ctx": ("--fit-ctx", "-fitc"),
+    "fit_target": ("--fit-target", "-fitt"),
+    "op_offload": ("--no-op-offload", "-nopo"),
+    "repack": ("--repack",),
 }
 
 
@@ -231,6 +236,7 @@ def run_help(binary):
 def detect_server_caps(binary):
     text = run_help(binary)
     return {
+        "fit": has_flag(text, "--fit"),
         "model": has_flag(text, "--model", "-m"),
         "mmproj": has_flag(text, "--mmproj"),
         "mmproj-offload": has_flag(text, "--mmproj-offload"),
@@ -390,7 +396,47 @@ PASSTHROUGH_KEYS = (
     "presence-penalty", "frequency-penalty",
 )
 
+# These options are emitted explicitly above the schema-driven tail. Never
+# pass aliases a second time: they would override the searched candidate.
+HANDLED_KEYS = {
+    "model", "mmproj", "image-min-tokens", "mmproj-offload", "no-mmproj-offload",
+    "ot", "load-mode", "c", "n-gpu-layers", "n-cpu-moe", "b", "ubatch-size",
+    "t", "threads-batch", "parallel", "fa", "cache-type-k", "cache-type-v",
+    "kv-unified", "no-kv-unified", "jinja", "cache-reuse", "ctx-checkpoints",
+    "checkpoint-min-step", "n-predict",
+}
 _KIND_CACHE = {}
+_SCHEMA_CACHE = {}
+
+
+def server_schema(binary):
+    key = str(binary)
+    if key not in _SCHEMA_CACHE:
+        try:
+            from lib import schema
+            # Same environment as the actual server, including adjacent .so's.
+            _SCHEMA_CACHE[key] = schema.parse_help(run_help(binary))
+        except ImportError:
+            _SCHEMA_CACHE[key] = {}
+    return _SCHEMA_CACHE[key]
+
+
+def read_tune_options(path, section, flags):
+    """Use the same INI semantics as the wizard, including globals/comments."""
+    try:
+        from lib.inifile import IniFile
+        from lib.launch import effective_pairs
+    except ImportError:
+        ini = configparser.ConfigParser(interpolation=None, strict=False,
+                                        inline_comment_prefixes=(";", "#"))
+        ini.optionxform = str
+        ini.read(path, encoding="utf-8-sig")
+        if section not in ini:
+            raise ValueError("Секция не найдена")
+        return {**(dict(ini["*"]) if "*" in ini else {}), **dict(ini[section])}
+    ini = IniFile(path, Path(path).read_text(encoding="utf-8-sig"))
+    return effective_pairs(ini, section, flags)
+
 
 
 def _flag_kinds(binary):
@@ -398,26 +444,16 @@ def _flag_kinds(binary):
     key = str(binary)
     if key in _KIND_CACHE:
         return _KIND_CACHE[key]
-    kinds = {}
-    try:
-        import sys as _sys
-        from pathlib import Path as _Path
-        root = _Path(__file__).resolve().parent.parent
-        if str(root) not in _sys.path:
-            _sys.path.insert(0, str(root))
-        from lib import schema as _schema
-        flags, meta = _schema.load(binary)
-        if not meta.get("error"):
-            uniq = {id(v): v for v in flags.values()}
-            for f in uniq.values():
-                kinds[f.canonical] = f.kind
-    except Exception:
-        kinds = {}
+    kinds = {f.canonical: f.kind for f in server_schema(binary).values()}
     _KIND_CACHE[key] = kinds
     return kinds
 
 
 def build_server_command(binary, opts, port, caps, args):
+    flags = server_schema(binary)
+    if flags:
+        from lib.launch import normalize
+        opts = normalize(opts, flags)
     cmd = [str(binary), "--host", "127.0.0.1", "--port", str(port)]
 
     cmd += ["--model", str(opts["model"])]
@@ -505,25 +541,30 @@ def build_server_command(binary, opts, port, caps, args):
     if caps.get("checkpoint-min-step") and opts.get("checkpoint-min-step") is not None:
         cmd += ["--checkpoint-min-step", str(opts["checkpoint-min-step"])]
 
-    # ускорители и прочее, что тюнер не варьирует, — переносим из секции.
-    # Сверка со схемой ЭТОЙ сборки: флаг, которого нет в бинаре (например
-    # reasoning-effort на faks), пропускаем, а не роняем весь прогон
-    # неизвестным аргументом. Пустой kinds = схема недоступна, тогда
-    # предполагаем, что значение нужно (как раньше).
+    # Forward EVERY schema-known option not owned by the search, not merely
+    # a hard-coded whitelist. A missing required flag is an error, not a
+    # different model configuration silently benchmarked as the requested one.
     kinds = _flag_kinds(binary)
-    schema_known = bool(kinds)
-    for key in PASSTHROUGH_KEYS:
-        if key not in opts:
+    for key, value in opts.items():
+        if key in HANDLED_KEYS:
             continue
-        val = str(opts[key]).strip()
-        canon = "--" + key
-        kind = kinds.get(canon)
-        if kind is None and schema_known:
-            continue
-        if kind == "flag" or val == "":
-            cmd.append(canon)
+        if flags:
+            from lib.launch import CONTROL, flag_argv
+            if key in CONTROL:
+                raise ValueError(f"управление сервером нельзя задавать в пресете: {key}")
+            cmd += flag_argv(key, value, flags)
+        elif key in PASSTHROUGH_KEYS:
+            canon = "--" + key
+            kind = kinds.get(canon)
+            if kinds and kind is None:
+                continue
+            if kind == "flag":
+                if not is_false(value):
+                    cmd.append(canon)
+            else:
+                cmd += [canon, str(value)]
         else:
-            cmd += [canon, val]
+            raise ValueError(f"не удалось проверить флаг {key}: недоступна схема сборки")
 
     # mmproj и режим его выгрузки: гейтим --keep-mmproj, иначе текстовый
     # замер не должен платить память за зрение
@@ -952,14 +993,21 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
         "ubatch-size": str(ubatch),
         "t": str(variant.get("threads", args.threads)),
         "threads-batch": str(variant.get("threads_batch", args.threads_batch)),
-        "parallel": "1",
+        "parallel": str(variant.get("parallel", base_opts.get("parallel", "1"))),
         "fa": str(variant.get("fa", args.flash_attn)),
         "cache-type-k": str(variant.get("kv_cache_type", args.kv_cache_type)),
-        "cache-type-v": str(variant.get("kv_cache_type", args.kv_cache_type)),
+        "cache-type-v": str(variant.get("kv_cache_type_v", variant.get("kv_cache_type", args.kv_cache_type))),
         "kv-unified": str(variant.get("kv_unified", args.kv_unified)),
-        "jinja": str(args.jinja),
+        "jinja": str(variant.get("jinja", base_opts.get("jinja", args.jinja))),
         "cache-reuse": str(variant.get("reuse", args.cache_reuse)),
     })
+
+    for key, ini_key in MODERN_AXES.items():
+        if key in variant:
+            cfg[ini_key] = str(variant[key])
+    # Never let the server's automatic fit silently change a measured axis.
+    if caps.get("fit"):
+        cfg["fit"] = "off"
 
     # mmproj выбрасывается только если зрение не нужно ни для сохранения
     # (--keep-mmproj), ни для замера (--allow-vision): иначе вторая ветка
@@ -989,6 +1037,7 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
         "kv-unified",
         "jinja",
         "cache-reuse",
+        "fit", "moe-cache-mib", "n-cpu-ffn", "op-offload", "repack", "backend-sampling",
         "model",   # замер не должен выдаваться за замер другой модели
     )
 
@@ -998,9 +1047,12 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
         # absent-ключи не пишутся, а не роняют прогон
         "config": {key: cfg[key] for key in selected_config_keys if key in cfg},
         "config_extra": {
+            **{k: v for k, v in cfg.items() if k not in selected_config_keys},
             "load-mode": eff_lm if caps.get("load-mode") else "default",
         },
         "log": str(log_path),
+        "search_variant": dict(variant),
+        "binary_fingerprint": getattr(args, "binary_fingerprint", None),
     }
 
     vram_samples = []
@@ -1095,6 +1147,8 @@ def evaluate(binary, base_opts, context, variant, args, run_id, caps, short_only
                 warmup_tokens=args.warmup_tokens,
             )
 
+            if not result["short"]["needle_ok"]:
+                raise RuntimeError("Короткая проверка извлечения не прошла — глубокая проба пропущена")
             if not short_only and deep_target > short_target + 1024:
                 result["deep"] = probe_series(
                     port,
@@ -1214,12 +1268,21 @@ def build_bench_command(tool, caps, model, ctx, variant, args):
         "-n", str(args.screen_tg),
     ]
 
-    add_bench_flag(cmd, caps, "ctx", ctx)
+    if caps.get("ctx"):
+        add_bench_flag(cmd, caps, "ctx", ctx)
+    elif caps.get("depth"):
+        add_bench_flag(cmd, caps, "depth", max(0, ctx - args.screen_pp - args.screen_tg))
+    # fit-ctx is only a fit lower bound, NOT a context-size flag.
+    if getattr(args, "bench_fit_target", 0):
+        if not (caps.get("fit_ctx") and caps.get("fit_target")):
+            raise ValueError("llama-bench не поддерживает --fit-target/--fit-ctx")
+        add_bench_flag(cmd, caps, "fit_target", args.bench_fit_target)
+        add_bench_flag(cmd, caps, "fit_ctx", ctx)
     add_bench_flag(cmd, caps, "ngl", variant.get("ngl", args.ngl))
     add_bench_flag(cmd, caps, "moe", variant.get("moe", 0))
     add_bench_flag(cmd, caps, "fa", variant.get("fa", args.flash_attn))
     add_bench_flag(cmd, caps, "ctk", variant.get("kv_cache_type", args.kv_cache_type))
-    add_bench_flag(cmd, caps, "ctv", variant.get("kv_cache_type", args.kv_cache_type))
+    add_bench_flag(cmd, caps, "ctv", variant.get("kv_cache_type_v", variant.get("kv_cache_type", args.kv_cache_type)))
 
     ubatch = safe_int(variant.get("ubatch", 2048), 2048)
     batch = max(safe_int(variant.get("b", 2048), 2048), ubatch)
@@ -1229,6 +1292,10 @@ def build_bench_command(tool, caps, model, ctx, variant, args):
     add_bench_flag(cmd, caps, "t", variant.get("threads", args.threads))
     add_bench_flag(cmd, caps, "tb", variant.get("threads_batch", args.threads_batch))
 
+    if "op_offload" in variant:
+        add_bench_flag(cmd, caps, "op_offload", 0 if is_true(variant["op_offload"]) else 1)
+    if "repack" in variant:
+        add_bench_flag(cmd, caps, "repack", 1 if is_true(variant["repack"]) else 0)
     return cmd
 
 
@@ -1467,8 +1534,252 @@ def run_llama_sweep_bench(tool, caps, model, ctx, variant, args, log_path):
     }
 
 
+# Internal variant key -> canonical INI key. New axes go through the same
+# schema serializer as user flags, not hard-coded argv guesses.
+MODERN_AXES = {
+    "moe_cache": "moe-cache-mib", "cpu_ffn": "n-cpu-ffn",
+    "threads_batch": "threads-batch", "op_offload": "op-offload",
+    "repack": "repack", "backend_sampling": "backend-sampling",
+}
+INTEGER_AXES = {"moe_cache", "cpu_ffn", "threads_batch"}
+CORE_AXIS_FLAGS = {
+    "moe": "n-cpu-moe", "ubatch": "ubatch-size", "b": "batch-size",
+    "threads": "threads", "kv_cache_type": "cache-type-k", "fa": "flash-attn",
+}
+BENCH_AXIS_KEYS = {
+    "moe": "moe", "ubatch": "ub", "b": "b", "threads": "t",
+    "threads_batch": "tb", "kv_cache_type": "ctk", "fa": "fa",
+    "op_offload": "op_offload", "repack": "repack",
+}
+
+
+def configure_search(args, opts, flags, meta=None):
+    """Resolve model/flag constraints before any expensive measurement."""
+    from lib.launch import resolve_option
+    args.model_is_moe = meta.is_moe if meta is not None else None
+    args.model_layers = meta.n_layer if meta is not None else 0
+    args.host_moe = is_true(opts.get("cpu-moe", "off")) or bool(opts.get("ot"))
+    args.fixed_placement = args.host_moe
+    if args.model_layers:
+        args.max_cpu_moe = min(args.max_cpu_moe, args.model_layers)
+        if getattr(args, "moe_values", "") and any(
+                x > args.model_layers for x in csv_ints(args.moe_values, "moe-values")):
+            raise ValueError("--moe-values превышает число слоёв модели")
+    args.axis_options = {}
+    raw_names = {
+        "moe_cache": "moe_cache_values", "cpu_ffn": "cpu_ffn_values",
+        "threads_batch": "threads_batch_values", "op_offload": "op_offload_values",
+        "repack": "repack_values", "backend_sampling": "backend_sampling_values",
+    }
+    for key, attr in raw_names.items():
+        raw = getattr(args, attr, "")
+        flag = resolve_option(flags, MODERN_AXES[key])
+        explicit = raw not in ("", "auto")
+        if not flag:
+            if explicit:
+                raise ValueError(f"--{attr.replace('_', '-')}: сборка не поддерживает --{MODERN_AXES[key]}")
+            continue
+        if key == "moe_cache" and args.model_is_moe is not True:
+            if explicit and any(csv_ints(raw, attr)):
+                raise ValueError("MoE cache требует подтверждённой MoE-модели")
+            continue
+        if key == "cpu_ffn" and args.model_is_moe is not False:
+            if explicit and any(csv_ints(raw, attr)):
+                raise ValueError("n-cpu-ffn предназначен для dense-модели")
+            continue
+        if raw == "auto":
+            if key == "moe_cache":
+                values = [0, 256, 512]
+            elif key == "threads_batch":
+                n = max(1, os.cpu_count() or 1)
+                current = safe_int(opts.get("threads-batch"), args.threads_batch)
+                values = sorted({max(1, n // 2), n, current})
+            else:
+                values = []
+        elif not raw:
+            values = []
+        elif key in INTEGER_AXES:
+            values = csv_ints(raw, attr)
+            minimum = 1 if key == "threads_batch" else 0
+            if any(v < minimum for v in values):
+                raise ValueError(f"--{attr.replace('_', '-')}: значения должны быть >= {minimum}")
+            if key == "cpu_ffn" and args.model_layers and max(values) > args.model_layers:
+                raise ValueError("--cpu-ffn-values превышает число слоёв модели")
+        else:
+            values = list(dict.fromkeys(v.strip() for v in raw.split(",")))
+            if any(v not in ("on", "off") for v in values):
+                raise ValueError(f"--{attr.replace('_', '-')}: ожидается on,off")
+            # Repack/op-offload need a real negative flag, not omission.
+            if "off" in values and key != "backend_sampling" and not resolve_option(flags, "no-" + MODERN_AXES[key]):
+                raise ValueError(f"сборка не поддерживает --no-{MODERN_AXES[key]}")
+        args.axis_options[key] = values
+    raw_kv = getattr(args, "kv_values", "")
+    if raw_kv:
+        known = {"f16", "bf16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}
+        values = raw_kv.split(",")
+        if any(v.strip() not in known for v in values):
+            raise ValueError("--kv-values: неизвестный тип K/V")
+        for key in ("cache-type-k", "cache-type-v"):
+            if not resolve_option(flags, key):
+                raise ValueError(f"сборка не поддерживает --{key}")
+    args.server_axes = supported_axes(args, flags)
+    if getattr(args, "search", "staged") == "full":
+        if any(getattr(args, attr, "") not in ("", "auto") for attr in raw_names.values()):
+            raise ValueError("новые оси поддерживаются в --search staged; full — legacy-сетка")
+
+
+def supported_axes(args, flags, bench_caps=None):
+    from lib.launch import resolve_option
+    allowed = {key for key, flag in {**CORE_AXIS_FLAGS, **MODERN_AXES}.items()
+               if resolve_option(flags, flag)}
+    if getattr(args, "model_is_moe", None) is not True or getattr(args, "fixed_placement", False):
+        allowed.discard("moe")
+    if getattr(args, "model_is_moe", None) is not True:
+        allowed.discard("moe_cache")
+    if getattr(args, "model_is_moe", None) is not False:
+        allowed.discard("cpu_ffn")
+    if not resolve_option(flags, "cache-type-v"):
+        allowed.discard("kv_cache_type")
+    if bench_caps is not None:
+        allowed = {key for key in allowed if bench_caps.get(BENCH_AXIS_KEYS.get(key, ""))}
+        if not bench_caps.get("ctv"):
+            allowed.discard("kv_cache_type")
+    return allowed
+
+
+def compatible_variant(v, args):
+    if getattr(args, "model_is_moe", None) is False and v.get("_axis") in ("moe", "moe_cache"):
+        return False
+    if v.get("_axis") == "moe_cache" and safe_int(v.get("moe_cache")) > 0:
+        if not (safe_int(v.get("moe")) > 0 or getattr(args, "host_moe", False)):
+            return False
+    # Quantized V requires FA. Do not deliberately generate guaranteed failures.
+    if str(v.get("fa", "auto")) == "off" and str(v.get("kv_cache_type_v", v.get("kv_cache_type", "f16"))) not in ("f16", "bf16", "f32"):
+        return False
+    return True
+
+
+def fair_variants(variants):
+    """One value per axis before a second value: offload cannot eat the budget."""
+    groups = {}
+    for v in variants:
+        groups.setdefault(v.get("_axis", "seed"), []).append(v)
+    out = []
+    while any(groups.values()):
+        for group in groups.values():
+            if group:
+                out.append(group.pop(0))
+    return out
+
+
+def search_weights(args):
+    return {"balanced": (0.55, 0.30, 0.15), "gen": (0.80, 0.10, 0.10),
+            "prefill": (0.20, 0.65, 0.15), "vram": (0.35, 0.20, 0.45)}.get(
+                getattr(args, "optimize_for", "balanced"), (0.55, 0.30, 0.15))
+
+
+def staged_search(base, args, evaluate_one, limit, seeds=()):
+    """Budgeted coordinate search, also when bench is absent or incompatible.
+
+    Every callback loads once, checks short retrieval first, and only then
+    performs the deep probe on the SAME server. Failed candidates are deduped.
+    """
+    measured, results = set(), []
+    best, best_score = dict(base), None
+    weights = search_weights(args)
+
+    def measure(v):
+        nonlocal best, best_score
+        key = variant_key(v)
+        if key in measured or len(results) >= limit:
+            return
+        measured.add(key)
+        r = evaluate_one(v)
+        r["search_variant"] = dict(v)
+        results.append(r)
+        if r.get("ok"):
+            score = rank_score(r, weights)
+            if best_score is None or score > best_score:
+                best, best_score = dict(v), score
+
+    if limit <= 0:
+        return results
+    measure(base)
+    rounds = max(1, getattr(args, "refine_rounds", 2) + 1)
+    for rnd in range(rounds):
+        if len(results) >= limit:
+            break
+        fresh = axis_variants(best, args, "moe" in getattr(args, "active_axes", ()), exclude=measured)
+        fresh = fair_variants(fresh)
+        if rnd == 0:
+            # Bench winners are hints, never a replacement for the actual baseline.
+            fresh = [v for v in seeds if variant_key(v) not in measured][:2] + fresh
+        # Allow cache growth only within measured spare VRAM (reserve stays intact).
+        best_result = next((r for r in results if r.get("ok") and
+                            variant_key(r["search_variant"]) == variant_key(best)), None)
+        if best_result and best_result.get("min_observed_free_mib") is not None:
+            spare = max(0, best_result["min_observed_free_mib"] - getattr(args, "reserve", 1024))
+            fresh = [v for v in fresh if v.get("_axis") != "moe_cache" or
+                     safe_int(v.get("moe_cache")) - safe_int(best.get("moe_cache")) <= spare]
+        unique = {}
+        for v in fresh:
+            if compatible_variant(v, args):
+                unique.setdefault(variant_key(v), v)
+        fresh = list(unique.values())
+        if not fresh:
+            break
+        # Reserve room for refinement instead of spending everything around base.
+        remaining = limit - len(results)
+        quota = max(1, (remaining + (rounds - rnd) - 1) // (rounds - rnd))
+        before = best_score
+        for v in fresh[:quota]:
+            measure(v)
+        # No promising improvement AND all immediate neighbours tested: stop.
+        if len(fresh) <= quota and before is not None and best_score is not None:
+            if best_score - before < getattr(args, "min_gain", 0.02) * max(abs(before), 1e-9):
+                break
+    return results
+
+
+def run_staged_validation(args, opts, caps, contexts, selected):
+    args.active_axes = args.server_axes
+    base = default_variant(args) if args.ignore_preset else staged_base(args, opts)
+    # Optional axes start from documented defaults, only if schema supported.
+    for key, value in (("moe_cache", 0), ("cpu_ffn", 0), ("op_offload", "on"),
+                       ("repack", "on"), ("backend_sampling", "off")):
+        if key in args.server_axes and args.axis_options.get(key):
+            base.setdefault(key, value)
+    results = []
+    for i, ctx in enumerate(sorted(contexts, reverse=True)):
+        remaining = args.max_candidates - len(results)
+        count = len(contexts) - i
+        limit = remaining // count
+        if limit < 1:
+            break
+        def evaluate_one(v):
+            run_id = len(results) + 1
+            print(f"[staged {run_id}/{args.max_candidates}] ctx={ctx} {v}", flush=True)
+            r = evaluate(args.server, opts, ctx, v, args, run_id, caps)
+            results.append(r)
+            (args.out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+            return r
+        staged_search(base, args, evaluate_one, limit, seeds=selected)
+    return results
+
+
 def variant_key(variant):
-    return json.dumps(variant, sort_keys=True, ensure_ascii=False)
+    # Search metadata is NOT part of the effective configuration. Otherwise
+    # the same settings reached via different axes are benchmarked repeatedly.
+    config = {k: str(v) for k, v in variant.items() if not k.startswith("_")}
+    if "kv_cache_type" in config:
+        config.setdefault("kv_cache_type_v", config["kv_cache_type"])
+    for key in ("fa", "kv_unified", "op_offload", "repack", "backend_sampling"):
+        if key in config:
+            if is_true(config[key]):
+                config[key] = "on"
+            elif is_false(config[key]):
+                config[key] = "off"
+    return json.dumps(config, sort_keys=True, ensure_ascii=False)
 
 
 def default_variant(args):
@@ -1558,7 +1869,7 @@ def ubatch_value_list(args):
 #   threads — важен, когда эксперты на CPU (это наш случай);
 #   b     — влияет, только если больше ubatch; в новых сборках n_batch
 #           клампится в n_ubatch, поэтому ось последняя.
-def knob_axes(present_flags=None):
+def knob_axes(present_flags=None, learn=True):
     """Порядок осей: из реестра lib/axes.py, приоритет скорректирован замерами.
 
     Реестр — единственное место, где описаны ось, её флаг и ожидаемый
@@ -1567,7 +1878,7 @@ def knob_axes(present_flags=None):
     """
     from lib import axes as _axes
     try:
-        learned = _axes.learn()
+        learned = _axes.learn() if learn else {}
     except Exception as exc:            # noqa: BLE001 — реестр осей не критичен
         # битый tune-results/**/results.json не должен ронять даже --help
         _sys.stderr.write(f"предупреждение: замеры осей не прочитаны: {exc}\n")
@@ -1585,13 +1896,15 @@ def knob_axes(present_flags=None):
     return out
 
 
-KNOB_AXES = knob_axes()
+KNOB_AXES = knob_axes(learn=False)
 
 
 def axis_values(args, key, screen_moe_enabled):
     """Допустимые значения оси; пустой список — ось нечего крутить."""
+    if key in MODERN_AXES:
+        return getattr(args, "axis_options", {}).get(key, [])
     if key == "moe":
-        return moe_value_list(args, screen_moe_enabled)
+        return moe_value_list(args, screen_moe_enabled) if screen_moe_enabled else []
     if key == "ubatch":
         return ubatch_value_list(args)
     if key == "b":
@@ -1600,6 +1913,9 @@ def axis_values(args, key, screen_moe_enabled):
         raw = str(getattr(args, "batch_values", "") or "").strip()
         return [int(x) for x in raw.split(",") if x.strip()] if raw else []
     if key == "kv_cache_type":
+        explicit = getattr(args, "kv_values", "")
+        if explicit:
+            return list(dict.fromkeys(x.strip() for x in explicit.split(",") if x.strip()))
         vals = [args.kv_cache_type]
         if args.try_f16 and "f16" not in vals:
             vals.append("f16")
@@ -1619,7 +1935,7 @@ def axis_values(args, key, screen_moe_enabled):
 
 def _axis_value(variant, key):
     if key == "b":
-        return max(2048, int(variant.get("ubatch", 2048)))
+        return variant.get("b", max(2048, int(variant.get("ubatch", 2048))))
     return variant.get(key)
 
 
@@ -1629,16 +1945,19 @@ def _with_axis(variant, key, value):
         v["moe"] = int(value)
     elif key == "ubatch":
         v["ubatch"] = int(value)
-        v["b"] = max(2048, int(value))
+        v["b"] = max(int(v.get("b", 2048)), int(value))
     elif key == "b":
         v["b"] = max(int(value), int(v.get("ubatch", 2048)))
     elif key == "threads":
         v["threads"] = int(value)
-        v["threads_batch"] = max(int(v.get("threads_batch", 0) or 0), int(value))
+        # Prefill threads are an independent axis, not coupled to decode.
     elif key == "kv_cache_type":
         v["kv_cache_type"] = str(value)
+        v["kv_cache_type_v"] = str(value)
     elif key == "fa":
         v["fa"] = str(value)
+    elif key in MODERN_AXES:
+        v[key] = value
     return v
 
 
@@ -1650,16 +1969,19 @@ def axis_variants(base, args, screen_moe_enabled, exclude=None):
     seen = set(exclude or ())
     seen.add(variant_key(base))
     out = []
-    for key, _rank, _why in sorted(KNOB_AXES, key=lambda a: -a[1]):
+    for key, _rank, _why in KNOB_AXES:
+        allowed = getattr(args, "active_axes", None)
+        if allowed is not None and key not in allowed:
+            continue
         current = _axis_value(base, key)
         for value in axis_values(args, key, screen_moe_enabled):
             if str(value) == str(current):
                 continue
             v = _with_axis(base, key, value)
-            # метку оси ставим ДО подсчёта ключа: иначе ключ первого вызова
-            # не совпадёт с ключом exclude из следующего, и уже измеренное
-            # будет прогоняться заново
+            # Axis labels are diagnostic only; variant_key ignores them.
             v["_axis"] = key
+            if not compatible_variant(v, args):
+                continue
             k = variant_key(v)
             if k in seen:
                 continue
@@ -1685,6 +2007,8 @@ def staged_base(args, opts):
         v["b"] = max(safe_int(cfg.get("b"), v["b"]), v["ubatch"])
     if "cache-type-k" in cfg:
         v["kv_cache_type"] = str(cfg.get("cache-type-k"))
+    if "cache-type-v" in cfg:
+        v["kv_cache_type_v"] = str(cfg["cache-type-v"])
     if "fa" in cfg:
         fa = str(cfg.get("fa")).lower()
         if fa in ("on", "off", "auto", "true", "false", "1", "0"):
@@ -1695,9 +2019,18 @@ def staged_base(args, opts):
     if "threads-batch" in cfg:
         v["threads_batch"] = safe_int(cfg.get("threads-batch"), v["threads_batch"])
     if "n-gpu-layers" in cfg:
-        v["ngl"] = safe_int(cfg.get("n-gpu-layers"), v["ngl"])
+        v["ngl"] = str(cfg["n-gpu-layers"])
     if "kv-unified" in cfg:
         v["kv_unified"] = str(cfg.get("kv-unified"))
+    for key, ini_key in MODERN_AXES.items():
+        if ini_key in cfg:
+            v[key] = (safe_int(cfg[ini_key]) if key in INTEGER_AXES else
+                      "off" if is_false(cfg[ini_key]) else "on")
+    v["reuse"] = safe_int(cfg.get("cache-reuse", getattr(args, "cache_reuse", 0)))
+    for key, value in (("moe_cache", 0), ("cpu_ffn", 0), ("op_offload", "on"),
+                       ("repack", "on"), ("backend_sampling", "off")):
+        if key in getattr(args, "server_axes", ()) and getattr(args, "axis_options", {}).get(key):
+            v.setdefault(key, value)
     return v
 
 
@@ -1814,7 +2147,7 @@ def expand_server_candidates(
     return out
 
 
-def replace_section_keys(original, section, updates):
+def replace_section_keys(original, section, updates, flags=None):
     if not updates:
         return original
 
@@ -1833,17 +2166,23 @@ def replace_section_keys(original, section, updates):
         if match:
             if active:
                 insert_index = len(output)
-            active = match.group(1) == section
+            active = match.group(1).lower() == section.lower()
             if active:
                 found = True
 
         if active:
             km = key_line.match(line)
-            if km and km.group(2) in updates:
-                key = km.group(2)
+            key = km.group(2) if km else None
+            if key is not None:
+                try:
+                    from lib.launch import normalize
+                    key = next(iter(normalize({key: "true"}, flags or {})))
+                except ImportError:
+                    pass
+            if key in updates:
                 seen.add(key)
                 line = (
-                    f"{km.group(1)}{key}{km.group(3)}"
+                    f"{km.group(1)}{key if km.group(2).lstrip('-').startswith('no-') else km.group(2)}{km.group(3)}"
                     f"{updates[key]}{km.group(5) or ''}"
                 )
 
@@ -2005,6 +2344,22 @@ def main():
     p.add_argument("--threads-batch", type=int, default=16)
     p.add_argument("--try-threads-16", action="store_true")
 
+    p.add_argument("--moe-cache-values", default="auto",
+                   help="MiB GPU-кэша CPU MoE-экспертов: auto или 0,256,512,1024; только при поддержке сборки")
+    p.add_argument("--cpu-ffn-values", default="",
+                   help="явный список n-cpu-ffn для dense-моделей")
+    p.add_argument("--threads-batch-values", default="auto",
+                   help="потоки префилла независимо от декодинга: auto или список")
+    p.add_argument("--op-offload-values", default="",
+                   help="явный A/B on,off для операций над host-тензорами")
+    p.add_argument("--repack-values", default="", help="явный A/B on,off переупаковки весов")
+    p.add_argument("--backend-sampling-values", default="",
+                   help="экспериментальный server-only A/B off,on; не меняет sampler chain")
+    p.add_argument("--kv-values", default="",
+                   help="явные типы K/V-кэша, например q8_0,f16; фильтруются по совместимости с FA")
+    p.add_argument("--bench-fit-target", type=int, default=0,
+                   help="MiB запаса auto-fit только screening; 0 = не менять раскладку автоматически")
+
     p.add_argument("--try-4096", action="store_true")
     p.add_argument("--ubatch-values", default="",
                    help="Явный список ubatch-size через запятую, например 2048,4096; "
@@ -2052,7 +2407,7 @@ def main():
                    help="минимальный относительный прирост, ради которого "
                         "делается следующий раунд (staged)")
     p.add_argument("--max-screen", type=int, default=24,
-                   help="потолок кандидатов screening (staged)")
+                   help="общий лимит screening, включая baseline и refinement")
     p.add_argument("--batch-values", default="",
                    help="явные значения n_batch через запятую; по умолчанию "
                         "ось b не крутится — она клампится в ubatch")
@@ -2082,6 +2437,10 @@ def main():
 
     if args.apply and not args.deep:
         p.error("--apply допускается только с --deep")
+    if args.max_screen < 1 or args.refine_rounds < 0:
+        p.error("--max-screen >= 1, --refine-rounds >= 0")
+    if not 0 <= args.min_gain < 1 or args.bench_fit_target < 0:
+        p.error("--min-gain должен быть в [0,1), --bench-fit-target >= 0")
     if args.max_candidates < 1:
         p.error("--max-candidates должен быть >= 1")
     if args.moe_step < 1:
@@ -2123,20 +2482,10 @@ def main():
 
     original_hash = hashlib.sha256(original_bytes).hexdigest()
 
-    ini = configparser.ConfigParser(interpolation=None, strict=False)
-    ini.read_string(original)
-
-    if args.section not in ini:
-        p.error("Секция не найдена")
-
-    opts = dict(ini[args.section])
-
-    unknown = set(opts) - allowed_keys_for(args.server)
-    if unknown:
-        p.error(
-            "Неизвестные ключи INI; добавьте явную поддержку или удалите: "
-            + ", ".join(sorted(unknown))
-        )
+    try:
+        opts = read_tune_options(args.ini, args.section, server_schema(args.server))
+    except (OSError, ValueError, configparser.Error) as exc:
+        p.error(str(exc))
 
     if not opts.get("model"):
         p.error("В секции нет model")
@@ -2150,7 +2499,7 @@ def main():
         p.error(f"Не найден модельный файл: {model_path}")
     opts["model"] = str(model_path)
 
-    if args.keep_mmproj and opts.get("mmproj"):
+    if (args.keep_mmproj or args.allow_vision) and opts.get("mmproj"):
         mmproj_path = Path(str(opts["mmproj"])).expanduser()
         if not mmproj_path.is_absolute():
             mmproj_path = (args.ini.parent / mmproj_path).resolve()
@@ -2228,6 +2577,8 @@ def main():
             f"без --search-ctx с --deep --apply."
         )
 
+    if len(contexts) > args.max_candidates:
+        p.error("--max-candidates должен покрывать хотя бы одну пробу на каждый контекст")
     if any(ctx < 4096 or ctx > 262144 for ctx in contexts):
         p.error("Контекст должен быть в пределах 4096..262144")
 
@@ -2237,8 +2588,64 @@ def main():
     if args.max_probe_tokens < args.short_probe_tokens:
         args.short_probe_tokens = max(512, args.max_probe_tokens // 2)
 
+    flags = server_schema(args.server)
+    if flags:
+        from lib.launch import resolve_option
+        for key, value in list(opts.items()):
+            f = resolve_option(flags, key)
+            if f is None:
+                p.error(f"флаг {key} не поддерживается выбранной сборкой")
+            if f.kind == "path" and value:
+                path = Path(value).expanduser()
+                opts[key] = str(path if path.is_absolute() else args.ini.parent / path)
+    if args.with_spec and opts.get("model-draft") and not Path(opts["model-draft"]).is_file():
+        p.error(f"Не найден model-draft: {opts['model-draft']}")
+
+    try:
+        from lib import gguf
+        model_meta = gguf.probe(opts["model"])
+    except ImportError:
+        model_meta = None
+    except (OSError, ValueError, gguf.GGUFError):
+        model_meta = None
+    try:
+        configure_search(args, opts, flags, model_meta)
+        global KNOB_AXES
+        KNOB_AXES = knob_axes(set(flags))
+    except ValueError as exc:
+        p.error(str(exc))
+    if model_meta is None:
+        print("ВНИМАНИЕ: архитектура неизвестна — автоматические MoE/dense оси выключены.")
+    if args.model_is_moe is False or args.fixed_placement:
+        moe_sweep_server = False
+
+    # Preflight before creating artifacts, unloading anything or starting GPU work.
+    try:
+        build_server_command(args.server, opts, 8080, server_caps, args)
+    except ValueError as exc:
+        p.error(str(exc))
+    custom_launch = set(opts) - HANDLED_KEYS - set(PASSTHROUGH_KEYS)
+    # Optional server-only axes are explored after screening, never passed to
+    # upstream llama-bench which currently has no --moe-cache-mib.
+    # A preset already using any custom flag still requires server-only search.
+    if custom_launch or allow_ot or args.with_spec:
+        print("Screening через llama-bench пропущен: он не воспроизводит "
+              "дополнительные флаги сервера; подбор пойдёт через llama-server.")
+        args.skip_screening = True
+
     args.out = args.out / (time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
     args.out.mkdir(parents=True, exist_ok=False)
+    binary_stat = args.server.stat()
+    args.binary_fingerprint = hashlib.sha256(
+        f"{args.server}:{binary_stat.st_size}:{binary_stat.st_mtime_ns}".encode()).hexdigest()[:16]
+    (args.out / "plan.json").write_text(json.dumps({
+        "server": str(args.server), "binary_fingerprint": args.binary_fingerprint,
+        "model": opts["model"], "model_is_moe": args.model_is_moe,
+        "model_layers": args.model_layers, "server_axes": sorted(args.server_axes),
+        "axis_values": args.axis_options, "max_screen": args.max_screen,
+        "max_candidates": args.max_candidates, "search": args.search,
+        "contexts": contexts,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
 
     total, used, free = gpu_mem(args.gpu)
     print(f"GPU {args.gpu}: всего {total} MiB, свободно {free} MiB")
@@ -2250,6 +2657,8 @@ def main():
     bench_caps = {}
     screen_moe_enabled = False
 
+    if args.screen_only and (args.bench == "none" or args.skip_screening):
+        p.error("--screen-only: screening недоступен для этой конфигурации; сервер не запускался")
     if args.bench != "none" and not args.skip_screening:
         bench_tool = None
         sweep_tool = None
@@ -2271,7 +2680,7 @@ def main():
         if args.search == "staged":
             screen_moe_enabled = bool(
                 server_caps.get("n-cpu-moe") and bench_caps_screen.get("moe")
-                and not allow_ot
+                and not allow_ot and args.model_is_moe is True and not args.fixed_placement
             )
             if args.ignore_preset:
                 _base = default_variant(args)
@@ -2283,13 +2692,16 @@ def main():
                       f"{json.dumps(_base, ensure_ascii=False)}")
             print("порядок проверки (по убыванию прироста): "
                   + ", ".join(k for k, _, _ in KNOB_AXES))
-            candidates = axis_variants(_base, args, screen_moe_enabled)
-            candidates = candidates[:args.max_screen]
+            args.active_axes = supported_axes(args, server_schema(args.server), bench_caps_screen)
+            candidates = [_base] + fair_variants(axis_variants(_base, args, screen_moe_enabled))
+            initial_budget = max(1, args.max_screen // (args.refine_rounds + 1))
+            candidates = candidates[:initial_budget]
         else:
             candidates, screen_moe_enabled = make_screen_candidates(
                 args, server_caps, bench_caps_screen, allow_ot,
             )
 
+        candidates = candidates[:args.max_screen]
         needed_ctx = args.screen_pp + args.screen_tg + 64
         screen_ctx = min(max(contexts), max(args.screen_ctx, needed_ctx))
         if screen_ctx < needed_ctx:
@@ -2367,6 +2779,10 @@ def main():
                         fresh = axis_variants(base_v, args,
                                               screen_moe_enabled,
                                               exclude=measured)
+                        left = max(0, args.max_screen - len(measured))
+                        rounds_left = args.refine_rounds - rnd + 1
+                        round_budget = (left + rounds_left - 1) // rounds_left
+                        fresh = fair_variants(fresh)[:round_budget]
                         if not fresh:
                             print(f"[refine {rnd}] новых вариантов нет — стоп")
                             break
@@ -2466,118 +2882,121 @@ def main():
             }, indent=2, ensure_ascii=False))
             return
 
-    candidate_limit = max(args.max_candidates, args.screen_top) * max(1, len(contexts))
-    server_candidates = expand_server_candidates(
-        selected,
-        args,
-        server_caps,
-        allow_ot,
-        screen_moe_enabled,
-        candidate_limit,
-    )
+    if args.search == "staged":
+        results = run_staged_validation(args, opts, server_caps, contexts, selected)
+    else:
+        candidate_limit = max(args.max_candidates, args.screen_top) * max(1, len(contexts))
+        server_candidates = expand_server_candidates(
+            selected,
+            args,
+            {**server_caps, "n-cpu-moe": moe_sweep_server},
+            allow_ot,
+            screen_moe_enabled,
+            candidate_limit,
+        )
 
-    if not server_candidates:
-        server_candidates = [default_variant(args)]
+        if not server_candidates:
+            server_candidates = [default_variant(args)]
 
-    results = []
-    seen = set()
-    run_id = 0
+        results = []
+        seen = set()
+        run_id = 0
 
-    # Быстрый предфильтр на уменьшенном контексте: отбрасываем OOM/медленные
-    # варианты до запуска дорогой full-context валидации.
-    max_ctx = max(contexts)
-    prefilter_ctx = None
-    if not args.no_prefilter:
-        want = args.prefilter_ctx or args.screen_ctx
-        if 4096 <= want < max_ctx:
-            prefilter_ctx = want
+        # Быстрый предфильтр на уменьшенном контексте: отбрасываем OOM/медленные
+        # варианты до запуска дорогой full-context валидации.
+        max_ctx = max(contexts)
+        prefilter_ctx = None
+        if not args.no_prefilter:
+            want = args.prefilter_ctx or args.screen_ctx
+            if 4096 <= want < max_ctx:
+                prefilter_ctx = want
 
-    if prefilter_ctx and server_candidates:
-        prefilter_results = []
+        if prefilter_ctx and server_candidates:
+            prefilter_results = []
 
-        for pf_idx, variant in enumerate(server_candidates, start=1):
-            run_id += 1
-            print(
-                f"[P{pf_idx}/{len(server_candidates)}] prefilter ctx={prefilter_ctx} {variant}",
-                flush=True,
-            )
-            result = evaluate(
-                args.server,
-                opts,
-                prefilter_ctx,
-                variant,
-                args,
-                run_id,
-                server_caps,
-                short_only=True,
-            )
-            prefilter_results.append(result)
-            print(json.dumps(result, ensure_ascii=False), flush=True)
-            (args.out / "prefilter.json").write_text(
-                json.dumps(prefilter_results, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            for pf_idx, variant in enumerate(server_candidates, start=1):
+                run_id += 1
+                print(
+                    f"[P{pf_idx}/{len(server_candidates)}] prefilter ctx={prefilter_ctx} {variant}",
+                    flush=True,
+                )
+                result = evaluate(
+                    args.server,
+                    opts,
+                    prefilter_ctx,
+                    variant,
+                    args,
+                    run_id,
+                    server_caps,
+                    short_only=True,
+                )
+                prefilter_results.append(result)
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                (args.out / "prefilter.json").write_text(
+                    json.dumps(prefilter_results, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
-        survivors = [
-            v for v, r in zip(server_candidates, prefilter_results) if r.get("ok")
-        ]
-        if survivors:
-            print(
-                f"\nПредфильтр прошли {len(survivors)}/{len(server_candidates)}; "
-                "далее полная проверка на максимальном контексте.",
-                flush=True,
-            )
-            server_candidates = survivors
-        else:
-            print("\nПредфильтр не прошёл ни один вариант.", flush=True)
-            results = prefilter_results
-            server_candidates = []
+            survivors = [
+                v for v, r in zip(server_candidates, prefilter_results) if r.get("ok")
+            ]
+            if survivors:
+                print(
+                    f"\nПредфильтр прошли {len(survivors)}/{len(server_candidates)}; "
+                    "далее полная проверка на максимальном контексте.",
+                    flush=True,
+                )
+                server_candidates = survivors
+            else:
+                print("\nПредфильтр не прошёл ни один вариант.", flush=True)
+                results = prefilter_results
+                server_candidates = []
 
-    # Larger contexts first, because --apply requires deep validation.
-    # BUGFIX: раньше был общий лимит max_candidates на все контексты —
-    # второй контекст почти никогда не тестировался. Теперь бюджет на контекст.
-    validation_contexts = sorted(contexts, reverse=True)
-    per_ctx_budget = max(1, args.max_candidates // max(1, len(validation_contexts)))
+        # Larger contexts first, because --apply requires deep validation.
+        # BUGFIX: раньше был общий лимит max_candidates на все контексты —
+        # второй контекст почти никогда не тестировался. Теперь бюджет на контекст.
+        validation_contexts = sorted(contexts, reverse=True)
+        per_ctx_budget = max(1, args.max_candidates // max(1, len(validation_contexts)))
 
-    full_idx = 0
-    total_budget = args.max_candidates
-    for ctx in validation_contexts:
-        ctx_count = 0
-        for variant in server_candidates:
-            if len(results) >= total_budget:
+        full_idx = 0
+        total_budget = args.max_candidates
+        for ctx in validation_contexts:
+            ctx_count = 0
+            for variant in server_candidates:
+                if len(results) >= total_budget:
+                    break
+                if ctx_count >= per_ctx_budget and len(validation_contexts) > 1:
+                    break
+
+                key = (ctx, variant_key(variant))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                run_id += 1
+                full_idx += 1
+                ctx_count += 1
+                print(f"[{full_idx}/{total_budget}] ctx={ctx} {variant}", flush=True)
+
+                result = evaluate(
+                    args.server,
+                    opts,
+                    ctx,
+                    variant,
+                    args,
+                    run_id,
+                    server_caps,
+                )
+                results.append(result)
+
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                (args.out / "results.json").write_text(
+                    json.dumps(results, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+            if len(results) >= args.max_candidates:
                 break
-            if ctx_count >= per_ctx_budget and len(validation_contexts) > 1:
-                break
-
-            key = (ctx, variant_key(variant))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            run_id += 1
-            full_idx += 1
-            ctx_count += 1
-            print(f"[{full_idx}/{total_budget}] ctx={ctx} {variant}", flush=True)
-
-            result = evaluate(
-                args.server,
-                opts,
-                ctx,
-                variant,
-                args,
-                run_id,
-                server_caps,
-            )
-            results.append(result)
-
-            print(json.dumps(result, ensure_ascii=False), flush=True)
-            (args.out / "results.json").write_text(
-                json.dumps(results, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-
-        if len(results) >= args.max_candidates:
-            break
 
     (args.out / "results.json").write_text(
         json.dumps(results, indent=2, ensure_ascii=False),
@@ -2679,7 +3098,7 @@ def main():
         if int(updates["b"]) < int(updates["ubatch-size"]):
             updates["b"] = updates["ubatch-size"]
 
-    edited = replace_section_keys(original, args.section, updates)
+    edited = replace_section_keys(original, args.section, updates, server_schema(args.server))
     if edited == original:
         print("Выбран исходный пресет; изменений не требуется.")
         return

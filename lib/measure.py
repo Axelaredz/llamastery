@@ -19,7 +19,7 @@ from . import paths
 # динамику генерации (доля токенов в мыслях), DRY — штраф повторов, сэмплинг —
 # форму распределения. Без них в подписи замеры двух пресетов, отличающихся
 # только reasoning-budget, склеивались бы в один.
-SIGNIFICANT = ("c", "n-cpu-moe", "n-gpu-layers", "ngl", "b", "batch-size",
+SIGNIFICANT = ("moe-cache-mib", "n-cpu-ffn", "op-offload", "repack", "backend-sampling", "c", "n-cpu-moe", "n-gpu-layers", "ngl", "b", "batch-size",
                "ubatch-size", "ub", "t", "threads", "threads-batch", "tb",
                "parallel", "np", "fa", "flash-attn", "cache-type-k", "ctk",
                "cache-type-v", "ctv", "kv-unified", "kvu", "spec-type",
@@ -65,7 +65,8 @@ ALIASES = {
 _TRUE = {"1", "true", "on", "yes", "y"}
 _FALSE = {"0", "false", "off", "no", "n"}
 _FLAGGY = {"fa", "flash-attn", "kv-unified", "kvu", "jinja", "cont-batching",
-           "cache-prompt", "context-shift", "mmproj-offload", "fit"}
+           "cache-prompt", "context-shift", "mmproj-offload", "fit",
+           "op-offload", "repack", "backend-sampling"}
 
 
 def _norm_value(key: str, value) -> str:

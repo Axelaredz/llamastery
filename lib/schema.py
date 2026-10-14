@@ -14,6 +14,7 @@
 """
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -28,6 +29,8 @@ _HINT_RE = re.compile(
     r"^(?:"
     r"\{[^}]*\}|\[[^\]]*\]|\([^)]*\)|<[^>]*>|[A-Z][A-Z0-9_]*|[A-Z0-9]+|lo-hi|[-0-9.]+"
     r"|[A-Za-z0-9_.\-]+,[A-Za-z0-9_.\-]+(?:,[A-Za-z0-9_.\-]*)*"
+    r"|[A-Z][A-Z0-9_]*(?:[=:][A-Z][A-Z0-9_]*)+"
+    r"|<[^>]+>(?:[=:]<[^>]+>)+"
     r")$"
 )
 _ENV_RE = re.compile(r"\(env:\s*([A-Z0-9_]+)\s*\)")
@@ -121,8 +124,11 @@ def _split_line(line: str) -> tuple[list[str], str | None, str]:
     value_hint, desc = None, ""
     if idx < len(tokens):
         tok = tokens[idx]
-        head = " ".join(forms)
-        if _HINT_RE.match(tok):
+        # Two or more spaces begin the description column. Otherwise prose
+        # starting with "KV"/"HTTP" looks like an uppercase value placeholder.
+        end = line.find(forms[-1]) + len(forms[-1])
+        gap = re.match(r"\s*", line[end:]).group()
+        if _HINT_RE.match(tok) and len(gap) < 2:
             value_hint = tok
             m = re.search(re.escape(tok) + r"\s{2,}(.*)$", line)
             desc = m.group(1).strip() if m else ""
@@ -157,7 +163,7 @@ def _classify(value_hint: str | None, desc: str) -> tuple[str, list[str]]:
         return "string", []
     if re.fullmatch(r"[A-Za-z0-9_.\-]+", value_hint):
         return "string", []
-    return "flag", []
+    return "string", []
 
 
 def parse_help(text: str) -> dict[str, Flag]:
@@ -193,9 +199,9 @@ def parse_help(text: str) -> dict[str, Flag]:
         shorts = [f for f in forms if not f.startswith("--")]
         longs = [f for f in forms if f.startswith("--")]
         if longs:
-            canonical, short, alias = longs[0], (shorts[0] if shorts else None), longs[1:]
+            canonical, short, alias = longs[0], (shorts[0] if shorts else None), longs[1:] + shorts[1:]
         else:
-            canonical, short, alias = shorts[0], shorts[0], []
+            canonical, short, alias = shorts[0], shorts[0], shorts[1:]
 
         env = None
         em = _ENV_RE.search(desc)
@@ -219,8 +225,12 @@ def parse_help(text: str) -> dict[str, Flag]:
 
 
 def run_help(binary: str | Path, timeout: int = 60) -> str:
+    env = dict(os.environ)
+    bindir = str(Path(binary).resolve().parent)
+    env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"]
+                                       if env.get("LD_LIBRARY_PATH") else "")
     p = subprocess.run([str(binary), "--help"], capture_output=True,
-                       text=True, timeout=timeout)
+                       text=True, timeout=timeout, env=env)
     return (p.stdout or "") + (p.stderr or "")
 
 
@@ -241,13 +251,14 @@ def load(binary: str | Path | None, use_cache: bool = True,
     st = binary.stat()
     mtime = st.st_mtime
     meta = {"binary": str(binary), "mtime": mtime,
-            "size": st.st_size}
+            "size": st.st_size, "parser_version": 2}
 
     cached = paths.schema_cache(binary)
     if use_cache and cached.exists() and not refresh:
         try:
             blob = json.loads(cached.read_text(encoding="utf-8"))
-            if blob.get("meta", {}).get("mtime") == mtime:
+            if (blob.get("meta", {}).get("mtime") == mtime
+                    and blob.get("meta", {}).get("parser_version") == 2):
                 return ({k: Flag(**v) for k, v in blob["flags"].items()},
                         blob["meta"])
         except (json.JSONDecodeError, TypeError, ValueError):
